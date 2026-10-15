@@ -1,0 +1,17 @@
+.DS_Store
+
+# Local app bundles and build products
+dist/
+.build/
+.swiftpm/
+
+# Local data and credentials
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+.env
+.env.*
+*.pem
+*.p12
+*.key
