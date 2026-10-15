@@ -5,6 +5,7 @@ import SQLite3
 import Security
 import SwiftUI
 import UniformTypeIdentifiers
+import WebKit
 
 #if !DENBOX_TESTING
 @main
@@ -28,6 +29,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {
     case home = "Home"
     case movies = "Movies"
     case shows = "TV Shows"
+    case imdbCharts = "IMDb Charts"
     case watchlist = "My List"
     case downloads = "Downloads"
 
@@ -38,6 +40,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {
         case .home: "house"
         case .movies: "film"
         case .shows: "tv"
+        case .imdbCharts: "chart.bar.xaxis"
         case .watchlist: "bookmark"
         case .downloads: "arrow.down.circle"
         }
@@ -193,6 +196,8 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var didFinishRemoteSearch = false
     @Published private(set) var imdbDatasetStatus = "IMDb dataset is not downloaded."
     @Published private(set) var isUpdatingIMDbDataset = false
+    @Published private(set) var imdbChartLists: IMDbChartLists?
+    @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var resolvingSimilarTitleID: String?
     @Published private(set) var similarTitleSearchMessage: String?
     @Published private(set) var detailsRefreshRevision = 0
@@ -201,6 +206,7 @@ final class LibraryModel: ObservableObject {
     private let database: MediaDatabase
     private(set) var recentlyRefreshedDetails: [String: MediaDetails] = [:]
     private var searchTask: Task<Void, Never>?
+    private var artworkLookupsInFlight: Set<String> = []
     private var catalogRefreshInProgress = false
     private var detailRefreshesInFlight: Set<String> = []
     private var nextMoviePage = 0
@@ -239,6 +245,8 @@ final class LibraryModel: ObservableObject {
             base = items.filter { $0.kind == "Movie" }
         case .shows:
             base = items.filter { $0.kind == "Series" }
+        case .imdbCharts:
+            base = []
         case .watchlist:
             base = items.filter { savedIDs.contains($0.id) }
         case .downloads:
@@ -344,9 +352,58 @@ final class LibraryModel: ObservableObject {
             }
             let timestamp = IMDbMetadataStore.shared.lastUpdated?.formatted(date: .abbreviated, time: .shortened) ?? "now"
             imdbDatasetStatus = "IMDb dataset ready · updated \(timestamp)"
+            imdbChartLists = nil
+            if section == .imdbCharts { await loadIMDbCharts() }
         } catch {
             imdbDatasetStatus = error.localizedDescription
         }
+    }
+
+    func loadIMDbCharts() async {
+        guard !isLoadingIMDbCharts, imdbChartLists == nil else { return }
+        isLoadingIMDbCharts = true
+        defer { isLoadingIMDbCharts = false }
+        imdbChartLists = await Task.detached(priority: .userInitiated) {
+            IMDbMetadataStore.shared.chartLists()
+        }.value
+    }
+
+    func loadIMDbArtwork(for metadata: IMDbTitleMetadata) async -> Data? {
+        let cache = database.cachedIMDbArtwork(for: metadata.tconst)
+        if cache.cached { return cache.data }
+        guard artworkLookupsInFlight.insert(metadata.tconst).inserted else { return nil }
+        defer { artworkLookupsInFlight.remove(metadata.tconst) }
+
+        let imageURL: URL?
+        if let local = catalogTitle(matching: metadata), let artworkURL = local.artworkURL {
+            imageURL = artworkURL
+        } else if let apiKey = SecretVault.read(account: "media-api-key"),
+                  let item = await searchSimbaTitle(matching: metadata, apiKey: apiKey) {
+            imageURL = item.artworkURL
+        } else {
+            imageURL = nil
+        }
+        guard let imageURL else {
+            if SecretVault.read(account: "media-api-key") != nil {
+                database.saveIMDbArtwork(nil, sourceURL: nil, for: metadata.tconst)
+            }
+            return nil
+        }
+
+        var request = URLRequest(url: imageURL)
+        request.timeoutInterval = 20
+        request.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              data.count <= 8 * 1024 * 1024,
+              let mimeType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
+              mimeType.hasPrefix("image/"), NSImage(data: data) != nil else {
+            database.saveIMDbArtwork(nil, sourceURL: imageURL.absoluteString, for: metadata.tconst)
+            return nil
+        }
+        database.saveIMDbArtwork(data, sourceURL: imageURL.absoluteString, for: metadata.tconst)
+        return data
     }
 
     func openCatalogTitle(matching metadata: IMDbTitleMetadata) async {
@@ -362,14 +419,39 @@ final class LibraryModel: ObservableObject {
         }
         resolvingSimilarTitleID = metadata.id
         defer { resolvingSimilarTitleID = nil }
+        guard let resolved = await searchSimbaTitle(matching: metadata, apiKey: apiKey) else {
+            similarTitleSearchMessage = "Simba did not return a matching title for \(metadata.title)."
+            return
+        }
+        database.saveRemoteItems([resolved])
+        items = database.loadCatalog()
+        selectedItem = items.first(where: { $0.id == resolved.id }) ?? resolved
+        similarTitleSearchMessage = nil
+    }
 
+    func catalogTitle(matching metadata: IMDbTitleMetadata) -> MediaItem? {
+        let targetTitle = normalizedMatchTitle(metadata.title)
+        return items.compactMap { item -> (MediaItem, Double, Int)? in
+            guard item.kind == metadata.kind else { return nil }
+            let aliases = ([item.title] + item.matchingTitles).map(normalizedMatchTitle)
+            let score = aliases.map { $0 == targetTitle ? 1.0 : matchTitleSimilarity(targetTitle, $0) }.max() ?? 0
+            guard score >= 0.92 else { return nil }
+            let yearDistance = metadata.year.flatMap { year in Int(item.year).map { abs($0 - year) } } ?? Int.max
+            return (item, score, yearDistance)
+        }.sorted { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+            return lhs.2 < rhs.2
+        }.first?.0
+    }
+
+    private func searchSimbaTitle(matching metadata: IMDbTitleMetadata, apiKey: String) async -> MediaItem? {
+        let target = normalizedMatchTitle(metadata.title)
         for url in DirectMediaAPI.searchURLs(query: metadata.title, routeKey: apiKey) {
             guard let payload = try? await DirectMediaAPI.getJSON(url: url, timeout: 15) else { continue }
-            let matches = Self.searchItems(from: payload, fallbackKind: "Series")
-                .filter { $0.kind == "Series" }
+            let matches = Self.searchItems(from: payload, fallbackKind: metadata.kind)
+                .filter { $0.kind == metadata.kind }
                 .compactMap { item -> (MediaItem, Double, Int)? in
                     let titles = ([item.title] + item.matchingTitles).map(normalizedMatchTitle).filter { !$0.isEmpty }
-                    let target = normalizedMatchTitle(metadata.title)
                     let score = titles.map { $0 == target ? 1.0 : matchTitleSimilarity(target, $0) }.max() ?? 0
                     guard score >= 0.86 else { return nil }
                     let yearDistance = metadata.year.flatMap { imdbYear in
@@ -381,29 +463,9 @@ final class LibraryModel: ObservableObject {
                     if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
                     return lhs.2 < rhs.2
                 }
-            guard let resolved = matches.first?.0 else { continue }
-            database.saveRemoteItems([resolved])
-            items = database.loadCatalog()
-            selectedItem = items.first(where: { $0.id == resolved.id }) ?? resolved
-            similarTitleSearchMessage = nil
-            return
+            if let item = matches.first?.0 { return item }
         }
-        similarTitleSearchMessage = "Simba did not return a matching series for \(metadata.title)."
-    }
-
-    func catalogTitle(matching metadata: IMDbTitleMetadata) -> MediaItem? {
-        let targetTitle = normalizedMatchTitle(metadata.title)
-        return items.compactMap { item -> (MediaItem, Double, Int)? in
-            guard item.kind == "Series" else { return nil }
-            let aliases = ([item.title] + item.matchingTitles).map(normalizedMatchTitle)
-            let score = aliases.map { $0 == targetTitle ? 1.0 : matchTitleSimilarity(targetTitle, $0) }.max() ?? 0
-            guard score >= 0.92 else { return nil }
-            let yearDistance = metadata.year.flatMap { year in Int(item.year).map { abs($0 - year) } } ?? Int.max
-            return (item, score, yearDistance)
-        }.sorted { lhs, rhs in
-            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
-            return lhs.2 < rhs.2
-        }.first?.0
+        return nil
     }
 
     private func enrichWithIMDb(_ details: MediaDetails, item: MediaItem) -> MediaDetails {
@@ -616,7 +678,7 @@ final class LibraryModel: ObservableObject {
         case .home: hasMoreMovies || hasMoreSeries
         case .movies: hasMoreMovies
         case .shows: hasMoreSeries
-        case .watchlist, .downloads: false
+        case .watchlist, .downloads, .imdbCharts: false
         }
     }
 
@@ -1286,6 +1348,12 @@ private final class MediaDatabase {
             payload TEXT NOT NULL,
             fetched_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS imdb_artwork_cache (
+            tconst TEXT PRIMARY KEY,
+            image_data BLOB,
+            source_url TEXT,
+            cached_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS downloaded_media (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -1351,6 +1419,38 @@ private final class MediaDatabase {
         bind(id, at: 1, in: statement)
         bind(json, at: 2, in: statement)
         sqlite3_bind_double(statement, 3, fetchedAt.timeIntervalSince1970)
+        sqlite3_step(statement)
+    }
+
+    func cachedIMDbArtwork(for tconst: String) -> (cached: Bool, data: Data?) {
+        guard let handle else { return (false, nil) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT image_data FROM imdb_artwork_cache WHERE tconst=?", -1, &statement, nil) == SQLITE_OK,
+              let statement else { return (false, nil) }
+        defer { sqlite3_finalize(statement) }
+        bind(tconst, at: 1, in: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return (false, nil) }
+        let length = Int(sqlite3_column_bytes(statement, 0))
+        guard length > 0, let bytes = sqlite3_column_blob(statement, 0) else { return (true, nil) }
+        return (true, Data(bytes: bytes, count: length))
+    }
+
+    func saveIMDbArtwork(_ data: Data?, sourceURL: String?, for tconst: String) {
+        guard let handle else { return }
+        var statement: OpaquePointer?
+        let sql = "INSERT OR REPLACE INTO imdb_artwork_cache(tconst,image_data,source_url,cached_at) VALUES(?,?,?,?)"
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return }
+        defer { sqlite3_finalize(statement) }
+        bind(tconst, at: 1, in: statement)
+        if let data, !data.isEmpty {
+            data.withUnsafeBytes { bytes in
+                sqlite3_bind_blob(statement, 2, bytes.baseAddress, Int32(bytes.count), sqliteTransient)
+            }
+        } else {
+            sqlite3_bind_null(statement, 2)
+        }
+        bind(sourceURL, at: 3, in: statement)
+        sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
         sqlite3_step(statement)
     }
 
