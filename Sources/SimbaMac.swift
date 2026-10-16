@@ -271,7 +271,7 @@ extension MediaItem {
             apiID: apiID,
             title: title,
             subtitle: subtitle,
-            synopsis: synopsis.nilIfEmpty ?? metadata.synopsis ?? synopsis,
+            synopsis: PersianMetadataText.preferredSynopsis(from: [synopsis, metadata.synopsis]),
             year: year.nilIfEmpty ?? metadata.year ?? year,
             kind: kind,
             symbol: symbol,
@@ -281,6 +281,40 @@ extension MediaItem {
             matchingTitles: matchingTitles,
             imdbID: imdbID,
             genres: genres.isEmpty ? metadata.genres : genres,
+            imdbRating: imdbRating,
+            imdbVotes: imdbVotes
+        )
+    }
+
+    func applyingPublicTitleMetadata(_ sources: [PublicTitleMetadata]) -> MediaItem {
+        guard !sources.isEmpty else { return self }
+        let ordered = sources.sorted { lhs, rhs in
+            let lhsPriority = lhs.provider == .filimo ? 0 : 1
+            let rhsPriority = rhs.provider == .filimo ? 0 : 1
+            return lhsPriority < rhsPriority
+        }
+        let publicSynopsis = ordered.first(where: \.hasPersianSynopsis)?.synopsis
+        let fallbackSynopsis = ordered.first {
+            !$0.synopsis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }?.synopsis
+        let resolvedSynopsis = publicSynopsis ?? synopsis.nilIfEmpty ?? fallbackSynopsis ?? synopsis
+        let resolvedArtwork = ordered.compactMap(\.posterURL).first ?? artworkURL
+        guard resolvedSynopsis != synopsis || resolvedArtwork != artworkURL else { return self }
+        return MediaItem(
+            id: id,
+            apiID: apiID,
+            title: title,
+            subtitle: subtitle,
+            synopsis: resolvedSynopsis,
+            year: year,
+            kind: kind,
+            symbol: symbol,
+            palette: palette,
+            artworkURL: resolvedArtwork,
+            isRemote: isRemote,
+            matchingTitles: matchingTitles,
+            imdbID: imdbID,
+            genres: genres,
             imdbRating: imdbRating,
             imdbVotes: imdbVotes
         )
@@ -634,7 +668,8 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var imdbPeopleAvailable = false
     @Published private(set) var pendingIMDbPersonRequest: IMDbPersonLookupRequest?
-    @Published private(set) var publicReferenceStatus = "Public references are checked when requested from Settings."
+    @Published private(set) var publicReferenceStatus = "IMDb, TVmaze, Wikidata, and enabled TMDB references update automatically for loaded titles."
+    @Published private(set) var publicTitleCatalogStatus = "Filimo and HexDL metadata updates automatically for loaded titles."
     @Published private(set) var genreFacets: [IMDbGenreFacet] = []
     @Published private(set) var isLoadingGenreFacets = false
     @Published private(set) var preferredGenres: Set<String> = []
@@ -661,6 +696,8 @@ final class LibraryModel: ObservableObject {
     private var imdbRecommendationsInFlight: Set<String> = []
     private var referenceMetadataLookupsInFlight: Set<String> = []
     private var publicMetadataLookupsInFlight: Set<String> = []
+    private var publicTitleCatalogTask: Task<Void, Never>?
+    private var publicTitleCatalogRefreshRequested = false
     private var referenceCatalogEnrichmentTask: Task<Void, Never>?
     private var referenceCatalogEnrichmentRequested = false
     private var forceTMDBReferenceRefreshRequested = false
@@ -694,7 +731,16 @@ final class LibraryModel: ObservableObject {
         imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
         selectedGenreFilters = database.loadGenrePreferences(category: "filter")
         preferredGenres = database.loadGenrePreferences(category: "preferred")
-        let cached = database.loadCatalog()
+        let cached = database.loadCatalog().map { item in
+            var enriched = item
+            if let reference = database.loadReferenceMetadata(mediaID: item.id) {
+                enriched = enriched.applyingReference(reference)
+            }
+            let publicMetadata = PublicMetadataProvider.allCases.compactMap {
+                database.loadPublicTitleMetadata(mediaID: item.id, provider: $0)
+            }
+            return enriched.applyingPublicTitleMetadata(publicMetadata)
+        }
         if !cached.isEmpty {
             items = cached
             catalogName = "Denbox Library"
@@ -798,10 +844,15 @@ final class LibraryModel: ObservableObject {
     var hasIMDbData: Bool { IMDbMetadataStore.shared.isAvailable }
     var isTrackingPlayback: Bool { activeWatchSessionID != nil }
     var isCheckingPublicReferences: Bool { referenceCatalogEnrichmentTask != nil }
+    var isCheckingPublicTitlePages: Bool { publicTitleCatalogTask != nil }
 
     func checkPublicReferencesForCatalog(forceTMDB: Bool = false) {
         if forceTMDB { forceTMDBReferenceRefreshRequested = true }
         scheduleCatalogReferenceEnrichment()
+    }
+
+    func checkPublicTitlePagesForCatalog() {
+        schedulePublicTitleCatalogEnrichment()
     }
 
     func publicTitleMetadata(mediaID: String, provider: PublicMetadataProvider) -> PublicTitleMetadata? {
@@ -863,7 +914,23 @@ final class LibraryModel: ObservableObject {
                 database.recordPublicTitleMetadataAttempt(mediaID: item.id, provider: provider)
             }
         }
+        if updatedCount > 0 { applyCachedPublicMetadataToCatalog(mediaID: item.id) }
         return (dueProviders.count, updatedCount)
+    }
+
+    private func applyCachedPublicMetadataToCatalog(mediaID: String) {
+        guard let index = items.firstIndex(where: { $0.id == mediaID }) else { return }
+        let item = items[index]
+        let metadata = PublicMetadataProvider.allCases.compactMap {
+            database.loadPublicTitleMetadata(mediaID: mediaID, provider: $0)
+        }
+        let enriched = item.applyingPublicTitleMetadata(metadata)
+        guard enriched != item else { return }
+        items[index] = enriched
+        if let rating = personalRatings[mediaID], database.updatePersonalRatingSnapshot(enriched) {
+            personalRatings[mediaID] = PersonalRating(rating: rating.rating, item: enriched, updatedAt: rating.updatedAt)
+        }
+        detailsRefreshRevision += 1
     }
 
     func exportViewingActivity(to url: URL) {
@@ -976,9 +1043,7 @@ final class LibraryModel: ObservableObject {
         let history = watchHistory
         let preferences = preferredGenres
         let userRatings = Array(personalRatings.values)
-        let watched = Set(database.loadWatchProgress(limit: 2_000, includeWatched: true)
-            .filter { $0.isWatched || $0.progress >= 0.9 }
-            .compactMap(\.imdbID))
+        let watched = database.loadWatchedIMDbIDs()
         recommendations = await Task.detached(priority: .userInitiated) {
             PersonalizedRecommendationRanker.rank(
                 candidates,
@@ -1033,6 +1098,10 @@ final class LibraryModel: ObservableObject {
                 referenceMetadataByID[item.id] = reference
                 resolved = resolved.applyingReference(reference)
             }
+            let publicMetadata = PublicMetadataProvider.allCases.compactMap {
+                database.loadPublicTitleMetadata(mediaID: item.id, provider: $0)
+            }
+            resolved = resolved.applyingPublicTitleMetadata(publicMetadata)
             if metadata[item.id] != nil,
                let existingRating = personalRatings[item.id],
                database.updatePersonalRatingSnapshot(resolved) {
@@ -1047,6 +1116,54 @@ final class LibraryModel: ObservableObject {
         }
         items = enriched
         if refreshedRatedMetadata { invalidateRecommendations() }
+        scheduleCatalogReferenceEnrichment()
+        schedulePublicTitleCatalogEnrichment()
+    }
+
+    private func schedulePublicTitleCatalogEnrichment() {
+        publicTitleCatalogRefreshRequested = true
+        guard publicTitleCatalogTask == nil else { return }
+        publicTitleCatalogRefreshRequested = false
+        publicTitleCatalogTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var checkedTitles = 0
+            defer {
+                self.publicTitleCatalogTask = nil
+                if checkedTitles > 0 {
+                    self.publicTitleCatalogStatus = "Filimo and HexDL checks are complete for the loaded titles."
+                } else if self.items.isEmpty {
+                    self.publicTitleCatalogStatus = "Load a catalog to check Filimo and HexDL."
+                } else {
+                    self.publicTitleCatalogStatus = "Persian public title metadata is up to date."
+                }
+                if self.publicTitleCatalogRefreshRequested {
+                    self.publicTitleCatalogRefreshRequested = false
+                    self.schedulePublicTitleCatalogEnrichment()
+                }
+            }
+
+            repeat {
+                self.publicTitleCatalogRefreshRequested = false
+                let pending = self.items.filter { item in
+                    guard item.isRemote, ["Movie", "Series"].contains(item.kind) else { return false }
+                    let cooldown: TimeInterval = 24 * 60 * 60
+                    return PublicMetadataProvider.allCases.contains { provider in
+                        let cached = self.database.loadPublicTitleMetadata(mediaID: item.id, provider: provider)
+                        guard cached?.needsAutomaticRefresh() ?? true else { return false }
+                        if let attemptedAt = self.database.publicTitleMetadataLastAttempt(mediaID: item.id, provider: provider),
+                           Date().timeIntervalSince(attemptedAt) < cooldown { return false }
+                        return !self.publicMetadataLookupsInFlight.contains("\(item.id)|\(provider.rawValue)")
+                    }
+                }
+                guard !pending.isEmpty else { break }
+                self.publicTitleCatalogStatus = "Updating Persian metadata from Filimo and HexDL…"
+                for item in pending {
+                    guard !Task.isCancelled else { break }
+                    let result = await self.refreshPublicTitleMetadata(for: item)
+                    if result.attempted > 0 { checkedTitles += 1 }
+                }
+            } while self.publicTitleCatalogRefreshRequested && !Task.isCancelled
+        }
     }
 
     private func scheduleCatalogReferenceEnrichment() {
@@ -1652,13 +1769,28 @@ final class LibraryModel: ObservableObject {
         var sources = item.kind == "Series"
             ? ((episode?.sources ?? []) + (episode?.downloadSources ?? []))
             : ((details?.sources ?? []) + (details?.downloadSources ?? []))
-        if sources.isEmpty, item.isRemote,
-           let refreshed = await loadDetails(for: item, forceRefresh: true) {
-            details = refreshed
-            episode = matchingEpisode(in: refreshed)
-            sources = item.kind == "Series"
-                ? ((episode?.sources ?? []) + (episode?.downloadSources ?? []))
+        let cachedTitle = episode.map { "\(item.title) · \($0.title)" } ?? item.title
+        if let offline = downloadManager.completedDownload(
+            mediaItemID: item.id,
+            episodeID: episode?.id ?? progress.episodeID,
+            title: cachedTitle
+        ) {
+            playLocalVideo(offline, title: cachedTitle, item: item, episode: episode, details: details)
+            return
+        }
+        if item.isRemote, let refreshed = await loadDetails(for: item, forceRefresh: true) {
+            let refreshedEpisode = matchingEpisode(in: refreshed)
+            let refreshedSources = item.kind == "Series"
+                ? ((refreshedEpisode?.sources ?? []) + (refreshedEpisode?.downloadSources ?? []))
                 : (refreshed.sources + refreshed.downloadSources)
+            if item.kind != "Series", !refreshedSources.isEmpty {
+                details = refreshed
+                sources = refreshedSources
+            } else if let refreshedEpisode {
+                details = refreshed
+                episode = refreshedEpisode
+                if !refreshedSources.isEmpty { sources = refreshedSources }
+            }
         }
         if item.kind == "Series", (progress.episodeID != nil || progress.episodeLabel != nil || progress.episodeTitle != nil), episode == nil {
             viewingUpdateMessage = "The saved episode could not be matched in the refreshed season list."
@@ -3416,6 +3548,25 @@ extension MediaDatabase {
         bind(episodeID ?? "", at: 2, in: statement)
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
         return Self.readWatchProgress(statement)
+    }
+
+    func loadWatchedIMDbIDs() -> Set<String> {
+        guard let handle else { return [] }
+        let sql = """
+        SELECT DISTINCT imdb_id
+        FROM watch_progress
+        WHERE imdb_id IS NOT NULL AND trim(imdb_id)<>''
+          AND (is_watched=1 OR
+               (duration_seconds>0 AND position_seconds>=duration_seconds*0.9))
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var result = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let imdbID = columnText(statement, 0) { result.insert(imdbID) }
+        }
+        return result
     }
 
     func loadWatchProgress(limit: Int? = 500, includeWatched: Bool = false) -> [WatchProgress] {
@@ -6505,6 +6656,10 @@ private struct MediaDetailPage: View {
         }
         .onChange(of: model.detailsRefreshRevision) { _ in
             referenceMetadata = model.referenceMetadata(mediaID: item.id)
+            filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
+            hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
+            filimoURLText = filimoMetadata?.pageURL.absoluteString ?? filimoURLText
+            hexDLURLText = hexDLMetadata?.pageURL.absoluteString ?? hexDLURLText
             guard let refreshed = model.recentlyRefreshedDetails[item.id] else { return }
             details = referenceMetadata.map { ReferenceMetadataService.enrich(refreshed, with: $0) } ?? refreshed
             if selectedSeasonID == nil { selectedSeasonID = details?.seasons.first?.id }
@@ -7439,6 +7594,8 @@ private struct MediaDetailPage: View {
 
     private func enqueueDownload(source: MediaStreamSource?, sources: [MediaStreamSource], title: String, episodeID: String?) async {
         actionMessage = nil
+        var resolvedTitle = title
+        var resolvedEpisodeID = episodeID
         let current = source.map { [$0] } ?? sources
         var downloadable = directDownloadSources(current)
         if downloadable.isEmpty, item.isRemote {
@@ -7449,6 +7606,8 @@ private struct MediaDetailPage: View {
             if let targetEpisode, let refreshed, let match = matchingEpisode(targetEpisode, in: refreshed) {
                 selectedSeasonID = match.season.id
                 selectedEpisodeID = match.episode.id
+                resolvedTitle = "\(item.title) · \(match.episode.title)"
+                resolvedEpisodeID = match.episode.id
                 downloadable = directDownloadSources(match.episode.downloadSources + match.episode.sources)
             } else if let refreshed {
                 downloadable = directDownloadSources(refreshed.downloadSources + refreshed.sources)
@@ -7458,7 +7617,7 @@ private struct MediaDetailPage: View {
             actionMessage = "No direct download link is available. Adaptive HLS or DASH links cannot be saved as a single video file."
             return
         }
-        if downloadManager.enqueue(source: resolvedSource, title: title, catalogMediaID: item.id, episodeID: episodeID) {
+        if downloadManager.enqueue(source: resolvedSource, title: resolvedTitle, catalogMediaID: item.id, episodeID: resolvedEpisodeID) {
             actionMessage = "Added to Downloads"
         } else {
             actionMessage = "This download is already queued or saved."
@@ -8559,7 +8718,7 @@ private struct SettingsSheet: View {
                     .font(.denbox(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("IMDb supplies ratings and structured people and episode data when available. TVmaze adds series artwork and cast; Persian descriptions from Simba, Filimo, or HexDL stay in front of English summaries. You can search Filimo and HexDL public pages from a title when you want matching Persian text and artwork saved locally.")
+                Text("IMDb supplies ratings and structured people and episode data when available. TVmaze adds series artwork and cast; Persian descriptions from Simba, Filimo, or HexDL stay in front of English summaries. Filimo and HexDL public pages are checked automatically for loaded titles, and matching Persian text and artwork are saved locally.")
                     .font(.denbox(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -8625,6 +8784,23 @@ private struct SettingsSheet: View {
                 Text(DenboxLanguage.localizedMessage(model.publicReferenceStatus))
                     .font(.denbox(size: 10, weight: .medium))
                     .foregroundStyle(Color.secondaryText)
+                HStack(spacing: 10) {
+                    Button {
+                        model.checkPublicTitlePagesForCatalog()
+                    } label: {
+                        Label(model.isCheckingPublicTitlePages
+                              ? "Updating Persian metadata…"
+                              : "Check Filimo and HexDL for loaded titles",
+                              systemImage: model.isCheckingPublicTitlePages ? "hourglass" : "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isCheckingPublicTitlePages || model.items.isEmpty)
+                    Text(DenboxLanguage.localizedMessage(model.publicTitleCatalogStatus))
+                        .font(.denbox(size: 10, weight: .medium))
+                        .foregroundStyle(Color.secondaryText)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
+                }
                 HStack(spacing: 10) {
                     Button {
                         Task { await model.refreshIMDbDataset() }

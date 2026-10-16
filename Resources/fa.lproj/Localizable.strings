@@ -464,7 +464,7 @@
 "Checking public metadata for %@ titles…" = "در حال بررسی فرادادهٔ عمومی برای %@ عنوان…";
 "Checked public references for %@ titles." = "منابع عمومی برای %@ عنوان بررسی شدند.";
 "Public reference metadata has not been checked yet." = "فرادادهٔ منابع عمومی هنوز بررسی نشده است.";
-"Public references are checked when requested from Settings." = "منابع عمومی با درخواست شما از تنظیمات بررسی می‌شوند.";
+"Public references refresh automatically when a movie or series detail page opens." = "هنگام بازکردن صفحهٔ جزئیات فیلم یا سریال، منابع عمومی خودکار به‌روزرسانی می‌شوند.";
 "IMDb supplies ratings and structured people and episode data when available. TVmaze adds series artwork and cast; Persian descriptions from Simba, Filimo, or HexDL stay in front of English summaries. You can search Filimo and HexDL public pages from a title when you want matching Persian text and artwork saved locally." = "وقتی داده موجود باشد، IMDb امتیازها و اطلاعات ساختاریافتهٔ افراد و قسمت‌ها را می‌دهد. TVmaze تصویر و بازیگران سریال‌ها را اضافه می‌کند؛ توضیحات فارسی Simba، Filimo یا HexDL همیشه بر خلاصه‌های انگلیسی مقدم می‌مانند. هر زمان خواستی می‌توانی از صفحهٔ عنوان، صفحه‌های عمومی Filimo و HexDL را جست‌وجو کنی تا متن و تصویر منطبق محلی ذخیره شوند.";
 "Open a title to load public metadata, or check the loaded catalog." = "برای بارگیری فرادادهٔ عمومی، صفحهٔ یک عنوان را باز کن یا فهرست بارگیری‌شده را بررسی کن.";
 "Loaded catalog references are checked only when you request them in Settings. Opening a title checks its own references on demand." = "منابع عمومی فهرست بارگیری‌شده فقط با درخواست شما از تنظیمات بررسی می‌شوند. با بازکردن عنوان، منابع همان عنوان نیز بررسی می‌شوند.";
