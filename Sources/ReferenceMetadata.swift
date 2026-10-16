@@ -40,10 +40,10 @@ struct ReferenceTitleMetadata: Codable, Sendable {
             year: year ?? fallback.year,
             rating: rating ?? fallback.rating,
             runtime: runtime ?? fallback.runtime,
-            genres: genres.isEmpty ? fallback.genres : genres,
+            genres: Array((genres + fallback.genres).uniqued().prefix(12)),
             country: country ?? fallback.country,
             director: director ?? fallback.director,
-            cast: cast.isEmpty ? fallback.cast : cast,
+            cast: Array((cast + fallback.cast).uniqued().prefix(20)),
             citations: citationMap.values.sorted { $0.provider < $1.provider },
             attemptedProviders: Array(Set(attemptedProviders + fallback.attemptedProviders)).sorted(),
             fetchedAt: max(fetchedAt, fallback.fetchedAt)
@@ -62,7 +62,11 @@ enum ReferenceMetadataService {
         let attempted = Set(cached.attemptedProviders)
         if item.kind == "Series", !attempted.contains("TVmaze") { return true }
         let wantsWikidata = item.kind == "Movie" || item.kind == "Series"
-        if wantsWikidata, !attempted.contains("Wikidata") { return true }
+        if wantsWikidata {
+            let hasWikidataResult = cached.citations.contains { $0.provider == "Wikidata" }
+            if validIMDbID(imdbID), !hasWikidataResult { return true }
+            if !attempted.contains("Wikidata") { return true }
+        }
         return false
     }
 
