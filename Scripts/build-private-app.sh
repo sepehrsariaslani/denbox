@@ -10,6 +10,7 @@ IINA_URL="https://github.com/iina/iina/releases/download/v1.3.0/IINA.v1.3.0.dmg"
 IINA_SHA256="b50c416828005e1eec0dc8066c961efcc389e6be1a5a595541ea62d48d31a391"
 OUTPUT_DIR="$ROOT/dist"
 APP=""
+ARM64_APP=""
 BUILD_SUCCEEDED=0
 
 for tool in swiftc codesign curl hdiutil shasum lipo python3; do
@@ -35,6 +36,9 @@ cleanup() {
   fi
   if [[ "$BUILD_SUCCEEDED" != "1" && -n "$APP" && "$APP" == "$OUTPUT_DIR"/Denbox-*.app ]]; then
     /bin/rm -rf "$APP"
+  fi
+  if [[ "$BUILD_SUCCEEDED" != "1" && -n "$ARM64_APP" && "$ARM64_APP" == "$OUTPUT_DIR"/Denbox-*-arm64.app ]]; then
+    /bin/rm -rf "$ARM64_APP"
   fi
   /bin/rm -rf "$WORK"
 }
@@ -85,6 +89,10 @@ APP="$OUTPUT_DIR/Denbox-${APP_VERSION}-build${BUILD_NUMBER}.app"
 if [[ -e "$APP" ]]; then
   APP="$OUTPUT_DIR/Denbox-${APP_VERSION}-build${BUILD_NUMBER}-$(date +%Y%m%d-%H%M%S).app"
 fi
+ARM64_APP="$OUTPUT_DIR/Denbox-${APP_VERSION}-build${BUILD_NUMBER}-arm64.app"
+if [[ -e "$ARM64_APP" ]]; then
+  ARM64_APP="$OUTPUT_DIR/Denbox-${APP_VERSION}-build${BUILD_NUMBER}-arm64-$(date +%Y%m%d-%H%M%S).app"
+fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/fa.lproj" \
   "$APP/Contents/Resources/Fonts" "$APP/Contents/Frameworks"
 
@@ -132,9 +140,9 @@ APP_SOURCES=(
 )
 
 for architecture in arm64 x86_64; do
-  echo "Compiling Denbox for $architecture (macOS 13+)."
+  echo "Compiling Denbox for $architecture (macOS 12+)."
   swiftc -parse-as-library -swift-version 5 -O \
-    -target "$architecture-apple-macosx13.0" \
+    -target "$architecture-apple-macosx12.0" \
     -I "$ROOT/Sources/MPV" \
     -framework SwiftUI -framework AppKit -framework MediaPlayer -framework OpenGL \
     -framework ImageIO -framework Network -framework Security \
@@ -155,12 +163,58 @@ done
 
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
+
+ditto "$APP" "$ARM64_APP"
+lipo -thin arm64 "$ARM64_APP/Contents/MacOS/Denbox" \
+  -output "$WORK/Denbox-arm64-only"
+cp "$WORK/Denbox-arm64-only" "$ARM64_APP/Contents/MacOS/Denbox"
+codesign --force --deep --sign - "$ARM64_APP"
+codesign --verify --deep --strict "$ARM64_APP"
+if [[ "$(lipo -archs "$ARM64_APP/Contents/MacOS/Denbox")" != "arm64" ]]; then
+  echo "The Apple Silicon build must contain only the arm64 executable slice." >&2
+  exit 1
+fi
+
 /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" >/dev/null
 if ! /usr/bin/plutil -lint "$APP/Contents/Resources/DenboxPrivateAPIKeys.plist" >/dev/null; then
   echo "The app's private API bootstrap plist is invalid." >&2
   exit 1
 fi
 
+ARM64_DMG_NAME="Denbox-${APP_VERSION}-build${BUILD_NUMBER}-macOS-arm64.dmg"
+UNIVERSAL_DMG_NAME="Denbox-${APP_VERSION}-build${BUILD_NUMBER}-macOS-universal.dmg"
+for asset in "$ARM64_DMG_NAME" "$UNIVERSAL_DMG_NAME"; do
+  if [[ -e "$OUTPUT_DIR/$asset" || -e "$OUTPUT_DIR/$asset.sha256" ]]; then
+    echo "Release artifact already exists: $OUTPUT_DIR/$asset. Increment the app build number before rebuilding." >&2
+    exit 1
+  fi
+done
+
+package_dmg() {
+  local source_app="$1"
+  local asset_name="$2"
+  local architecture="$3"
+  local stage="$WORK/dmg-stage-$architecture"
+  mkdir -p "$stage"
+  ditto "$source_app" "$stage/Denbox.app"
+  ln -s /Applications "$stage/Applications"
+  hdiutil create -quiet -volname Denbox -srcfolder "$stage" -ov -format UDZO \
+    "$WORK/$asset_name"
+  hdiutil verify "$WORK/$asset_name" >/dev/null
+  local digest
+  digest="$(shasum -a 256 "$WORK/$asset_name" | awk '{print $1}')"
+  printf '%s  %s\n' "$digest" "$asset_name" > "$WORK/$asset_name.sha256"
+  printf '%s  %s\n' "$digest" "$WORK/$asset_name" | shasum -a 256 -c >/dev/null
+}
+
+package_dmg "$ARM64_APP" "$ARM64_DMG_NAME" arm64
+package_dmg "$APP" "$UNIVERSAL_DMG_NAME" universal
+mv "$WORK/$ARM64_DMG_NAME" "$OUTPUT_DIR/$ARM64_DMG_NAME"
+mv "$WORK/$ARM64_DMG_NAME.sha256" "$OUTPUT_DIR/$ARM64_DMG_NAME.sha256"
+mv "$WORK/$UNIVERSAL_DMG_NAME" "$OUTPUT_DIR/$UNIVERSAL_DMG_NAME"
+mv "$WORK/$UNIVERSAL_DMG_NAME.sha256" "$OUTPUT_DIR/$UNIVERSAL_DMG_NAME.sha256"
+
 BUILD_SUCCEEDED=1
-echo "Built and verified $APP (Universal: Apple Silicon + Intel, macOS 13 Ventura+)."
+echo "Built and verified Apple Silicon and Universal DMGs (macOS 12 Monterey+)."
+shasum -a 256 "$OUTPUT_DIR/$ARM64_DMG_NAME" "$OUTPUT_DIR/$UNIVERSAL_DMG_NAME"
 echo "This private build contains extractable shared API keys; restrict access to trusted recipients."

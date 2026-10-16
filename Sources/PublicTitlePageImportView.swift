@@ -101,10 +101,16 @@ struct PublicTitlePageImportView: View {
                             Text("Persian synopsis")
                                 .font(.denbox(size: 10, weight: .medium))
                                 .foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
-                            TextEditor(text: $synopsis)
+                            Group {
+                                if #available(macOS 13.0, *) {
+                                    TextEditor(text: $synopsis)
+                                        .scrollContentBackground(.hidden)
+                                } else {
+                                    TextEditor(text: $synopsis)
+                                }
+                            }
                                 .font(.denbox(size: 12))
                                 .frame(minHeight: 74, maxHeight: 110)
-                                .scrollContentBackground(.hidden)
                                 .padding(4)
                                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
                         }

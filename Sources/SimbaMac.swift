@@ -12,6 +12,7 @@ struct DenboxApp: App {
     @StateObject private var model = LibraryModel()
     @AppStorage(DenboxLanguage.preferenceKey) private var interfaceLanguage = DenboxLanguage.defaultCode
 
+    @SceneBuilder
     var body: some Scene {
         WindowGroup("Denbox") {
             MainWindow()
@@ -22,20 +23,18 @@ struct DenboxApp: App {
                 .environment(\.layoutDirection, DenboxLanguage.layoutDirection(for: interfaceLanguage))
                 .preferredColorScheme(.dark)
         }
-        .defaultSize(width: 1280, height: 820)
-        .windowResizability(.contentMinSize)
 
-        WindowGroup("Denbox Player", id: "denbox-player") {
-            PlayerWindowHost()
-                .environmentObject(model)
-                .environmentObject(model.downloadManager)
-                .environment(\.font, .denbox(size: 13))
-                .environment(\.locale, DenboxLanguage.locale(for: interfaceLanguage))
-                .environment(\.layoutDirection, DenboxLanguage.layoutDirection(for: interfaceLanguage))
-                .preferredColorScheme(.dark)
+        if #available(macOS 13.0, *) {
+            WindowGroup("Denbox Player", id: "denbox-player") {
+                PlayerWindowHost()
+                    .environmentObject(model)
+                    .environmentObject(model.downloadManager)
+                    .environment(\.font, .denbox(size: 13))
+                    .environment(\.locale, DenboxLanguage.locale(for: interfaceLanguage))
+                    .environment(\.layoutDirection, DenboxLanguage.layoutDirection(for: interfaceLanguage))
+                    .preferredColorScheme(.dark)
+            }
         }
-        .defaultSize(width: 1280, height: 800)
-        .windowResizability(.contentMinSize)
     }
 }
 #endif
@@ -4672,7 +4671,6 @@ extension MediaItem {
 struct MainWindow: View {
     @EnvironmentObject private var model: LibraryModel
     @EnvironmentObject private var downloadManager: DownloadManager
-    @Environment(\.openWindow) private var openWindow
     @State private var detailPath: [MediaItem] = []
 
     var body: some View {
@@ -4690,10 +4688,14 @@ struct MainWindow: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 1020, minHeight: 700)
+        .background {
+            if #available(macOS 13.0, *) {
+                PlayerWindowActivator(model: model)
+            }
+        }
         .onChange(of: model.playerURL) { url in
             guard url != nil, !model.isPlayerWindowOpen else { return }
             model.isPlayerWindowOpen = true
-            openWindow(id: "denbox-player")
         }
         .onChange(of: model.selectedItem) { item in
             guard let item else { return }
@@ -4709,15 +4711,60 @@ struct MainWindow: View {
         }
     }
 
+    private var legacyPlayerSheetPresentation: Binding<Bool> {
+        Binding(
+            get: {
+                if #available(macOS 13.0, *) { return false }
+                return model.isPlayerWindowOpen
+            },
+            set: { isPresented in
+                if #unavailable(macOS 13.0) { model.isPlayerWindowOpen = isPresented }
+            }
+        )
+    }
+
     private var detailNavigationStack: some View {
-        NavigationStack(path: $detailPath) {
-            mainContent
-                .navigationDestination(for: MediaItem.self) { item in
-                    MediaDetailPage(item: item)
-                        .environmentObject(model)
+        Group {
+            if #available(macOS 13.0, *) {
+                NavigationStack(path: $detailPath) {
+                    mainContent
+                        .navigationDestination(for: MediaItem.self) { item in
+                            MediaDetailPage(item: item)
+                                .environmentObject(model)
+                                .environmentObject(downloadManager)
+                        }
                 }
+                .background(Color.canvas)
+            } else {
+                VStack(spacing: 0) {
+                    if let item = detailPath.last {
+                        HStack {
+                            Button("Back", systemImage: "chevron.backward") {
+                                if !detailPath.isEmpty { detailPath.removeLast() }
+                            }
+                            Spacer()
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 10)
+                        .background(Color.canvas)
+                        MediaDetailPage(item: item, onBack: {
+                            if !detailPath.isEmpty { detailPath.removeLast() }
+                        })
+                            .environmentObject(model)
+                            .environmentObject(downloadManager)
+                    } else {
+                        mainContent
+                    }
+                }
+                .background(Color.canvas)
+            }
         }
-        .background(Color.canvas)
+        .sheet(isPresented: legacyPlayerSheetPresentation) {
+            PlayerWindowHost()
+                .environmentObject(model)
+                .environmentObject(downloadManager)
+                .preferredColorScheme(.dark)
+        }
     }
 
     private var mainContent: some View {
@@ -4801,7 +4848,6 @@ struct MainWindow: View {
                 .padding(.bottom, 48)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .scrollIndicators(.hidden)
         }
         .background(Color.canvas)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -4979,7 +5025,6 @@ private struct Sidebar: View {
             .overlay(alignment: .top) { Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1) }
         }
         .background(Color.sidebar)
-        .toolbarBackground(Color.sidebar, for: .windowToolbar)
     }
 }
 
@@ -5162,7 +5207,6 @@ private struct MediaShelf: View {
                 }
                 .padding(.vertical, 3)
             }
-            .scrollIndicators(.hidden)
         }
     }
 }
@@ -5769,7 +5813,6 @@ private struct IMDbFranchisesPage: View {
                         }
                     }
                     .frame(height: 555)
-                    .scrollIndicators(.hidden)
                 }
                 .frame(width: 220)
 
@@ -7557,6 +7600,7 @@ private struct MediaDetailPage: View {
     @EnvironmentObject private var downloadManager: DownloadManager
     @Environment(\.dismiss) private var dismiss
     let item: MediaItem
+    var onBack: (() -> Void)? = nil
     @State private var details: MediaDetails?
     @State private var personalRating: Int?
     @State private var referenceMetadata: ReferenceTitleMetadata?
@@ -8199,7 +8243,7 @@ private struct MediaDetailPage: View {
     private var playButton: some View {
         if !item.isRemote {
             Button {
-                dismiss()
+                if let onBack { onBack() } else { dismiss() }
                 model.openLocalVideo()
             } label: {
                 Label("Open a local video", systemImage: "play.fill")
@@ -8742,6 +8786,41 @@ private struct PlayerWindowHost: View {
     }
 }
 
+@available(macOS 13.0, *)
+private struct PlayerWindowActivator: View {
+    @Environment(\.openWindow) private var openWindow
+    @ObservedObject var model: LibraryModel
+
+    var body: some View {
+        Color.clear
+            .onChange(of: model.isPlayerWindowOpen) { isOpen in
+                if isOpen { openWindow(id: "denbox-player") }
+            }
+    }
+}
+
+private struct PlayerHoverActivityModifier: ViewModifier {
+    let onMove: (CGPoint) -> Void
+    let onEnter: () -> Void
+    let onExit: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.onContinuousHover { phase in
+                switch phase {
+                case .active(let location): onMove(location)
+                case .ended: onExit()
+                }
+            }
+        } else {
+            content.onHover { isHovering in
+                if isHovering { onEnter() } else { onExit() }
+            }
+        }
+    }
+}
+
 private struct LocalPlayerSheet: View {
     private enum CurrentFileRemovalMode: Equatable {
         case trash
@@ -9064,19 +9143,25 @@ private struct LocalPlayerSheet: View {
         }
         .animation(.easeOut(duration: 0.2), value: controlsHidden)
         .animation(.easeInOut(duration: 0.22), value: playback.isInMiniPlayerMode)
-        .onContinuousHover { phase in
-            switch phase {
-            case .active(let location):
+        .modifier(PlayerHoverActivityModifier(
+            onMove: { location in
                 let moved = PlayerControlsAutoHidePolicy.pointerMoved(
                     from: lastPlayerHoverLocation,
                     to: location
                 )
                 lastPlayerHoverLocation = location
                 if moved { showPlayerControls() }
-            case .ended:
+            },
+            onEnter: {
+                controlsHideTask?.cancel()
+                controlsHidden = false
+                NSCursor.setHiddenUntilMouseMoves(false)
+            },
+            onExit: {
                 lastPlayerHoverLocation = nil
+                scheduleControlsHide()
             }
-        }
+        ))
         .confirmationDialog("Confirm file action", isPresented: $showingFileRemovalConfirmation,
                             titleVisibility: .visible) {
             Button(pendingFileRemovalMode == .permanent ? "Delete Permanently" : "Move to Trash",
@@ -10008,9 +10093,17 @@ private struct LocalPlayerSheet: View {
                     GroupBox("Custom mpv filter") {
                         VStack(alignment: .leading, spacing: 8) {
                             TextField("Filter name", text: $filterName)
-                            TextField("MPV filter expression", text: $filterExpression, axis: .vertical)
-                                .font(.system(.body, design: .monospaced))
-                                .lineLimit(1...3)
+                            Group {
+                                if #available(macOS 13.0, *) {
+                                    TextField("MPV filter expression", text: $filterExpression, axis: .vertical)
+                                        .font(.system(.body, design: .monospaced))
+                                        .lineLimit(1...3)
+                                } else {
+                                    TextEditor(text: $filterExpression)
+                                        .font(.system(.body, design: .monospaced))
+                                        .frame(height: 64)
+                                }
+                            }
                             HStack {
                                 Button("Save preset") {
                                     guard playback.saveFilterPreset(name: filterName, kind: filterKind, expression: filterExpression) else {
