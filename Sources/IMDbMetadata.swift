@@ -36,6 +36,11 @@ struct IMDbPersonMetadata: Identifiable, Sendable {
     var imdbURL: URL? { URL(string: "https://www.imdb.com/name/\(nconst)/") }
 }
 
+struct IMDbPersonLookupRequest: Equatable, Sendable {
+    let nconst: String?
+    let name: String
+}
+
 struct IMDbPersonCredit: Identifiable, Sendable {
     let title: IMDbTitleMetadata
     let category: String
@@ -353,6 +358,57 @@ final class IMDbMetadataStore: @unchecked Sendable {
         return people
     }
 
+    func person(for nconst: String) -> IMDbPersonMetadata? {
+        guard nconst.range(of: #"^nm\d{7,10}$"#, options: .regularExpression) != nil,
+              hasPeopleData(), let db = openReadOnly() else { return nil }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        let sql = "SELECT nconst,primary_name,birth_year,death_year,primary_profession,known_for_titles FROM people WHERE nconst=? LIMIT 1"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        bind(nconst, to: statement, at: 1)
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let id = text(statement, 0), let name = text(statement, 1) else { return nil }
+        return IMDbPersonMetadata(
+            nconst: id,
+            name: name,
+            birthYear: integer(statement, 2),
+            deathYear: integer(statement, 3),
+            professions: (text(statement, 4) ?? "").split(separator: ",").map(String.init),
+            knownForTitleIDs: (text(statement, 5) ?? "").split(separator: ",").map(String.init)
+        )
+    }
+
+    func principalPeople(for tconst: String, limit: Int = 20) -> [IMDbPersonMetadata] {
+        guard tconst.range(of: #"^tt\d{7,10}$"#, options: .regularExpression) != nil,
+              hasPeopleData(), let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        let sql = """
+        SELECT p.nconst,p.primary_name,p.birth_year,p.death_year,p.primary_profession,p.known_for_titles
+        FROM title_principals c JOIN people p ON p.nconst=c.nconst
+        WHERE c.tconst=? AND c.category IN ('actor','actress')
+        ORDER BY c.ordering LIMIT ?
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        bind(tconst, to: statement, at: 1)
+        sqlite3_bind_int(statement, 2, Int32(max(1, min(limit, 50))))
+        var people: [IMDbPersonMetadata] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = text(statement, 0), let name = text(statement, 1), !name.isEmpty else { continue }
+            people.append(IMDbPersonMetadata(
+                nconst: id,
+                name: name,
+                birthYear: integer(statement, 2),
+                deathYear: integer(statement, 3),
+                professions: (text(statement, 4) ?? "").split(separator: ",").map(String.init),
+                knownForTitleIDs: (text(statement, 5) ?? "").split(separator: ",").map(String.init)
+            ))
+        }
+        return people
+    }
+
     func personCredits(for nconst: String, offset: Int = 0, limit: Int = 100) -> [IMDbPersonCredit] {
         guard hasPeopleData(), let db = openReadOnly() else { return [] }
         defer { sqlite3_close(db) }
@@ -597,25 +653,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
     }
 
     func principalCast(for tconst: String, limit: Int = 20) -> [String] {
-        guard hasPeopleData(), let db = openReadOnly() else { return [] }
-        defer { sqlite3_close(db) }
-        var statement: OpaquePointer?
-        let sql = """
-        SELECT p.primary_name
-        FROM title_principals c JOIN people p ON p.nconst=c.nconst
-        WHERE c.tconst=? AND c.category IN ('actor','actress')
-        ORDER BY c.ordering LIMIT ?
-        """
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
-        defer { sqlite3_finalize(statement) }
-        bind(tconst, to: statement, at: 1)
-        sqlite3_bind_int(statement, 2, Int32(max(1, min(limit, 50))))
-        var names: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let name = text(statement, 0), !name.isEmpty else { continue }
-            names.append(name)
-        }
-        return names
+        principalPeople(for: tconst, limit: limit).map(\.name)
     }
 
     func chartLists() -> IMDbChartLists? {

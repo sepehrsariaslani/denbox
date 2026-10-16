@@ -4,8 +4,13 @@ import Foundation
 struct IMDbEnrichmentPerformanceTests {
     @MainActor
     static func main() async throws {
-        let model = LibraryModel(loadRemoteCatalog: false, refreshStaleDetailsInBackground: false)
-        let database = MediaDatabase()
+        let databaseURL = CommandLine.arguments.dropFirst().first.map { URL(fileURLWithPath: $0) }
+        let model = LibraryModel(
+            loadRemoteCatalog: false,
+            refreshStaleDetailsInBackground: false,
+            databaseURL: databaseURL
+        )
+        let database = MediaDatabase(databaseURL: databaseURL)
         let candidates = database.loadCatalog().filter { item in
             item.isRemote && item.kind == "Series" && database.loadDetailsPayload(for: item.id) != nil
         }

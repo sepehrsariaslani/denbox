@@ -196,6 +196,7 @@ struct ViewingStats: Sendable {
 enum IMDbGenreLocalization {
     private static let names: [String: String] = [
         "Action": "اکشن",
+        "Adult": "بزرگسالان",
         "Adventure": "ماجراجویی",
         "Animation": "انیمیشن",
         "Biography": "زندگی‌نامه",
@@ -216,6 +217,7 @@ enum IMDbGenreLocalization {
         "Reality-TV": "واقع‌نما",
         "Romance": "عاشقانه",
         "Sci-Fi": "علمی‌تخیلی",
+        "Short": "کوتاه",
         "Sport": "ورزشی",
         "Talk-Show": "گفت‌وگو",
         "Thriller": "هیجان‌انگیز",

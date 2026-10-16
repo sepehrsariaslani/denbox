@@ -192,6 +192,7 @@ struct MediaDetails: Sendable {
     let imdbRating: String?
     let imdbVotes: Int?
     let similarSeries: [IMDbTitleMetadata]
+    let castPeople: [IMDbPersonMetadata]
 
     var hasUsefulContent: Bool {
         !sources.isEmpty || !downloadSources.isEmpty || !seasons.isEmpty
@@ -525,7 +526,8 @@ enum IMDbMediaEnricher {
         guard let matched = store.matchTitle(title: item.title, year: details.year ?? item.year, kind: item.kind) else {
             return details
         }
-        let cast = store.principalCast(for: matched.tconst)
+        let castPeople = store.principalPeople(for: matched.tconst)
+        let cast = castPeople.map(\.name)
         let seriesEnrichment = item.kind == "Series"
             ? store.enrichment(title: item.title, year: details.year ?? item.year, includeSimilar: false)
             : nil
@@ -545,7 +547,8 @@ enum IMDbMediaEnricher {
             imdbID: matched.tconst,
             imdbRating: matched.rating.map { String(format: "%.1f", $0) } ?? details.imdbRating,
             imdbVotes: matched.votes ?? details.imdbVotes,
-            similarSeries: []
+            similarSeries: [],
+            castPeople: castPeople.isEmpty ? details.castPeople : castPeople
         )
     }
 }
@@ -571,12 +574,14 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     @Published private(set) var remoteSearchResults: [MediaItem] = []
     @Published private(set) var didFinishRemoteSearch = false
+    @Published private(set) var isSearchingRemoteSearch = false
     @Published private(set) var imdbDatasetStatus = "IMDb dataset is not downloaded."
     @Published private(set) var isUpdatingIMDbDataset = false
     @Published private(set) var imdbChartLists: IMDbChartLists?
     @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var imdbPeopleAvailable = false
-    @Published private(set) var publicReferenceStatus = "Public references are checked automatically when the catalog loads."
+    @Published private(set) var pendingIMDbPersonRequest: IMDbPersonLookupRequest?
+    @Published private(set) var publicReferenceStatus = "Open a title to load public reference metadata, or check the loaded catalog from Settings."
     @Published private(set) var genreFacets: [IMDbGenreFacet] = []
     @Published private(set) var isLoadingGenreFacets = false
     @Published private(set) var preferredGenres: Set<String> = []
@@ -596,11 +601,13 @@ final class LibraryModel: ObservableObject {
     private let refreshStaleDetailsInBackground: Bool
     private(set) var recentlyRefreshedDetails: [String: MediaDetails] = [:]
     private var searchTask: Task<Void, Never>?
+    private var activeRemoteSearchID: UUID?
     private var artworkLookupsInFlight: Set<String> = []
     private var imdbEnrichmentsInFlight: Set<String> = []
     private var imdbRecommendationsInFlight: Set<String> = []
     private var referenceMetadataLookupsInFlight: Set<String> = []
     private var referenceCatalogEnrichmentTask: Task<Void, Never>?
+    private var referenceCatalogEnrichmentRequested = false
     private var recommendationsNeedRefresh = false
     private var catalogRefreshInProgress = false
     private var detailRefreshesInFlight: Set<String> = []
@@ -644,8 +651,6 @@ final class LibraryModel: ObservableObject {
         refreshViewingData()
         Task {
             await enrichCatalogWithIMDb()
-            if IMDbMetadataStore.shared.isAvailable { await loadGenreFacets() }
-            scheduleCatalogReferenceEnrichment()
         }
         if loadRemoteCatalog {
             if SecretVault.read(account: "media-api-key") != nil,
@@ -680,7 +685,10 @@ final class LibraryModel: ObservableObject {
             : base.filter { !Set($0.genres).isDisjoint(with: selectedGenreFilters) }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return genreFiltered }
-        let localMatches = genreFiltered.filter { $0.title.localizedCaseInsensitiveContains(query) }
+        let localMatches = genreFiltered.filter { item in
+            ([item.title, item.subtitle] + item.matchingTitles)
+                .contains { $0.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil }
+        }
         guard didFinishRemoteSearch, section != .myRatings else { return localMatches }
         var seen = Set(localMatches.map(\.id))
         return localMatches + remoteSearchResults.filter { seen.insert($0.id).inserted }
@@ -763,14 +771,24 @@ final class LibraryModel: ObservableObject {
             return nil
         }
         do {
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-               let size = attributes[.size] as? NSNumber,
-               size.int64Value > 50_000_000 {
+            let maximumImportBytes = 50_000_000
+            let startedAccess = url.startAccessingSecurityScopedResource()
+            defer { if startedAccess { url.stopAccessingSecurityScopedResource() } }
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            if let size = attributes[.size] as? NSNumber, size.int64Value > Int64(maximumImportBytes) {
                 viewingUpdateMessage = "The selected viewing-data file is larger than 50 MB."
                 return nil
             }
-            let data = try Data(contentsOf: url)
-            guard data.count <= 50_000_000 else {
+            let file = try FileHandle(forReadingFrom: url)
+            defer { try? file.close() }
+            var data = Data()
+            while data.count <= maximumImportBytes {
+                let remaining = maximumImportBytes + 1 - data.count
+                let chunk = try file.read(upToCount: min(64 * 1024, remaining)) ?? Data()
+                guard !chunk.isEmpty else { break }
+                data.append(chunk)
+            }
+            guard data.count <= maximumImportBytes else {
                 viewingUpdateMessage = "The selected viewing-data file is larger than 50 MB."
                 return nil
             }
@@ -911,7 +929,9 @@ final class LibraryModel: ObservableObject {
     }
 
     private func scheduleCatalogReferenceEnrichment() {
+        referenceCatalogEnrichmentRequested = true
         guard referenceCatalogEnrichmentTask == nil else { return }
+        referenceCatalogEnrichmentRequested = false
         referenceCatalogEnrichmentTask = Task { @MainActor [weak self] in
             guard let self else { return }
             var completedCount = 0
@@ -923,6 +943,10 @@ final class LibraryModel: ObservableObject {
                     self.publicReferenceStatus = "Load a catalog to check public metadata references."
                 } else {
                     self.publicReferenceStatus = "Public reference metadata is up to date."
+                }
+                if self.referenceCatalogEnrichmentRequested {
+                    self.referenceCatalogEnrichmentRequested = false
+                    self.scheduleCatalogReferenceEnrichment()
                 }
             }
 
@@ -995,6 +1019,36 @@ final class LibraryModel: ObservableObject {
     func clearGenreFilters() {
         selectedGenreFilters.removeAll()
         database.saveGenrePreferences([], category: "filter")
+    }
+
+    func browseGenre(_ genre: String, kind: String? = nil) {
+        let value = genre.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        selectedGenreFilters = [value]
+        database.saveGenrePreferences(selectedGenreFilters, category: "filter")
+        searchText = ""
+        switch kind {
+        case "Movie": section = .movies
+        case "Series": section = .shows
+        default: section = .home
+        }
+    }
+
+    func openIMDbPerson(_ person: IMDbPersonMetadata) {
+        pendingIMDbPersonRequest = IMDbPersonLookupRequest(nconst: person.nconst, name: person.name)
+        section = .imdbPeople
+    }
+
+    func openIMDbPerson(named name: String) {
+        let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        pendingIMDbPersonRequest = IMDbPersonLookupRequest(nconst: nil, name: value)
+        section = .imdbPeople
+    }
+
+    func consumePendingIMDbPersonRequest() -> IMDbPersonLookupRequest? {
+        defer { pendingIMDbPersonRequest = nil }
+        return pendingIMDbPersonRequest
     }
 
     func togglePreferredGenre(_ genre: String) {
@@ -1162,7 +1216,8 @@ final class LibraryModel: ObservableObject {
                 imdbID: details.imdbID,
                 imdbRating: details.imdbRating,
                 imdbVotes: details.imdbVotes,
-                similarSeries: recommendations
+                similarSeries: recommendations,
+                castPeople: details.castPeople
             )
             self.detailsRefreshRevision += 1
         }
@@ -1517,7 +1572,6 @@ final class LibraryModel: ObservableObject {
             imdbChartLists = nil
             imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
             await enrichCatalogWithIMDb()
-            scheduleCatalogReferenceEnrichment()
             genreFacets = []
             recommendations = []
             await loadGenreFacets()
@@ -1678,14 +1732,24 @@ final class LibraryModel: ObservableObject {
     func searchRemote(_ query: String) {
         searchTask?.cancel()
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestID = UUID()
+        activeRemoteSearchID = requestID
         remoteSearchResults = []
         didFinishRemoteSearch = false
+        isSearchingRemoteSearch = false
         guard !query.isEmpty else { return }
-        guard section != .myRatings else { return }
+        guard section != .myRatings else {
+            didFinishRemoteSearch = true
+            return
+        }
 
+        isSearchingRemoteSearch = true
         searchTask = Task {
+            defer {
+                if activeRemoteSearchID == requestID { isSearchingRemoteSearch = false }
+            }
             try? await Task.sleep(nanoseconds: 350_000_000)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, activeRemoteSearchID == requestID else { return }
             do {
                 guard let apiKey = SecretVault.read(account: "media-api-key"),
                       let fallbackURL = DirectMediaAPI.searchFallbackURL(query: query) else {
@@ -1701,12 +1765,12 @@ final class LibraryModel: ObservableObject {
                 } else {
                     resolvedPayload = try await DirectMediaAPI.getJSON(url: fallbackURL, timeout: 10)
                 }
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, activeRemoteSearchID == requestID else { return }
                 remoteSearchResults = Self.searchItems(from: resolvedPayload)
                 database.saveRemoteItems(remoteSearchResults)
                 didFinishRemoteSearch = true
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, activeRemoteSearchID == requestID else { return }
                 didFinishRemoteSearch = true
                 connectionStatus = "Search is unavailable. Showing saved titles."
             }
@@ -1748,6 +1812,7 @@ final class LibraryModel: ObservableObject {
             if !cached.isEmpty {
                 items = cached
                 connectionStatus = "Live catalog unavailable. Showing \(cached.filter { $0.kind == "Movie" }.count) saved movies and \(cached.filter { $0.kind == "Series" }.count) saved series."
+                await enrichCatalogWithIMDb()
             } else {
                 let failures = [movieResponse.error, seriesResponse.error].compactMap { $0 }
                 connectionStatus = failures.isEmpty
@@ -1774,7 +1839,6 @@ final class LibraryModel: ObservableObject {
         }
         section = .home
         await enrichCatalogWithIMDb()
-        scheduleCatalogReferenceEnrichment()
     }
 
     var canLoadMoreCatalog: Bool {
@@ -1838,7 +1902,6 @@ final class LibraryModel: ObservableObject {
         }
         if added > 0 {
             await enrichCatalogWithIMDb()
-            scheduleCatalogReferenceEnrichment()
         }
     }
 
@@ -1886,7 +1949,6 @@ final class LibraryModel: ObservableObject {
         items = database.loadCatalog()
         Task {
             if IMDbMetadataStore.shared.isAvailable { await enrichCatalogWithIMDb() }
-            scheduleCatalogReferenceEnrichment()
         }
         catalogName = "Denbox API"
         let movieCount = uniqueItems.filter { $0.kind == "Movie" }.count
@@ -2056,7 +2118,8 @@ final class LibraryModel: ObservableObject {
             imdbID: nil,
             imdbRating: nil,
             imdbVotes: nil,
-            similarSeries: []
+            similarSeries: [],
+            castPeople: []
         )
     }
 
@@ -2302,7 +2365,6 @@ final class LibraryModel: ObservableObject {
         searchText = ""
         Task {
             await enrichCatalogWithIMDb()
-            scheduleCatalogReferenceEnrichment()
         }
     }
 }
@@ -3789,7 +3851,32 @@ struct MainWindow: View {
                     if [.home, .movies, .shows, .watchlist].contains(model.section), !model.genreFacets.isEmpty {
                         GenreFilterBar()
                     }
-                    if model.section == .forYou {
+                    if !model.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        if model.isSearchingRemoteSearch && !model.visibleItems.isEmpty {
+                            HStack(spacing: 9) {
+                                ProgressView().controlSize(.small)
+                                Text(DenboxLanguage.localizedMessage("Searching the catalog…"))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Color.secondaryText)
+                            }
+                        }
+                        if model.visibleItems.isEmpty {
+                            if model.isSearchingRemoteSearch {
+                                VStack(spacing: 10) {
+                                    ProgressView()
+                                    Text(DenboxLanguage.localizedMessage("Searching the catalog…"))
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(Color.secondaryText)
+                                }
+                                .frame(maxWidth: .infinity, minHeight: 150)
+                                .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 15))
+                            } else {
+                                EmptyLibraryState(isWatchlist: false, isMyRatings: false)
+                            }
+                        } else {
+                            MediaGrid(items: model.visibleItems)
+                        }
+                    } else if model.section == .forYou {
                         PersonalizedRecommendationsPage()
                     } else if model.section == .genres {
                         GenresPage()
@@ -4330,6 +4417,7 @@ private struct IMDbPeoplePage: View {
     @State private var credits: [IMDbPersonCredit] = []
     @State private var isLoadingCredits = false
     @State private var hasMoreCredits = false
+    @State private var autoSelectExactName = false
     private let pageSize = 100
     private let columns = [GridItem(.adaptive(minimum: 220), spacing: 14, alignment: .top)]
 
@@ -4341,7 +4429,13 @@ private struct IMDbPeoplePage: View {
                 searchPanel
             }
         }
-        .onAppear { model.refreshIMDbPeopleAvailability() }
+        .onAppear {
+            model.refreshIMDbPeopleAvailability()
+            consumePendingPersonRequest()
+        }
+        .onChange(of: model.pendingIMDbPersonRequest) { _ in
+            consumePendingPersonRequest()
+        }
         .task(id: query) {
             guard selectedPerson == nil else { return }
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4353,6 +4447,16 @@ private struct IMDbPeoplePage: View {
             }.value
             guard !Task.isCancelled else { return }
             results = found
+            if autoSelectExactName {
+                autoSelectExactName = false
+                let target = MediaTitleMatching.normalize(trimmed)
+                let exactMatches = found.filter {
+                    MediaTitleMatching.normalize($0.name) == target
+                }
+                if exactMatches.count == 1, let exact = exactMatches.first {
+                    select(exact)
+                }
+            }
         }
     }
 
@@ -4532,6 +4636,32 @@ private struct IMDbPeoplePage: View {
             results = await Task.detached(priority: .userInitiated) {
                 IMDbMetadataStore.shared.searchPeople(trimmed)
             }.value
+        }
+    }
+
+    private func consumePendingPersonRequest() {
+        guard let request = model.consumePendingIMDbPersonRequest() else { return }
+        selectedPerson = nil
+        credits = []
+        results = []
+        if let nconst = request.nconst {
+            query = ""
+            autoSelectExactName = false
+            Task {
+                let person = await Task.detached(priority: .userInitiated) {
+                    IMDbMetadataStore.shared.person(for: nconst)
+                }.value
+                guard model.section == .imdbPeople else { return }
+                if let person {
+                    select(person)
+                } else {
+                    autoSelectExactName = true
+                    query = request.name
+                }
+            }
+        } else {
+            autoSelectExactName = true
+            query = request.name
         }
     }
 
@@ -4845,7 +4975,7 @@ private struct GenresPage: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("Favorite genres")
                     .font(.system(size: 21, weight: .bold, design: .rounded))
-                Text("Genres are built from IMDb data stored on this Mac. Choose genres to personalize recommendations.")
+                Text("Click a genre to browse matching titles. Use the star to tune recommendations.")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.secondaryText)
             }
@@ -4879,11 +5009,8 @@ private struct GenresPage: View {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                     ForEach(model.genreFacets) { facet in
                         let selected = model.preferredGenres.contains(facet.name)
-                        Button { model.togglePreferredGenre(facet.name) } label: {
-                            HStack(spacing: 11) {
-                                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 18))
-                                    .foregroundStyle(selected ? Color.green : Color.secondaryText)
+                        HStack(spacing: 12) {
+                            Button { model.browseGenre(facet.name) } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(facet.displayName)
                                         .font(.system(size: 13, weight: .semibold))
@@ -4892,13 +5019,22 @@ private struct GenresPage: View {
                                         .font(.system(size: 9))
                                         .foregroundStyle(Color.secondaryText)
                                 }
-                                Spacer(minLength: 0)
+                                .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
                             }
-                            .padding(13)
-                            .background(selected ? Color.white.opacity(0.1) : Color.white.opacity(0.045),
-                                        in: RoundedRectangle(cornerRadius: 11))
+                            .buttonStyle(.plain)
+                            Button { model.togglePreferredGenre(facet.name) } label: {
+                                Image(systemName: selected ? "star.fill" : "star")
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(selected ? Color.yellow : Color.secondaryText)
+                                    .frame(width: 34, height: 34)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(DenboxLanguage.localizedMessage("Use genre for recommendations"))
                         }
-                        .buttonStyle(.plain)
+                        .padding(13)
+                        .background(selected ? Color.white.opacity(0.1) : Color.white.opacity(0.045),
+                                    in: RoundedRectangle(cornerRadius: 11))
                     }
                 }
             }
@@ -5146,6 +5282,7 @@ private struct ViewingStatsPage: View {
     @EnvironmentObject private var model: LibraryModel
     private let columns = [GridItem(.adaptive(minimum: 155), spacing: 12)]
     @State private var isConfirmingClear = false
+    @State private var importPreview: ViewingDataImportPreview?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -5187,11 +5324,18 @@ private struct ViewingStatsPage: View {
             .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 13))
 
             HStack(spacing: 10) {
+                Button(action: importViewingActivity) {
+                    Label("Import JSON…", systemImage: "square.and.arrow.down.on.square")
+                }
+                .buttonStyle(.bordered)
+                .help("Merge a viewing-data backup into this Mac.")
+                .disabled(model.isTrackingPlayback)
+
                 Button(action: exportViewingActivity) {
                     Label("Export JSON…", systemImage: "square.and.arrow.down")
                 }
                 .buttonStyle(.bordered)
-                .help("Export includes titles, personal ratings, watch times, progress, and local file paths.")
+                .help("JSON backups may include local file paths for videos opened directly from this Mac.")
 
                 Button(role: .destructive) {
                     isConfirmingClear = true
@@ -5201,7 +5345,10 @@ private struct ViewingStatsPage: View {
                 .buttonStyle(.bordered)
                 .disabled(model.isTrackingPlayback)
             }
-            Text("The export includes watch progress, personal ratings, watch time, and local file paths. Save it somewhere you choose.")
+            Text("Backups include watch progress, personal ratings, watch time, and title details. Import merges data and keeps newer local progress and ratings.")
+                .font(.system(size: 10))
+                .foregroundStyle(Color.secondaryText)
+            Text("JSON backups may include local file paths for videos opened directly from this Mac. Choose a destination you trust.")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.secondaryText)
             if model.isTrackingPlayback {
@@ -5211,6 +5358,37 @@ private struct ViewingStatsPage: View {
             }
         }
         .onAppear { model.refreshViewingData() }
+        .sheet(item: $importPreview) { preview in
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Review viewing-data import")
+                    .font(.system(size: 19, weight: .bold, design: .rounded))
+                Text(preview.fileName)
+                    .font(.system(size: 12, weight: .medium))
+                    .textSelection(.enabled)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(DenboxLanguage.localizedMessage("Progress records: \(preview.export.progress.count)"))
+                    Text(DenboxLanguage.localizedMessage("History sessions: \(preview.export.history.count)"))
+                    Text(DenboxLanguage.localizedMessage("Personal ratings: \(preview.export.personalRatings.count)"))
+                }
+                .font(.system(size: 12))
+                Text("Newer local progress and ratings will be kept. Duplicate history sessions will be skipped. Nothing will be deleted.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    Button("Cancel") { importPreview = nil }
+                        .keyboardShortcut(.cancelAction)
+                    Button("Merge data") {
+                        if model.mergeViewingData(preview.export) { importPreview = nil }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(24)
+            .frame(width: 460)
+        }
         .alert("Clear viewing history?", isPresented: $isConfirmingClear) {
             Button("Cancel", role: .cancel) { }
             Button("Clear", role: .destructive) { model.clearViewingActivity() }
@@ -5229,6 +5407,19 @@ private struct ViewingStatsPage: View {
         panel.nameFieldStringValue = "Denbox-viewing-data-\(formatter.string(from: Date())).json"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         model.exportViewingActivity(to: url)
+    }
+
+    private func importViewingActivity() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.title = DenboxLanguage.localizedMessage("Import viewing data")
+        panel.prompt = DenboxLanguage.localizedMessage("Review import")
+        guard panel.runModal() == .OK, let url = panel.url,
+              let preview = model.prepareViewingDataImport(from: url) else { return }
+        importPreview = preview
     }
 
     private func statCard(title: String, value: String, symbol: String) -> some View {
@@ -5853,18 +6044,24 @@ private struct MediaDetailPage: View {
                     if let details, !details.genres.isEmpty {
                         HStack(spacing: 8) {
                             ForEach(details.genres, id: \.self) { genre in
-                                Text(IMDbGenreLocalization.displayName(for: genre))
-                                    .font(.system(size: 11, weight: .medium))
-                                    .padding(.horizontal, 11)
-                                    .padding(.vertical, 6)
-                                    .background(Color.white.opacity(0.09), in: Capsule())
+                                Button {
+                                    model.browseGenre(genre, kind: item.kind)
+                                } label: {
+                                    Text(IMDbGenreLocalization.displayName(for: genre))
+                                        .font(.system(size: 11, weight: .medium))
+                                        .padding(.horizontal, 11)
+                                        .padding(.vertical, 6)
+                                        .background(Color.white.opacity(0.09), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .help(DenboxLanguage.localizedMessage("Browse titles in \(genre)"))
                             }
                         }
                     }
 
                     metadataLine("Director", value: details?.director)
                     metadataLine("Country", value: details?.country)
-                    metadataLine("Cast", value: details?.cast.joined(separator: ", "))
+                    castSection
                     if let citations = referenceMetadata?.citations, !citations.isEmpty {
                         HStack(spacing: 8) {
                             Text("Automatically enriched from")
@@ -6242,6 +6439,55 @@ private struct MediaDetailPage: View {
         return referenceMetadata?.rating.map { "TVmaze ★ \($0)" }
     }
 
+    private var castNames: [String] {
+        var seen = Set<String>()
+        return (details?.cast ?? []).filter { name in
+            let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !key.isEmpty && seen.insert(key).inserted
+        }
+    }
+
+    @ViewBuilder
+    private var castSection: some View {
+        if !castNames.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Cast")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.secondaryText)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(castNames, id: \.self) { name in
+                            Button {
+                                if let person = details?.castPeople.first(where: {
+                                    $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+                                }) {
+                                    model.openIMDbPerson(person)
+                                } else {
+                                    model.openIMDbPerson(named: name)
+                                }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Text(name)
+                                        .lineLimit(1)
+                                    Image(systemName: "person.crop.circle")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(Color.secondaryText)
+                                }
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(Color.white.opacity(0.08), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .help(DenboxLanguage.localizedMessage("Open \(name) filmography"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private var imdbAttribution: some View {
         HStack(spacing: 3) {
             Link("Information courtesy of IMDb", destination: URL(string: "https://www.imdb.com")!)
@@ -6583,6 +6829,8 @@ private struct LocalPlayerSheet: View {
     @State private var subtitleColor = Color.white
     @State private var subtitleBackgroundOpacity = 0.7
     @State private var aspectRatio = "no"
+    @State private var cropAspect = "no"
+    @State private var showPlayerAdjustments = false
     @State private var rotation = 0
     @State private var loopsCurrentFile = false
     @State private var playbackSpeed = 1.0
@@ -6696,6 +6944,7 @@ private struct LocalPlayerSheet: View {
             trackMenu
             subtitleMenu
             aspectMenu
+            pictureMenu
             Button {
                 rotation = (rotation + 90) % 360
                 playback.setRotation(rotation)
@@ -6722,6 +6971,9 @@ private struct LocalPlayerSheet: View {
         VStack(spacing: 12) {
             HStack(spacing: 22) {
                 transportButton("gobackward.10", help: "Back 10 seconds") { playback.seek(by: -10) }
+                if !playback.chapters.isEmpty {
+                    transportButton("backward.end", help: "Previous chapter") { playback.moveChapter(by: -1) }
+                }
                 Button { playback.togglePlayPause() } label: {
                     Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
                         .font(.system(size: 22, weight: .semibold))
@@ -6730,6 +6982,9 @@ private struct LocalPlayerSheet: View {
                 .buttonStyle(.plain)
                 .help(DenboxLanguage.localizedMessage(playback.isPlaying ? "Pause" : "Play"))
                 transportButton("goforward.10", help: "Forward 10 seconds") { playback.seek(by: 10) }
+                if !playback.chapters.isEmpty {
+                    transportButton("forward.end", help: "Next chapter") { playback.moveChapter(by: 1) }
+                }
 
                 Menu {
                     ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { speed in
@@ -6762,6 +7017,17 @@ private struct LocalPlayerSheet: View {
                 }
                 .buttonStyle(.plain)
                 .help("Repeat current file")
+
+                Button { playback.markABLoop() } label: {
+                    Text(playback.abLoopState == 0 ? "A–B" : (playback.abLoopState == 1 ? "A" : "B"))
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(minWidth: 30, minHeight: 30)
+                        .foregroundStyle(playback.abLoopState == 0 ? Color.white.opacity(0.75) : Color.orange)
+                }
+                .buttonStyle(.plain)
+                .help("Set or clear A-B loop points")
+
+                if !playback.chapters.isEmpty { chapterMenu }
 
                 Button { saveScreenshot() } label: {
                     Image(systemName: "camera")
@@ -6888,8 +7154,25 @@ private struct LocalPlayerSheet: View {
 
     private var trackMenu: some View {
         Menu {
-            if !playback.audioOptions.isEmpty {
-                Section("Audio") {
+            if !playback.videoOptions.isEmpty {
+                Section("Video") {
+                    Button("Disable video") { playback.selectVideo(nil) }
+                    ForEach(playback.videoOptions) { track in
+                        Button {
+                            playback.selectVideo(track)
+                        } label: {
+                            if track.isSelected {
+                                Label(DenboxLanguage.localizedMessage(track.displayName), systemImage: "checkmark")
+                            } else {
+                                Text(DenboxLanguage.localizedMessage(track.displayName))
+                            }
+                        }
+                    }
+                }
+            }
+            Section("Audio") {
+                Button("Open audio from file…") { chooseAudioFile() }
+                if !playback.audioOptions.isEmpty {
                     ForEach(playback.audioOptions) { track in
                         Button {
                             playback.selectAudio(track)
@@ -6902,6 +7185,10 @@ private struct LocalPlayerSheet: View {
                         }
                     }
                 }
+                Divider()
+                Button("Delay audio by 0.1 seconds") { playback.setAudioDelay(playback.audioDelaySeconds + 0.1) }
+                Button("Advance audio by 0.1 seconds") { playback.setAudioDelay(playback.audioDelaySeconds - 0.1) }
+                Button("Reset audio timing") { playback.setAudioDelay(0) }
             }
             Section("Subtitles") {
                 Button("Off") { playback.selectSubtitle(nil) }
@@ -6917,7 +7204,7 @@ private struct LocalPlayerSheet: View {
                     }
                 }
             }
-            if playback.audioOptions.isEmpty && playback.subtitleOptions.isEmpty {
+            if playback.videoOptions.isEmpty && playback.audioOptions.isEmpty && playback.subtitleOptions.isEmpty {
                 Text("No alternate tracks found")
             }
         } label: {
@@ -6930,6 +7217,122 @@ private struct LocalPlayerSheet: View {
         .menuStyle(.borderlessButton)
     }
 
+    private var pictureMenu: some View {
+        Button { showPlayerAdjustments.toggle() } label: {
+            Image(systemName: "slider.horizontal.3")
+                .frame(width: 30, height: 30)
+        }
+        .buttonStyle(.plain)
+        .help("Picture options")
+        .popover(isPresented: $showPlayerAdjustments, arrowEdge: .bottom) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 13) {
+                    Text("Picture and sound")
+                        .font(.system(size: 15, weight: .semibold))
+
+                    GroupBox("Crop video") {
+                        Picker("Crop", selection: Binding(
+                            get: { cropAspect },
+                            set: {
+                                cropAspect = $0
+                                playback.setCropAspect($0)
+                            }
+                        )) {
+                            Text(DenboxLanguage.localizedMessage("No crop")).tag("no")
+                            Text("16:9").tag("16:9")
+                            Text("4:3").tag("4:3")
+                            Text("2.35:1").tag("2.35:1")
+                        }
+                        .pickerStyle(.segmented)
+                    }
+
+                    Toggle("Deinterlace", isOn: Binding(
+                        get: { playback.isDeinterlacing },
+                        set: { playback.setDeinterlacing($0) }
+                    ))
+                    Toggle("Hardware decoding", isOn: Binding(
+                        get: { playback.hardwareDecodingEnabled },
+                        set: { playback.setHardwareDecoding($0) }
+                    ))
+
+                    GroupBox("Video adjustments") {
+                        VStack(spacing: 7) {
+                            ForEach(["brightness", "contrast", "gamma", "hue", "saturation"], id: \.self) { property in
+                                HStack(spacing: 8) {
+                                    Text(DenboxLanguage.localizedMessage(property.capitalized))
+                                        .frame(width: 76, alignment: .leading)
+                                    Slider(value: videoAdjustmentBinding(property), in: -100...100)
+                                    Text("\(Int(videoAdjustmentValue(property)))")
+                                        .monospacedDigit()
+                                        .frame(width: 30, alignment: .trailing)
+                                }
+                            }
+                        }
+                    }
+
+                    GroupBox("Audio equalizer") {
+                        VStack(spacing: 7) {
+                            ForEach(Array(["60 Hz", "250 Hz", "1 kHz", "4 kHz", "12 kHz"].enumerated()), id: \.offset) { index, label in
+                                HStack(spacing: 8) {
+                                    Text(label).frame(width: 50, alignment: .leading)
+                                    Slider(value: Binding(
+                                        get: { playback.audioEQBands[index] },
+                                        set: { playback.setAudioEQBand(index, gain: $0) }
+                                    ), in: -12...12)
+                                    Text("\(playback.audioEQBands[index], specifier: "%+.0f") dB")
+                                        .monospacedDigit()
+                                        .frame(width: 48, alignment: .trailing)
+                                }
+                            }
+                            Button("Reset audio equalizer") {
+                                for index in playback.audioEQBands.indices { playback.setAudioEQBand(index, gain: 0) }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                        }
+                    }
+                }
+                .padding(14)
+            }
+            .frame(width: 370, height: 480)
+        }
+    }
+
+    private func videoAdjustmentBinding(_ property: String) -> Binding<Double> {
+        Binding(get: { videoAdjustmentValue(property) }, set: { playback.setVideoAdjustment(property, value: $0) })
+    }
+
+    private func videoAdjustmentValue(_ property: String) -> Double {
+        switch property {
+        case "brightness": playback.videoBrightness
+        case "contrast": playback.videoContrast
+        case "gamma": playback.videoGamma
+        case "hue": playback.videoHue
+        case "saturation": playback.videoSaturation
+        default: 0
+        }
+    }
+
+    private var chapterMenu: some View {
+        Menu {
+            ForEach(playback.chapters) { chapter in
+                Button {
+                    playback.selectChapter(chapter.index)
+                } label: {
+                    if playback.currentChapterIndex == chapter.index {
+                        Label(DenboxLanguage.localizedMessage(chapter.title), systemImage: "checkmark")
+                    } else {
+                        Text(DenboxLanguage.localizedMessage(chapter.title))
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "list.number")
+                .frame(width: 30, height: 30)
+        }
+        .menuStyle(.borderlessButton)
+        .help("Chapters")
+    }
+
     private func chooseSubtitleFile() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = ["srt", "ass", "ssa", "vtt", "sub"].compactMap { UTType(filenameExtension: $0) }
@@ -6940,6 +7343,19 @@ private struct LocalPlayerSheet: View {
         panel.begin { response in
             guard response == .OK, let fileURL = panel.url else { return }
             DispatchQueue.main.async { playback.addSubtitleFile(fileURL) }
+        }
+    }
+
+    private func chooseAudioFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.title = DenboxLanguage.localizedMessage("Open audio file")
+        panel.prompt = DenboxLanguage.localizedMessage("Open")
+        panel.begin { response in
+            guard response == .OK, let fileURL = panel.url else { return }
+            DispatchQueue.main.async { playback.addAudioFile(fileURL) }
         }
     }
 
@@ -7068,7 +7484,7 @@ private struct SettingsSheet: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("Wikidata and TVmaze are checked automatically for every loaded movie and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page.")
+                Text("Wikidata and TVmaze load on a title's detail page. This Settings action checks all loaded movies and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page.")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)

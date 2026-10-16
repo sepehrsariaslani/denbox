@@ -4,6 +4,11 @@ import SQLite3
 @main
 struct IMDbGenreIndexPerformanceTests {
     static func main() throws {
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--database" {
+            try measureInstalledDatabase(at: URL(fileURLWithPath: CommandLine.arguments[2]))
+            return
+        }
+
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("DenboxGenreIndexTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -26,6 +31,34 @@ struct IMDbGenreIndexPerformanceTests {
         let movieMatch = store.matchTitle(title: "Original Movie", year: "2022", kind: "Movie")
         try require(movieMatch?.tconst == "tt-movie", "indexed original-title lookup missed a movie")
 
+        let discoveryStarted = Date()
+        let discovery = store.discoveryCandidates(limit: 30_000)
+        let discoverySeconds = Date().timeIntervalSince(discoveryStarted)
+        try require(discovery.count == 30_000, "discovery lookup did not return the requested number of rated titles")
+        try require(discovery.first?.tconst == "tt0049999", "discovery lookup did not preserve rating/vote order")
+        let plan = store.discoveryQueryPlanForTesting().joined(separator: " | ")
+        try require(plan.contains("idx_discovery_rating"), "discovery lookup did not use its rating-order index: \(plan)")
+        try require(!plan.localizedCaseInsensitiveContains("temp b-tree"), "discovery lookup still sorts into a temporary B-tree: \(plan)")
+
+        let repeatedDiscoveryStarted = Date()
+        let repeatedDiscovery = store.discoveryCandidates(limit: 30_000)
+        let repeatedDiscoverySeconds = Date().timeIntervalSince(repeatedDiscoveryStarted)
+        try require(repeatedDiscovery.count == discovery.count && repeatedDiscovery.first?.tconst == discovery.first?.tconst,
+                    "cached discovery candidates changed order")
+        try require(repeatedDiscoverySeconds < 0.2, "cached discovery query took more than 200 ms")
+
+        let rankingStarted = Date()
+        let ranked = PersonalizedRecommendationRanker.rank(
+            discovery,
+            history: [],
+            preferredGenres: ["Drama"],
+            excluding: [],
+            limit: 80
+        )
+        let rankingSeconds = Date().timeIntervalSince(rankingStarted)
+        try require(ranked.count == 80, "recommendation ranking returned fewer than 80 eligible titles")
+        try require(rankingSeconds < 1, "ranking 30,000 discovery candidates took more than one second")
+
         let queryStarted = Date()
         var resultCount = 0
         for _ in 0..<20 {
@@ -35,11 +68,44 @@ struct IMDbGenreIndexPerformanceTests {
         }
         let indexedQuerySeconds = Date().timeIntervalSince(queryStarted)
         try require(resultCount == 240, "indexed recommendation and title queries returned an inconsistent result count")
-        try require(indexedQuerySeconds < 2, "twenty indexed recommendation queries took over two seconds")
+        try require(indexedQuerySeconds < 2,
+                    String(format: "twenty indexed recommendation queries took %.3fs, over two seconds", indexedQuerySeconds))
 
         print(String(format: "Legacy genre-index migration: %.3fs for 50,000 series", migrationSeconds))
+        print(String(format: "Indexed discovery query: %.3fs first run · %.3fs cached; 30,000-title ranking: %.3fs", discoverySeconds, repeatedDiscoverySeconds, rankingSeconds))
         print(String(format: "Indexed recommendations and exact title lookups: %.3fs for 60 queries", indexedQuerySeconds))
-        print("PASS IMDb indexes: legacy migration, similar-title lookup, and exact series/movie title lookup")
+        print("PASS IMDb indexes: legacy migration, discovery ordering/cache, similar-title lookup, and exact series/movie title lookup")
+    }
+
+    private static func measureInstalledDatabase(at url: URL) throws {
+        let store = IMDbMetadataStore.testingStore(databaseURL: url)
+        let firstStarted = Date()
+        let candidates = store.discoveryCandidates()
+        let firstSeconds = Date().timeIntervalSince(firstStarted)
+        try require(candidates.count == 30_000,
+                    "the installed IMDb database returned only \(candidates.count) discovery candidates")
+        let plan = store.discoveryQueryPlanForTesting().joined(separator: " | ")
+        try require(plan.contains("idx_discovery_rating"), "the installed database did not use its discovery index: \(plan)")
+        try require(!plan.localizedCaseInsensitiveContains("temp b-tree"), "the installed discovery query still uses a temporary sort: \(plan)")
+
+        let repeatedStarted = Date()
+        let repeatedCount = store.discoveryCandidates().count
+        let repeatedSeconds = Date().timeIntervalSince(repeatedStarted)
+        try require(repeatedCount == candidates.count, "the cached installed discovery query changed its result count")
+        try require(repeatedSeconds < 0.2, "the cached installed discovery query took more than 200 ms")
+
+        let facetsStarted = Date()
+        let facets = store.genreFacets()
+        let facetsSeconds = Date().timeIntervalSince(facetsStarted)
+        let cachedFacetsStarted = Date()
+        _ = store.genreFacets()
+        let cachedFacetsSeconds = Date().timeIntervalSince(cachedFacetsStarted)
+        try require(!facets.isEmpty, "the installed IMDb database returned no genre facets")
+        try require(cachedFacetsSeconds < 0.2, "cached installed genre facets took more than 200 ms")
+
+        print(String(format: "Installed IMDb index build + discovery query: %.3fs · %d candidates", firstSeconds, candidates.count))
+        print(String(format: "Installed discovery cache hit: %.4fs · genre scan %.3fs · cache hit %.4fs", repeatedSeconds, facetsSeconds, cachedFacetsSeconds))
+        print("PASS installed IMDb discovery index and in-memory caches")
     }
 
     private static func createLegacyDatabase(at url: URL, seriesCount: Int) throws {

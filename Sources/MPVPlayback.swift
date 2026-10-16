@@ -6,12 +6,19 @@ import OpenGL.GL3
 import SwiftUI
 
 struct MPVPlaybackTrack: Identifiable, Hashable {
-    enum Kind: String { case audio, subtitle }
+    enum Kind: String { case video, audio, subtitle }
 
     let id: Int
     let kind: Kind
     let displayName: String
     let isSelected: Bool
+}
+
+struct MPVPlaybackChapter: Identifiable, Hashable {
+    let index: Int
+    let title: String
+    let timeSeconds: Double
+    var id: Int { index }
 }
 
 private struct MPVHandleBox: @unchecked Sendable {
@@ -25,8 +32,20 @@ final class MPVPlaybackController: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var currentTimeSeconds = 0.0
     @Published private(set) var durationSeconds: Double?
+    @Published private(set) var videoOptions: [MPVPlaybackTrack] = []
     @Published private(set) var audioOptions: [MPVPlaybackTrack] = []
     @Published private(set) var subtitleOptions: [MPVPlaybackTrack] = []
+    @Published private(set) var chapters: [MPVPlaybackChapter] = []
+    @Published private(set) var currentChapterIndex: Int?
+    @Published private(set) var audioDelaySeconds = 0.0
+    @Published private(set) var isDeinterlacing = false
+    @Published private(set) var hardwareDecodingEnabled = true
+    @Published private(set) var videoBrightness = 0.0
+    @Published private(set) var videoContrast = 0.0
+    @Published private(set) var videoGamma = 0.0
+    @Published private(set) var videoHue = 0.0
+    @Published private(set) var videoSaturation = 0.0
+    @Published private(set) var audioEQBands = Array(repeating: 0.0, count: 5)
     @Published private(set) var volume = 100.0
     @Published private(set) var speed = 1.0
     let subtitlesCanBeDisabled = true
@@ -192,8 +211,11 @@ final class MPVPlaybackController: ObservableObject {
         errorMessage = nil
         currentTimeSeconds = 0
         durationSeconds = nil
+        videoOptions = []
         audioOptions = []
         subtitleOptions = []
+        chapters = []
+        currentChapterIndex = nil
         lastWatchTick = nil
         pendingWatchedSeconds = 0
 
@@ -266,12 +288,22 @@ final class MPVPlaybackController: ObservableObject {
         refreshTracks()
     }
 
+    func selectVideo(_ track: MPVPlaybackTrack?) {
+        setProperty("vid", value: track.map { String($0.id) } ?? "no")
+        refreshTracks()
+    }
+
     func selectSubtitle(_ track: MPVPlaybackTrack?) {
         setProperty("sid", value: track.map { String($0.id) } ?? "no")
         refreshTracks()
     }
 
     func setSubtitleDelay(_ seconds: Double) { setProperty("sub-delay", value: String(seconds)) }
+    func setAudioDelay(_ seconds: Double) {
+        guard seconds.isFinite else { return }
+        audioDelaySeconds = seconds
+        setProperty("audio-delay", value: String(seconds))
+    }
     func setSubtitleScale(_ value: Double) { setProperty("sub-scale", value: String(value)) }
     func adjustSubtitleScale(by multiplier: Double) {
         guard multiplier.isFinite, multiplier > 0 else { return }
@@ -284,10 +316,106 @@ final class MPVPlaybackController: ObservableObject {
     func setAspectRatio(_ value: String) { setProperty("video-aspect-override", value: value) }
     func setRotation(_ degrees: Int) { setProperty("video-rotate", value: String(degrees)) }
     func setFileLoop(_ enabled: Bool) { setProperty("loop-file", value: enabled ? "inf" : "no") }
+    func setHardwareDecoding(_ enabled: Bool) {
+        hardwareDecodingEnabled = enabled
+        setProperty("hwdec", value: enabled ? "auto-safe" : "no")
+    }
+    func setDeinterlacing(_ enabled: Bool) {
+        isDeinterlacing = enabled
+        setProperty("deinterlace", value: enabled ? "yes" : "no")
+    }
+
+    func setVideoAdjustment(_ property: String, value: Double) {
+        let allowed = ["brightness", "contrast", "gamma", "hue", "saturation"]
+        guard allowed.contains(property), value.isFinite else { return }
+        let bounded = min(100, max(-100, value))
+        switch property {
+        case "brightness": videoBrightness = bounded
+        case "contrast": videoContrast = bounded
+        case "gamma": videoGamma = bounded
+        case "hue": videoHue = bounded
+        case "saturation": videoSaturation = bounded
+        default: break
+        }
+        setProperty(property, value: String(bounded))
+    }
+
+    func setAudioEQBand(_ index: Int, gain: Double) {
+        guard audioEQBands.indices.contains(index), gain.isFinite else { return }
+        audioEQBands[index] = min(12, max(-12, gain))
+        let frequencies = [60, 250, 1_000, 4_000, 12_000]
+        _ = command(["af", "remove", "@denbox_eq"])
+        guard audioEQBands.contains(where: { abs($0) > 0.01 }) else { return }
+        let filters = zip(frequencies, audioEQBands).map { frequency, gain in
+            "equalizer=f=\(frequency):t=q:w=1:g=\(String(format: "%.2f", gain))"
+        }.joined(separator: ",")
+        _ = command(["af", "add", "@denbox_eq:lavfi=[\(filters)]"])
+    }
+
+    func setCropAspect(_ value: String) {
+        guard value != "no", let ratio = Self.aspectRatio(from: value),
+              let sourceWidth = getProperty("video-params/w").flatMap(Double.init),
+              let sourceHeight = getProperty("video-params/h").flatMap(Double.init),
+              sourceWidth > 0, sourceHeight > 0 else {
+            _ = command(["vf", "remove", "@denbox_crop"])
+            return
+        }
+        let sourceRatio = sourceWidth / sourceHeight
+        let cropWidth = sourceRatio > ratio ? sourceHeight * ratio : sourceWidth
+        let cropHeight = sourceRatio > ratio ? sourceHeight : sourceWidth / ratio
+        let width = max(2, Int(cropWidth.rounded(.down)) & ~1)
+        let height = max(2, Int(cropHeight.rounded(.down)) & ~1)
+        let x = max(0, (Int(sourceWidth.rounded(.down)) - width) / 2 & ~1)
+        let y = max(0, (Int(sourceHeight.rounded(.down)) - height) / 2 & ~1)
+        _ = command(["vf", "remove", "@denbox_crop"])
+        _ = command(["vf", "add", "@denbox_crop:crop=\(width):\(height):\(x):\(y)"])
+    }
+
+    func selectChapter(_ index: Int) {
+        guard chapters.contains(where: { $0.index == index }) else { return }
+        setProperty("chapter", value: String(index))
+        currentChapterIndex = index
+    }
+
+    func moveChapter(by offset: Int) {
+        guard !chapters.isEmpty else { return }
+        let current = currentChapterIndex ?? 0
+        selectChapter(min(chapters.count - 1, max(0, current + offset)))
+    }
+
+    func markABLoop() {
+        switch getProperty("ab-loop-a") {
+        case nil, "no":
+            setProperty("ab-loop-a", value: String(currentTimeSeconds))
+            setProperty("ab-loop-b", value: "no")
+        default:
+            if getProperty("ab-loop-b") == "no" {
+                setProperty("ab-loop-b", value: String(currentTimeSeconds))
+            } else {
+                setProperty("ab-loop-a", value: "no")
+                setProperty("ab-loop-b", value: "no")
+            }
+        }
+    }
+
+    func clearABLoop() {
+        setProperty("ab-loop-a", value: "no")
+        setProperty("ab-loop-b", value: "no")
+    }
+
+    var abLoopState: Int {
+        guard getProperty("ab-loop-a") != nil, getProperty("ab-loop-a") != "no" else { return 0 }
+        return getProperty("ab-loop-b") == "no" ? 1 : 2
+    }
+
+    func addAudioFile(_ url: URL) {
+        _ = command(["audio-add", url.path, "select"])
+        refreshTracksSoon()
+    }
 
     func addSubtitleFile(_ url: URL) {
         _ = command(["sub-add", url.path, "select"])
-        refreshTracks()
+        refreshTracksSoon()
     }
 
     func captureScreenshot(to url: URL) {
@@ -336,6 +464,15 @@ final class MPVPlaybackController: ObservableObject {
         durationSeconds = getProperty("duration").flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil }
         volume = getProperty("volume").flatMap(Double.init) ?? volume
         speed = getProperty("speed").flatMap(Double.init) ?? speed
+        audioDelaySeconds = getProperty("audio-delay").flatMap(Double.init) ?? audioDelaySeconds
+        isDeinterlacing = getProperty("deinterlace") == "yes"
+        hardwareDecodingEnabled = getProperty("hwdec") != "no"
+        videoBrightness = getProperty("brightness").flatMap(Double.init) ?? videoBrightness
+        videoContrast = getProperty("contrast").flatMap(Double.init) ?? videoContrast
+        videoGamma = getProperty("gamma").flatMap(Double.init) ?? videoGamma
+        videoHue = getProperty("hue").flatMap(Double.init) ?? videoHue
+        videoSaturation = getProperty("saturation").flatMap(Double.init) ?? videoSaturation
+        currentChapterIndex = getProperty("chapter").flatMap(Int.init)
         let paused = getProperty("pause") == "yes"
         let idle = getProperty("idle-active") == "yes"
         let waitingForCache = getProperty("paused-for-cache") == "yes"
@@ -361,6 +498,7 @@ final class MPVPlaybackController: ObservableObject {
         guard handle != nil else { return }
         trackRefreshAt = Date()
         let count = min(64, max(0, Int(getProperty("track-list/count") ?? "0") ?? 0))
+        var video: [MPVPlaybackTrack] = []
         var audio: [MPVPlaybackTrack] = []
         var subtitles: [MPVPlaybackTrack] = []
         for index in 0..<count {
@@ -371,7 +509,10 @@ final class MPVPlaybackController: ObservableObject {
             let language = getProperty("\(prefix)/lang").flatMap { $0.isEmpty ? nil : $0 }
             let displayName = [title, language].compactMap { $0 }.joined(separator: " · ")
             let track: MPVPlaybackTrack?
-            if type == "audio" {
+            if type == "video" {
+                track = MPVPlaybackTrack(id: id, kind: .video, displayName: displayName.isEmpty ? "Video \(id)" : displayName,
+                                         isSelected: getProperty("\(prefix)/selected") == "yes")
+            } else if type == "audio" {
                 track = MPVPlaybackTrack(id: id, kind: .audio, displayName: displayName.isEmpty ? "Audio \(id)" : displayName,
                                          isSelected: getProperty("\(prefix)/selected") == "yes")
             } else if type == "sub" {
@@ -381,10 +522,32 @@ final class MPVPlaybackController: ObservableObject {
                 track = nil
             }
             guard let track else { continue }
-            if track.kind == .audio { audio.append(track) } else { subtitles.append(track) }
+            switch track.kind {
+            case .video: video.append(track)
+            case .audio: audio.append(track)
+            case .subtitle: subtitles.append(track)
+            }
         }
+        videoOptions = video
         audioOptions = audio
         subtitleOptions = subtitles
+        let chapterCount = min(256, max(0, Int(getProperty("chapter-list/count") ?? "0") ?? 0))
+        chapters = (0..<chapterCount).map { index in
+            let title = getProperty("chapter-list/\(index)/title").flatMap { $0.isEmpty ? nil : $0 }
+            let time = getProperty("chapter-list/\(index)/time").flatMap(Double.init) ?? 0
+            return MPVPlaybackChapter(index: index, title: title ?? "Chapter \(index + 1)", timeSeconds: time)
+        }
+    }
+
+    private func refreshTracksSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.refreshTracks() }
+    }
+
+    private static func aspectRatio(from value: String) -> Double? {
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2, let width = Double(parts[0]), let height = Double(parts[1]),
+              width > 0, height > 0 else { return nil }
+        return width / height
     }
 
     private func setProperty(_ name: String, value: String) {

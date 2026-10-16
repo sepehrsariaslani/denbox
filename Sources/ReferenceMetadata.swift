@@ -79,14 +79,15 @@ enum ReferenceMetadataService {
             genres: details.genres.isEmpty ? metadata.genres : details.genres,
             country: details.country?.referenceNonEmpty ?? metadata.country,
             director: details.director?.referenceNonEmpty ?? metadata.director,
-            cast: details.cast.isEmpty ? metadata.cast : details.cast,
+            cast: Array((details.cast + metadata.cast).uniqued().prefix(20)),
             sources: details.sources,
             downloadSources: details.downloadSources,
             seasons: details.seasons,
             imdbID: details.imdbID,
             imdbRating: details.imdbRating,
             imdbVotes: details.imdbVotes,
-            similarSeries: details.similarSeries
+            similarSeries: details.similarSeries,
+            castPeople: details.castPeople
         )
     }
 
