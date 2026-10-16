@@ -47,31 +47,12 @@ The IMDb importer limits its SQLite page caches, uses disk-backed temporary stor
 ## Build
 
 ```sh
-mkdir -p dist/Denbox.app/Contents/{MacOS,Resources,Frameworks}
-mkdir -p dist/Denbox.app/Contents/Resources/fa.lproj
-mkdir -p dist/Denbox.app/Contents/Resources/Fonts
-cp Resources/Info.plist dist/Denbox.app/Contents/Info.plist
-cp Resources/AppIcon.icns dist/Denbox.app/Contents/Resources/AppIcon.icns
-cp Resources/Denbox-Icon.png dist/Denbox.app/Contents/Resources/Denbox-Icon.png
-cp Resources/TMDB-Logo.png dist/Denbox.app/Contents/Resources/TMDB-Logo.png
-cp Resources/Fonts/*.ttf dist/Denbox.app/Contents/Resources/Fonts/
-cp Resources/fa.lproj/Localizable.strings dist/Denbox.app/Contents/Resources/fa.lproj/Localizable.strings
-cp /Applications/IINA.app/Contents/Frameworks/*.dylib dist/Denbox.app/Contents/Frameworks/
-# Private-release option: seed this Mac's required API keys for first-run Keychain import.
-python3 Scripts/embed-private-api-keys.py dist/Denbox.app
-swiftc -parse-as-library -swift-version 5 -O \
-  -target arm64-apple-macosx13.0 \
-  -I Sources/MPV -framework SwiftUI -framework AppKit -framework MediaPlayer -framework OpenGL -framework ImageIO -framework Network \
-  -framework Security -framework UniformTypeIdentifiers -framework WebKit -lsqlite3 \
-  -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
-  Sources/SimbaMac.swift Sources/DenboxLanguage.swift Sources/DiscoveryFeeds.swift Sources/MPVPlayback.swift Sources/IINAPlaybackMonitor.swift Sources/PublicTitleMetadata.swift Sources/PublicMetadataDiscovery.swift Sources/PublicTitlePageImportView.swift Sources/ReferenceMetadata.swift \
-  Sources/SegmentedDownloader.swift Sources/IMDbMetadata.swift Sources/ViewingActivity.swift Sources/OnlineSubtitleSearchView.swift Sources/OpenSubtitles.swift \
-  /Applications/IINA.app/Contents/Frameworks/libmpv.1.dylib \
-  -o dist/Denbox.app/Contents/MacOS/Denbox
-codesign --force --deep --sign - dist/Denbox.app
+./Scripts/build-private-app.sh
 ```
 
-The build links and bundles libmpv and its runtime libraries from the installed IINA app, then runs that engine inside Denbox. IINA must be installed to build this personal bundle; playback does not launch the IINA app. The bundle identifier and existing Keychain/database locations intentionally retain the Simba identity so this rename keeps the current API credentials, catalog cache, and My List. `Scripts/embed-private-api-keys.py` reads the required media/catalog keys and any available TMDB/OpenSubtitles keys from the builder's Keychain, then creates a binary bootstrap resource inside the app. Denbox imports these values to the recipient's Keychain on first use without displaying or logging them. Anyone with the app bundle can extract the included keys; only use this option for a private release shared with trusted recipients. This build targets Apple Silicon and macOS 13 or newer. It is ad-hoc signed and not notarized.
+The build script targets Apple Silicon and macOS 13 or newer. It uses IINA 1.3.0's bundled libmpv and runtime libraries, but does not require IINA to be installed: when that exact version is unavailable locally, it downloads the official release DMG and verifies its SHA-256 before extracting the libraries. Playback runs inside Denbox and never launches IINA.
+
+For private API access, the script first uses this Mac's existing Denbox Keychain entries. If the required Simba keys are absent, it downloads the credential bootstrap from the private `v0.2.10` release. A source builder therefore needs access to the private GitHub repository and release, using `gh auth login` or saved HTTPS Git credentials; they do not need to enter API keys or install IINA. The release DMG already contains the same bootstrap and needs no GitHub sign-in to run. Denbox imports the bundled values to the recipient's Keychain on first launch without displaying or logging them. Anyone with the private app bundle can extract and use the shared keys, so keep the repository and releases restricted to trusted recipients. The bundle identifier and existing Keychain/database locations retain the Simba identity so the rename keeps the current API credentials, catalog cache, and My List. Builds are ad-hoc signed and not notarized.
 
 The current embedded video surface uses AppKit OpenGL APIs, which the macOS SDK marks deprecated; the app still builds, but the renderer should be revisited for long-term macOS support.
 
