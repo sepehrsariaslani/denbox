@@ -698,6 +698,7 @@ final class LibraryModel: ObservableObject {
     private var publicMetadataLookupsInFlight: Set<String> = []
     private var publicTitleCatalogTask: Task<Void, Never>?
     private var publicTitleCatalogRefreshRequested = false
+    private var publicTitleCatalogForceRefreshRequested = false
     private var referenceCatalogEnrichmentTask: Task<Void, Never>?
     private var referenceCatalogEnrichmentRequested = false
     private var forceTMDBReferenceRefreshRequested = false
@@ -852,6 +853,7 @@ final class LibraryModel: ObservableObject {
     }
 
     func checkPublicTitlePagesForCatalog() {
+        publicTitleCatalogForceRefreshRequested = true
         schedulePublicTitleCatalogEnrichment()
     }
 
@@ -871,19 +873,21 @@ final class LibraryModel: ObservableObject {
         let merged = existing.map { metadata.merging($0) } ?? metadata
         guard database.savePublicTitleMetadata(merged, for: mediaID) else { return false }
         database.recordPublicTitleMetadataAttempt(mediaID: mediaID, provider: metadata.provider)
+        applyCachedPublicMetadataToCatalog(mediaID: mediaID)
         return true
     }
 
-    func refreshPublicTitleMetadata(for item: MediaItem) async -> (attempted: Int, updated: Int) {
+    func refreshPublicTitleMetadata(for item: MediaItem, force: Bool = false) async -> (attempted: Int, updated: Int) {
         guard item.isRemote, ["Movie", "Series"].contains(item.kind) else { return (0, 0) }
-        let cooldown: TimeInterval = 24 * 60 * 60
         let providers = PublicMetadataProvider.allCases
         let dueProviders = providers.filter { provider in
             let cached = database.loadPublicTitleMetadata(mediaID: item.id, provider: provider)
-            let needsRefresh = cached?.needsAutomaticRefresh() ?? true
-            guard needsRefresh else { return false }
-            if let attemptedAt = database.publicTitleMetadataLastAttempt(mediaID: item.id, provider: provider),
-               Date().timeIntervalSince(attemptedAt) < cooldown { return false }
+            let attemptedAt = database.publicTitleMetadataLastAttempt(mediaID: item.id, provider: provider)
+            guard PublicTitleMetadataRefreshPolicy.shouldRefresh(
+                cached: cached,
+                lastAttempt: attemptedAt,
+                force: force
+            ) else { return false }
             return !publicMetadataLookupsInFlight.contains("\(item.id)|\(provider.rawValue)")
         }
         guard !dueProviders.isEmpty else { return (0, 0) }
@@ -925,10 +929,11 @@ final class LibraryModel: ObservableObject {
             database.loadPublicTitleMetadata(mediaID: mediaID, provider: $0)
         }
         let enriched = item.applyingPublicTitleMetadata(metadata)
-        guard enriched != item else { return }
-        items[index] = enriched
-        if let rating = personalRatings[mediaID], database.updatePersonalRatingSnapshot(enriched) {
-            personalRatings[mediaID] = PersonalRating(rating: rating.rating, item: enriched, updatedAt: rating.updatedAt)
+        if enriched != item {
+            items[index] = enriched
+            if let rating = personalRatings[mediaID], database.updatePersonalRatingSnapshot(enriched) {
+                personalRatings[mediaID] = PersonalRating(rating: rating.rating, item: enriched, updatedAt: rating.updatedAt)
+            }
         }
         detailsRefreshRevision += 1
     }
@@ -1144,14 +1149,18 @@ final class LibraryModel: ObservableObject {
 
             repeat {
                 self.publicTitleCatalogRefreshRequested = false
+                let forceRefresh = self.publicTitleCatalogForceRefreshRequested
+                self.publicTitleCatalogForceRefreshRequested = false
                 let pending = self.items.filter { item in
                     guard item.isRemote, ["Movie", "Series"].contains(item.kind) else { return false }
-                    let cooldown: TimeInterval = 24 * 60 * 60
                     return PublicMetadataProvider.allCases.contains { provider in
                         let cached = self.database.loadPublicTitleMetadata(mediaID: item.id, provider: provider)
-                        guard cached?.needsAutomaticRefresh() ?? true else { return false }
-                        if let attemptedAt = self.database.publicTitleMetadataLastAttempt(mediaID: item.id, provider: provider),
-                           Date().timeIntervalSince(attemptedAt) < cooldown { return false }
+                        let attemptedAt = self.database.publicTitleMetadataLastAttempt(mediaID: item.id, provider: provider)
+                        guard PublicTitleMetadataRefreshPolicy.shouldRefresh(
+                            cached: cached,
+                            lastAttempt: attemptedAt,
+                            force: forceRefresh
+                        ) else { return false }
                         return !self.publicMetadataLookupsInFlight.contains("\(item.id)|\(provider.rawValue)")
                     }
                 }
@@ -1159,8 +1168,9 @@ final class LibraryModel: ObservableObject {
                 self.publicTitleCatalogStatus = "Updating Persian metadata from Filimo and HexDL…"
                 for item in pending {
                     guard !Task.isCancelled else { break }
-                    let result = await self.refreshPublicTitleMetadata(for: item)
+                    let result = await self.refreshPublicTitleMetadata(for: item, force: forceRefresh)
                     if result.attempted > 0 { checkedTitles += 1 }
+                    if result.attempted > 0 { try? await Task.sleep(nanoseconds: 500_000_000) }
                 }
             } while self.publicTitleCatalogRefreshRequested && !Task.isCancelled
         }
@@ -6771,7 +6781,7 @@ private struct MediaDetailPage: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Persian details and artwork")
                     .font(.denbox(size: 21, weight: .bold))
-                Text("Denbox searches public Filimo and HexDL title pages automatically when this page opens. You can search again or paste a public page URL below. Matching Persian text and artwork are saved on this Mac.")
+                Text("Denbox checks public Filimo and HexDL pages automatically for loaded titles and when this page opens. Matching Persian text and artwork are saved on this Mac.")
                     .font(.denbox(size: 11))
                     .foregroundStyle(Color.secondaryText)
             }
@@ -6807,7 +6817,7 @@ private struct MediaDetailPage: View {
         isSearchingPublicMetadata = true
         publicMetadataStatus = "Searching Filimo and HexDL for public Persian details…"
         Task { @MainActor in
-            let result = await model.refreshPublicTitleMetadata(for: item)
+            let result = await model.refreshPublicTitleMetadata(for: item, force: true)
             filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
             hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
             filimoURLText = filimoMetadata?.pageURL.absoluteString ?? filimoURLText

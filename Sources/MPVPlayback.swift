@@ -123,7 +123,7 @@ final class MPVPlaybackController: ObservableObject {
             ("cache-secs", "45"),
             ("cache-pause", "yes"),
             ("cache-pause-initial", "yes"),
-            ("cache-pause-wait", "3"),
+            ("cache-pause-wait", "8"),
             ("demuxer-max-bytes", "512MiB"),
             ("demuxer-max-back-bytes", "128MiB"),
             ("sub-auto", "fuzzy"),
@@ -225,15 +225,31 @@ final class MPVPlaybackController: ObservableObject {
     }
 
     func toggleFullscreen() {
-        guard let window = playerWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else { return }
+        // Prefer the key window because SwiftUI can replace its window while
+        // moving a WindowGroup scene. The render view's weak reference can
+        // briefly point at the previous window during that transition.
+        guard let window = [NSApp.keyWindow, playerWindow, NSApp.mainWindow]
+            .compactMap({ $0 })
+            .first(where: \.isVisible) else { return }
         window.collectionBehavior.insert(.fullScreenPrimary)
-        window.toggleFullScreen(nil)
+        // AppKit may ignore a fullscreen request issued in the middle of a
+        // SwiftUI button update. Schedule it on the next main-loop turn after
+        // making the visible player window key.
+        DispatchQueue.main.async { [weak window] in
+            guard let window, window.isVisible else { return }
+            window.makeKeyAndOrderFront(nil)
+            window.toggleFullScreen(nil)
+        }
     }
 
-    func render(width: Int32, height: Int32) -> Bool {
+    func render(width: Int32, height: Int32, force: Bool = false) -> Bool {
         guard width > 0, height > 0, let renderContext else { return false }
         let flags = mpv_render_context_update(renderContext)
-        guard flags & UInt64(MPV_RENDER_UPDATE_FRAME.rawValue) != 0 else { return false }
+        // NSOpenGLView uses a double-buffered drawable whose back buffer can
+        // be discarded after a swap or window/screen transition. Re-rendering
+        // the current mpv frame on an AppKit redraw keeps that surface from
+        // flashing black when the stream itself has not produced a new frame.
+        guard force || flags & UInt64(MPV_RENDER_UPDATE_FRAME.rawValue) != 0 else { return false }
 
         var framebuffer = mpv_opengl_fbo(fbo: 0, w: width, h: height, internal_format: 0)
         var flip: Int32 = 1
@@ -1063,6 +1079,7 @@ final class MPVRenderView: NSOpenGLView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window != nil, let openGLContext {
+            openGLContext.update()
             controller.attachRenderer(using: openGLContext)
             needsDisplay = true
         }
@@ -1117,7 +1134,7 @@ final class MPVRenderView: NSOpenGLView {
         guard let openGLContext else { return }
         openGLContext.makeCurrentContext()
         let scale = window?.backingScaleFactor ?? 1
-        if controller.render(width: Int32(bounds.width * scale), height: Int32(bounds.height * scale)) {
+        if controller.render(width: Int32(bounds.width * scale), height: Int32(bounds.height * scale), force: hasRenderedFrame) {
             hasRenderedFrame = true
             openGLContext.flushBuffer()
             controller.reportSwap()
@@ -1126,6 +1143,20 @@ final class MPVRenderView: NSOpenGLView {
             glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
             openGLContext.flushBuffer()
         }
+    }
+
+    override func reshape() {
+        super.reshape()
+        openGLContext?.update()
+        openGLContext?.makeCurrentContext()
+        needsDisplay = true
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        openGLContext?.update()
+        openGLContext?.makeCurrentContext()
+        needsDisplay = true
     }
 
     func detach() {

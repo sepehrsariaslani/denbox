@@ -255,3 +255,18 @@ struct PublicTitleMetadata: Codable, Sendable, Identifiable {
         )
     }
 }
+
+enum PublicTitleMetadataRefreshPolicy {
+    static let retryInterval: TimeInterval = 24 * 60 * 60
+
+    static func shouldRefresh(
+        cached: PublicTitleMetadata?,
+        lastAttempt: Date?,
+        now: Date = Date(),
+        force: Bool = false
+    ) -> Bool {
+        guard force || (cached?.needsAutomaticRefresh(now: now) ?? true) else { return false }
+        if !force, let lastAttempt, now.timeIntervalSince(lastAttempt) < retryInterval { return false }
+        return true
+    }
+}

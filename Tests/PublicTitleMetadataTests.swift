@@ -38,6 +38,21 @@ struct PublicTitleMetadataTests {
         let restored = try JSONDecoder().decode(PublicTitleMetadata.self, from: encoded)
         try require(restored.title == source.title && restored.visiblePageText == source.visiblePageText,
                     "the imported public metadata did not survive local serialization")
+        let firstRetry = source.importedAt.addingTimeInterval(60 * 60)
+        try require(!PublicTitleMetadataRefreshPolicy.shouldRefresh(
+            cached: source, lastAttempt: source.importedAt, now: firstRetry
+        ), "a fresh Persian synopsis and poster were refreshed too soon")
+        try require(PublicTitleMetadataRefreshPolicy.shouldRefresh(
+            cached: source,
+            lastAttempt: source.importedAt,
+            now: source.importedAt.addingTimeInterval(31 * 24 * 60 * 60)
+        ), "complete public metadata did not become due after its refresh interval")
+        try require(!PublicTitleMetadataRefreshPolicy.shouldRefresh(
+            cached: nil, lastAttempt: firstRetry, now: firstRetry.addingTimeInterval(60 * 60)
+        ), "an unsuccessful search bypassed its retry cooldown")
+        try require(PublicTitleMetadataRefreshPolicy.shouldRefresh(
+            cached: source, lastAttempt: firstRetry, now: firstRetry, force: true
+        ), "a manual refresh did not bypass the cache and cooldown")
 
         let englishRefresh = PublicTitleMetadata(
             provider: .filimo,
@@ -61,6 +76,29 @@ struct PublicTitleMetadataTests {
         ]) == "توضیحات فارسی موجود در کاتالوگ.",
                     "an English public/reference summary hid the existing Persian catalog description")
 
+        let hexEnglish = PublicTitleMetadata(
+            provider: .hexDL,
+            pageURL: URL(string: "https://hexdl.com/sample-movie/")!,
+            title: "Sample Movie",
+            synopsis: "An English HexDL summary.",
+            posterURL: URL(string: "https://hexdl.com/hex-poster.jpg"),
+            visiblePageText: "English details",
+            visibleHeadings: [],
+            episodeSnippets: [],
+            imageURLs: [],
+            importedAt: source.importedAt.addingTimeInterval(120)
+        )
+        let catalogItem = MediaItem(
+            id: "movie-1", title: "Sample Movie", subtitle: "Movie", synopsis: "Existing English catalog summary.",
+            year: "2020", kind: "Movie", symbol: "film", palette: 0,
+            artworkURL: URL(string: "https://simba.example/current-poster.jpg"), isRemote: true
+        )
+        let enrichedCatalogItem = catalogItem.applyingPublicTitleMetadata([hexEnglish, source])
+        try require(enrichedCatalogItem.synopsis == source.synopsis,
+                    "the catalog item did not prefer a saved Persian public synopsis")
+        try require(enrichedCatalogItem.artworkURL == source.posterURL,
+                    "the catalog item did not prefer the Filimo poster over HexDL and Simba artwork")
+
         let matching = PublicMetadataCandidate(
             index: 0,
             text: "شهرزاد • سریال • درام • ۱۳۹۴ - ۱۳۹۶",
@@ -82,7 +120,7 @@ struct PublicTitleMetadataTests {
             in: [actor], matching: ["Shahrzad"], kind: "Series", year: "2015"
         ).map { $0.candidate.index } == nil, "the title matcher accepted an actor as an exact title page")
 
-        print("PASS public metadata: search allowlists, Persian synopsis preservation, title matching, and local encoding")
+        print("PASS public metadata: matching, Persian synopsis priority, refresh policy, cooldown, and forced refresh")
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
