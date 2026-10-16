@@ -40,6 +40,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {
     case imdbPeople = "IMDb People"
     case imdbFranchises = "IMDb Franchises"
     case watchlist = "My List"
+    case myRatings = "My Ratings"
     case downloads = "Downloads"
 
     var id: String { rawValue }
@@ -58,12 +59,13 @@ enum LibrarySection: String, CaseIterable, Identifiable {
         case .imdbPeople: "person.2"
         case .imdbFranchises: "rectangle.stack"
         case .watchlist: "bookmark"
+        case .myRatings: "star"
         case .downloads: "arrow.down.circle"
         }
     }
 }
 
-struct MediaItem: Identifiable, Hashable, Sendable {
+struct MediaItem: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let apiID: String?
     let title: String
@@ -222,6 +224,27 @@ extension MediaItem {
             genres: metadata.genres,
             imdbRating: metadata.rating.map { String(format: "%.1f", $0) },
             imdbVotes: metadata.votes
+        )
+    }
+
+    func applyingReference(_ metadata: ReferenceTitleMetadata) -> MediaItem {
+        MediaItem(
+            id: id,
+            apiID: apiID,
+            title: title,
+            subtitle: subtitle,
+            synopsis: synopsis.nilIfEmpty ?? metadata.synopsis ?? synopsis,
+            year: year.nilIfEmpty ?? metadata.year ?? year,
+            kind: kind,
+            symbol: symbol,
+            palette: palette,
+            artworkURL: artworkURL ?? metadata.posterURL,
+            isRemote: isRemote,
+            matchingTitles: matchingTitles,
+            imdbID: imdbID,
+            genres: genres.isEmpty ? metadata.genres : genres,
+            imdbRating: imdbRating,
+            imdbVotes: imdbVotes
         )
     }
 }
@@ -532,6 +555,7 @@ final class LibraryModel: ObservableObject {
     @Published var section: LibrarySection = .home
     @Published var searchText = ""
     @Published var savedIDs: Set<String> = []
+    @Published private(set) var personalRatings: [String: PersonalRating] = [:]
     @Published var selectedItem: MediaItem?
     @Published var playerURL: URL?
     @Published var playerTitle = "Now Playing"
@@ -552,7 +576,9 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var imdbChartLists: IMDbChartLists?
     @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var imdbPeopleAvailable = false
+    @Published private(set) var publicReferenceStatus = "Public references are checked automatically when the catalog loads."
     @Published private(set) var genreFacets: [IMDbGenreFacet] = []
+    @Published private(set) var isLoadingGenreFacets = false
     @Published private(set) var preferredGenres: Set<String> = []
     @Published private(set) var recommendations: [IMDbTitleMetadata] = []
     @Published private(set) var referenceMetadataByID: [String: ReferenceTitleMetadata] = [:]
@@ -574,6 +600,8 @@ final class LibraryModel: ObservableObject {
     private var imdbEnrichmentsInFlight: Set<String> = []
     private var imdbRecommendationsInFlight: Set<String> = []
     private var referenceMetadataLookupsInFlight: Set<String> = []
+    private var referenceCatalogEnrichmentTask: Task<Void, Never>?
+    private var recommendationsNeedRefresh = false
     private var catalogRefreshInProgress = false
     private var detailRefreshesInFlight: Set<String> = []
     private var activeRemotePlayback: (
@@ -612,12 +640,12 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Local database · \(movies) movies · \(series) series"
         }
         savedIDs = database.loadSavedIDs()
+        personalRatings = database.loadPersonalRatings()
         refreshViewingData()
-        if IMDbMetadataStore.shared.isAvailable {
-            Task {
-                await enrichCatalogWithIMDb()
-                await refreshDiscoveryData()
-            }
+        Task {
+            await enrichCatalogWithIMDb()
+            if IMDbMetadataStore.shared.isAvailable { await loadGenreFacets() }
+            scheduleCatalogReferenceEnrichment()
         }
         if loadRemoteCatalog {
             if SecretVault.read(account: "media-api-key") != nil,
@@ -642,16 +670,18 @@ final class LibraryModel: ObservableObject {
             base = []
         case .watchlist:
             base = items.filter { savedIDs.contains($0.id) }
+        case .myRatings:
+            base = personalRatings.values.sorted { $0.updatedAt > $1.updatedAt }.map(\.item)
         case .downloads:
             base = []
         }
-        let genreFiltered = selectedGenreFilters.isEmpty
+        let genreFiltered = selectedGenreFilters.isEmpty || section == .myRatings
             ? base
             : base.filter { !Set($0.genres).isDisjoint(with: selectedGenreFilters) }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return genreFiltered }
         let localMatches = genreFiltered.filter { $0.title.localizedCaseInsensitiveContains(query) }
-        guard didFinishRemoteSearch else { return localMatches }
+        guard didFinishRemoteSearch, section != .myRatings else { return localMatches }
         var seen = Set(localMatches.map(\.id))
         return localMatches + remoteSearchResults.filter { seen.insert($0.id).inserted }
     }
@@ -666,6 +696,17 @@ final class LibraryModel: ObservableObject {
         }
     }
 
+    func setPersonalRating(_ rating: Int?, for item: MediaItem) {
+        guard rating.map({ (1...5).contains($0) }) ?? true,
+              database.setPersonalRating(rating, for: item) else { return }
+        if let rating {
+            personalRatings[item.id] = PersonalRating(rating: rating, item: item, updatedAt: Date())
+        } else {
+            personalRatings.removeValue(forKey: item.id)
+        }
+        invalidateRecommendations()
+    }
+
     func refreshViewingData() {
         continueWatchingItems = database.loadWatchProgress(limit: 500)
             .filter { !$0.isWatched && $0.positionSeconds >= 15 }
@@ -675,6 +716,11 @@ final class LibraryModel: ObservableObject {
 
     var hasIMDbData: Bool { IMDbMetadataStore.shared.isAvailable }
     var isTrackingPlayback: Bool { activeWatchSessionID != nil }
+    var isCheckingPublicReferences: Bool { referenceCatalogEnrichmentTask != nil }
+
+    func checkPublicReferencesForCatalog() {
+        scheduleCatalogReferenceEnrichment()
+    }
 
     func publicTitleMetadata(mediaID: String, provider: PublicMetadataProvider) -> PublicTitleMetadata? {
         database.loadPublicTitleMetadata(mediaID: mediaID, provider: provider)
@@ -693,10 +739,11 @@ final class LibraryModel: ObservableObject {
 
     func exportViewingActivity(to url: URL) {
         let export = ViewingDataExport(
-            schemaVersion: 1,
+            schemaVersion: 2,
             exportedAt: Date(),
             progress: database.loadWatchProgress(limit: nil, includeWatched: true),
-            history: database.loadWatchHistory(limit: nil)
+            history: database.loadWatchHistory(limit: nil),
+            personalRatings: personalRatings.values.sorted { $0.updatedAt > $1.updatedAt }
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -704,10 +751,57 @@ final class LibraryModel: ObservableObject {
         do {
             let data = try encoder.encode(export)
             try data.write(to: url, options: .atomic)
-            viewingUpdateMessage = "Viewing history export saved."
+            viewingUpdateMessage = "Viewing data export saved."
         } catch {
-            viewingUpdateMessage = "Could not save the viewing history export: \(error.localizedDescription)"
+            viewingUpdateMessage = "Could not save the viewing data export: \(error.localizedDescription)"
         }
+    }
+
+    func prepareViewingDataImport(from url: URL) -> ViewingDataImportPreview? {
+        guard !isTrackingPlayback else {
+            viewingUpdateMessage = "Close active playback before importing viewing data."
+            return nil
+        }
+        do {
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let size = attributes[.size] as? NSNumber,
+               size.int64Value > 50_000_000 {
+                viewingUpdateMessage = "The selected viewing-data file is larger than 50 MB."
+                return nil
+            }
+            let data = try Data(contentsOf: url)
+            guard data.count <= 50_000_000 else {
+                viewingUpdateMessage = "The selected viewing-data file is larger than 50 MB."
+                return nil
+            }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let export = try decoder.decode(ViewingDataExport.self, from: data).validated()
+            viewingUpdateMessage = nil
+            return ViewingDataImportPreview(fileName: url.lastPathComponent, export: export)
+        } catch let error as ViewingDataImportError {
+            viewingUpdateMessage = error.localizedDescription
+        } catch {
+            viewingUpdateMessage = "Could not read viewing data: \(error.localizedDescription)"
+        }
+        return nil
+    }
+
+    @discardableResult
+    func mergeViewingData(_ export: ViewingDataExport) -> Bool {
+        guard !isTrackingPlayback else {
+            viewingUpdateMessage = "Close active playback before importing viewing data."
+            return false
+        }
+        guard let export = try? export.validated(), database.mergeViewingData(export) else {
+            viewingUpdateMessage = "Could not merge viewing data. Your existing data was kept."
+            return false
+        }
+        personalRatings = database.loadPersonalRatings()
+        refreshViewingData()
+        viewingUpdateMessage = "Viewing data merged. Newer local progress and ratings were kept; duplicate sessions were skipped."
+        invalidateRecommendations()
+        return true
     }
 
     func clearViewingActivity() {
@@ -721,46 +815,175 @@ final class LibraryModel: ObservableObject {
         }
         refreshViewingData()
         viewingUpdateMessage = "Viewing history and progress cleared."
-        Task { await refreshDiscoveryData() }
+        invalidateRecommendations()
     }
 
     func refreshDiscoveryData() async {
         guard !isLoadingRecommendations else { return }
         isLoadingRecommendations = true
-        defer { isLoadingRecommendations = false }
+        recommendationsNeedRefresh = false
+        defer {
+            isLoadingRecommendations = false
+            if recommendationsNeedRefresh, section == .forYou {
+                Task { await refreshDiscoveryData() }
+            }
+        }
         let store = IMDbMetadataStore.shared
         let (facets, candidates) = await Task.detached(priority: .userInitiated) {
             (store.genreFacets(), store.discoveryCandidates())
         }.value
         genreFacets = facets
         refreshViewingData()
+        let history = watchHistory
+        let preferences = preferredGenres
+        let userRatings = Array(personalRatings.values)
         let watched = Set(database.loadWatchProgress(limit: 2_000, includeWatched: true)
             .filter { $0.isWatched || $0.progress >= 0.9 }
             .compactMap(\.imdbID))
-        recommendations = PersonalizedRecommendationRanker.rank(
-            candidates,
-            history: watchHistory,
-            preferredGenres: preferredGenres,
-            excluding: watched,
-            limit: 80
-        )
+        recommendations = await Task.detached(priority: .userInitiated) {
+            PersonalizedRecommendationRanker.rank(
+                candidates,
+                history: history,
+                preferredGenres: preferences,
+                excluding: watched,
+                personalRatings: userRatings,
+                limit: 80
+            )
+        }.value
+    }
+
+    func loadGenreFacets() async {
+        guard genreFacets.isEmpty, !isLoadingGenreFacets, IMDbMetadataStore.shared.isAvailable else { return }
+        isLoadingGenreFacets = true
+        defer { isLoadingGenreFacets = false }
+        let facets = await Task.detached(priority: .utility) {
+            IMDbMetadataStore.shared.genreFacets()
+        }.value
+        genreFacets = facets
+    }
+
+    private func invalidateRecommendations() {
+        recommendations = []
+        recommendationsNeedRefresh = true
+        if section == .forYou, !isLoadingRecommendations {
+            Task { await refreshDiscoveryData() }
+        }
     }
 
     func enrichCatalogWithIMDb() async {
-        guard IMDbMetadataStore.shared.isAvailable, !items.isEmpty else { return }
+        guard !items.isEmpty else { return }
         let catalog = items
-        let metadata = await Task.detached(priority: .utility) {
-            IMDbMetadataStore.shared.catalogMetadata(for: catalog)
-        }.value
-        guard !metadata.isEmpty else { return }
+        let metadata: [String: IMDbTitleMetadata]
+        if IMDbMetadataStore.shared.isAvailable {
+            metadata = await Task.detached(priority: .utility) {
+                IMDbMetadataStore.shared.catalogMetadata(for: catalog)
+            }.value
+        } else {
+            metadata = [:]
+        }
         var enriched: [MediaItem] = []
         enriched.reserveCapacity(catalog.count)
+        var refreshedRatedMetadata = false
         for item in catalog {
-            guard let title = metadata[item.id] else { enriched.append(item); continue }
-            database.saveIMDbMetadata(title, for: item.id)
-            enriched.append(item.applyingIMDb(title))
+            var resolved = item
+            if let title = metadata[item.id] {
+                database.saveIMDbMetadata(title, for: item.id)
+                resolved = resolved.applyingIMDb(title)
+            }
+            if let reference = database.loadReferenceMetadata(mediaID: item.id) {
+                referenceMetadataByID[item.id] = reference
+                resolved = resolved.applyingReference(reference)
+            }
+            if metadata[item.id] != nil,
+               let existingRating = personalRatings[item.id],
+               database.updatePersonalRatingSnapshot(resolved) {
+                personalRatings[item.id] = PersonalRating(
+                    rating: existingRating.rating,
+                    item: resolved,
+                    updatedAt: existingRating.updatedAt
+                )
+                refreshedRatedMetadata = true
+            }
+            enriched.append(resolved)
         }
         items = enriched
+        if refreshedRatedMetadata { invalidateRecommendations() }
+    }
+
+    private func scheduleCatalogReferenceEnrichment() {
+        guard referenceCatalogEnrichmentTask == nil else { return }
+        referenceCatalogEnrichmentTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var completedCount = 0
+            defer {
+                self.referenceCatalogEnrichmentTask = nil
+                if completedCount > 0 {
+                    self.publicReferenceStatus = "Checked public references for \(completedCount) titles."
+                } else if self.items.isEmpty {
+                    self.publicReferenceStatus = "Load a catalog to check public metadata references."
+                } else {
+                    self.publicReferenceStatus = "Public reference metadata is up to date."
+                }
+            }
+
+            while !Task.isCancelled {
+                let pending = self.items.compactMap { item -> (MediaItem, ReferenceTitleMetadata?, String)? in
+                    guard item.kind == "Movie" || item.kind == "Series" else { return nil }
+                    let imdbID = item.imdbID
+                    let cached = self.database.loadReferenceMetadata(mediaID: item.id)
+                    guard ReferenceMetadataService.shouldRefresh(cached, for: item, imdbID: imdbID) else { return nil }
+                    let lookupKey = "\(item.id)|\(imdbID ?? "series")"
+                    guard self.referenceMetadataLookupsInFlight.insert(lookupKey).inserted else { return nil }
+                    return (item, cached, lookupKey)
+                }
+                guard !pending.isEmpty else { break }
+
+                let batch = Array(pending.prefix(24))
+                for skipped in pending.dropFirst(batch.count) {
+                    self.referenceMetadataLookupsInFlight.remove(skipped.2)
+                }
+                self.publicReferenceStatus = "Checking public metadata for \(batch.count) titles…"
+                await withTaskGroup(of: (String, String, ReferenceTitleMetadata).self) { group in
+                    var nextIndex = 0
+                    for input in batch.prefix(3) {
+                        group.addTask {
+                            let metadata = await ReferenceMetadataService.fetch(
+                                for: input.0,
+                                imdbID: input.0.imdbID,
+                                existing: input.1
+                            )
+                            return (input.0.id, input.2, metadata)
+                        }
+                        nextIndex += 1
+                    }
+
+                    while let (mediaID, lookupKey, metadata) = await group.next() {
+                        self.referenceMetadataLookupsInFlight.remove(lookupKey)
+                        let latest = self.database.loadReferenceMetadata(mediaID: mediaID)
+                        let combined = metadata.merging(latest ?? .empty())
+                        self.database.saveReferenceMetadata(combined, mediaID: mediaID)
+                        self.referenceMetadataByID[mediaID] = combined
+                        if let index = self.items.firstIndex(where: { $0.id == mediaID }) {
+                            self.items[index] = self.items[index].applyingReference(combined)
+                        }
+                        completedCount += 1
+
+                        if nextIndex < batch.count {
+                            let input = batch[nextIndex]
+                            group.addTask {
+                                let metadata = await ReferenceMetadataService.fetch(
+                                    for: input.0,
+                                    imdbID: input.0.imdbID,
+                                    existing: input.1
+                                )
+                                return (input.0.id, input.2, metadata)
+                            }
+                            nextIndex += 1
+                        }
+                    }
+                }
+            }
+        }
     }
 
     func toggleGenreFilter(_ genre: String) {
@@ -778,7 +1001,7 @@ final class LibraryModel: ObservableObject {
         if preferredGenres.contains(genre) { preferredGenres.remove(genre) }
         else { preferredGenres.insert(genre) }
         database.saveGenrePreferences(preferredGenres, category: "preferred")
-        Task { await refreshDiscoveryData() }
+        invalidateRecommendations()
     }
 
     func saveAPIKeys(mediaAPIKey: String, feedKey: String) {
@@ -833,16 +1056,22 @@ final class LibraryModel: ObservableObject {
 
     private func fetchDetails(for item: MediaItem, apiKey: String, reportFailure: Bool) async -> MediaDetails? {
         var fallback: (details: MediaDetails, payload: Any)?
-        for url in DirectMediaAPI.detailsURLs(for: item, apiKey: apiKey) {
-            if let response = try? await DirectMediaAPI.getJSON(url: url, timeout: 12) {
-                let details = Self.parseDetails(response, for: item)
-                if details.hasPlayableResources {
-                    cacheDetailsPayload(response, for: item)
-                    scheduleIMDbEnrichment(for: item, details: details)
-                    scheduleReferenceEnrichment(for: item, details: details)
-                    return details
-                }
-                if fallback == nil, details.hasUsefulContent { fallback = (details, response) }
+        let response = try? await DirectMediaAPI.getJSON(
+            firstAcceptableFrom: DirectMediaAPI.detailsURLs(for: item, apiKey: apiKey),
+            timeout: 12
+        ) { payload in
+            let details = Self.parseDetails(payload, for: item)
+            if details.hasPlayableResources { return true }
+            if fallback == nil, details.hasUsefulContent { fallback = (details, payload) }
+            return false
+        }
+        if let response {
+            let details = Self.parseDetails(response, for: item)
+            if details.hasPlayableResources {
+                cacheDetailsPayload(response, for: item)
+                scheduleIMDbEnrichment(for: item, details: details)
+                scheduleReferenceEnrichment(for: item, details: details)
+                return details
             }
         }
         if let fallback {
@@ -1072,7 +1301,7 @@ final class LibraryModel: ObservableObject {
         activeWatchSessionID = nil
         activeWatchProgress = nil
         refreshViewingData()
-        Task { await refreshDiscoveryData() }
+        invalidateRecommendations()
     }
 
     func monitorIINAPlayback(socketURL: URL) {
@@ -1104,7 +1333,7 @@ final class LibraryModel: ObservableObject {
     func setWatched(_ progress: WatchProgress, watched: Bool) {
         database.setWatched(progress, watched: watched)
         refreshViewingData()
-        Task { await refreshDiscoveryData() }
+        invalidateRecommendations()
     }
 
     func watchProgress(mediaID: String, episodeID: String?) -> WatchProgress? {
@@ -1141,7 +1370,7 @@ final class LibraryModel: ObservableObject {
         )
         database.setWatched(progress, watched: watched)
         refreshViewingData()
-        Task { await refreshDiscoveryData() }
+        invalidateRecommendations()
     }
 
     func resume(_ progress: WatchProgress) async {
@@ -1288,7 +1517,11 @@ final class LibraryModel: ObservableObject {
             imdbChartLists = nil
             imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
             await enrichCatalogWithIMDb()
-            await refreshDiscoveryData()
+            scheduleCatalogReferenceEnrichment()
+            genreFacets = []
+            recommendations = []
+            await loadGenreFacets()
+            if section == .forYou { await refreshDiscoveryData() }
             if section == .imdbCharts { await loadIMDbCharts() }
         } catch {
             imdbDatasetStatus = error.localizedDescription
@@ -1387,9 +1620,8 @@ final class LibraryModel: ObservableObject {
 
     private func searchSimbaTitle(matching metadata: IMDbTitleMetadata, apiKey: String) async -> MediaItem? {
         let target = normalizedMatchTitle(metadata.title)
-        for url in DirectMediaAPI.searchURLs(query: metadata.title, routeKey: apiKey) {
-            guard let payload = try? await DirectMediaAPI.getJSON(url: url, timeout: 15) else { continue }
-            let matches = Self.searchItems(from: payload, fallbackKind: metadata.kind)
+        func matches(in payload: Any) -> [(MediaItem, Double, Int)] {
+            Self.searchItems(from: payload, fallbackKind: metadata.kind)
                 .filter { $0.kind == metadata.kind }
                 .compactMap { item -> (MediaItem, Double, Int)? in
                     let titles = ([item.title] + item.matchingTitles).map(normalizedMatchTitle).filter { !$0.isEmpty }
@@ -1404,9 +1636,13 @@ final class LibraryModel: ObservableObject {
                     if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
                     return lhs.2 < rhs.2
                 }
-            if let item = matches.first?.0 { return item }
         }
-        return nil
+        guard let payload = try? await DirectMediaAPI.getJSON(
+            firstAcceptableFrom: DirectMediaAPI.searchURLs(query: metadata.title, routeKey: apiKey),
+            timeout: 10,
+            accepting: { !matches(in: $0).isEmpty }
+        ) else { return nil }
+        return matches(in: payload).first?.0
     }
 
     private func enrichWithIMDb(_ details: MediaDetails, item: MediaItem) -> MediaDetails {
@@ -1445,6 +1681,7 @@ final class LibraryModel: ObservableObject {
         remoteSearchResults = []
         didFinishRemoteSearch = false
         guard !query.isEmpty else { return }
+        guard section != .myRatings else { return }
 
         searchTask = Task {
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -1454,19 +1691,15 @@ final class LibraryModel: ObservableObject {
                       let fallbackURL = DirectMediaAPI.searchFallbackURL(query: query) else {
                     throw DirectMediaAPIError.invalidURL
                 }
-                var payload: Any?
-                for routeURL in DirectMediaAPI.searchURLs(query: query, routeKey: apiKey) {
-                    if let routePayload = try? await DirectMediaAPI.getJSON(url: routeURL, timeout: 10),
-                       !Self.searchItems(from: routePayload).isEmpty {
-                        payload = routePayload
-                        break
-                    }
-                }
                 let resolvedPayload: Any
-                if let payload {
+                if let payload = try? await DirectMediaAPI.getJSON(
+                    firstAcceptableFrom: DirectMediaAPI.searchURLs(query: query, routeKey: apiKey),
+                    timeout: 10,
+                    accepting: { !Self.searchItems(from: $0).isEmpty }
+                ) {
                     resolvedPayload = payload
                 } else {
-                    resolvedPayload = try await DirectMediaAPI.getJSON(url: fallbackURL)
+                    resolvedPayload = try await DirectMediaAPI.getJSON(url: fallbackURL, timeout: 10)
                 }
                 guard !Task.isCancelled else { return }
                 remoteSearchResults = Self.searchItems(from: resolvedPayload)
@@ -1541,6 +1774,7 @@ final class LibraryModel: ObservableObject {
         }
         section = .home
         await enrichCatalogWithIMDb()
+        scheduleCatalogReferenceEnrichment()
     }
 
     var canLoadMoreCatalog: Bool {
@@ -1550,7 +1784,7 @@ final class LibraryModel: ObservableObject {
         case .home: hasMoreMovies || hasMoreSeries
         case .movies: hasMoreMovies
         case .shows: hasMoreSeries
-        case .watchlist, .downloads, .imdbCharts, .imdbPeople, .imdbFranchises,
+        case .watchlist, .myRatings, .downloads, .imdbCharts, .imdbPeople, .imdbFranchises,
              .forYou, .genres, .continueWatching, .watchHistory, .viewingStats: false
         }
     }
@@ -1570,30 +1804,27 @@ final class LibraryModel: ObservableObject {
         var added = 0
         var failures = 0
         var fetched = 0
+        let movieURL = loadMovies ? DirectMediaAPI.feedURL(filter: 0, page: nextMoviePage, routeKey: feedKey) : nil
+        let seriesURL = loadSeries ? DirectMediaAPI.feedURL(filter: 31, page: nextSeriesPage, routeKey: feedKey) : nil
+        async let movieResult = fetchCatalogPage(from: movieURL)
+        async let seriesResult = fetchCatalogPage(from: seriesURL)
+        let (movieResponse, seriesResponse) = await (movieResult, seriesResult)
 
-        if loadMovies {
-            if let url = DirectMediaAPI.feedURL(filter: 0, page: nextMoviePage, routeKey: feedKey),
-               let response = try? await DirectMediaAPI.getJSON(url: url),
-               let rows = DirectMediaAPI.rows(from: response) {
-                fetched += 1
-                let pageItems = Self.mediaItems(from: rows, fallbackKind: "Movie", offset: nextMoviePage * DirectMediaAPI.pageSize)
-                added += appendCatalogPage(pageItems, rawCount: rows.count, kind: "Movie")
-                if !rows.isEmpty { nextMoviePage += 1 }
-            } else {
-                failures += 1
-            }
+        if let rows = movieResponse.rows {
+            fetched += 1
+            let pageItems = Self.mediaItems(from: rows, fallbackKind: "Movie", offset: nextMoviePage * DirectMediaAPI.pageSize)
+            added += appendCatalogPage(pageItems, rawCount: rows.count, kind: "Movie")
+            if !rows.isEmpty { nextMoviePage += 1 }
+        } else if loadMovies {
+            failures += 1
         }
-        if loadSeries {
-            if let url = DirectMediaAPI.feedURL(filter: 31, page: nextSeriesPage, routeKey: feedKey),
-               let response = try? await DirectMediaAPI.getJSON(url: url),
-               let rows = DirectMediaAPI.rows(from: response) {
-                fetched += 1
-                let pageItems = Self.mediaItems(from: rows, fallbackKind: "Series", offset: nextSeriesPage * DirectMediaAPI.pageSize)
-                added += appendCatalogPage(pageItems, rawCount: rows.count, kind: "Series")
-                if !rows.isEmpty { nextSeriesPage += 1 }
-            } else {
-                failures += 1
-            }
+        if let rows = seriesResponse.rows {
+            fetched += 1
+            let pageItems = Self.mediaItems(from: rows, fallbackKind: "Series", offset: nextSeriesPage * DirectMediaAPI.pageSize)
+            added += appendCatalogPage(pageItems, rawCount: rows.count, kind: "Series")
+            if !rows.isEmpty { nextSeriesPage += 1 }
+        } else if loadSeries {
+            failures += 1
         }
 
         if failures > 0 {
@@ -1605,7 +1836,10 @@ final class LibraryModel: ObservableObject {
         } else {
             connectionStatus = "Loaded \(added) more titles · \(items.filter { $0.kind == "Movie" }.count) movies · \(items.filter { $0.kind == "Series" }.count) series"
         }
-        if added > 0 { await enrichCatalogWithIMDb() }
+        if added > 0 {
+            await enrichCatalogWithIMDb()
+            scheduleCatalogReferenceEnrichment()
+        }
     }
 
     private func appendCatalogPage(_ pageItems: [MediaItem], rawCount: Int, kind: String) -> Int {
@@ -1623,7 +1857,7 @@ final class LibraryModel: ObservableObject {
 
     private func fetchCatalogRows(from url: URL) async -> (rows: [[String: Any]]?, error: Error?) {
         do {
-            let payload = try await DirectMediaAPI.getJSON(url: url, timeout: 35)
+            let payload = try await DirectMediaAPI.getJSON(url: url, timeout: 12)
             guard let rows = DirectMediaAPI.rows(from: payload) else {
                 return (nil, DirectMediaAPIError.invalidResponse)
             }
@@ -1631,6 +1865,11 @@ final class LibraryModel: ObservableObject {
         } catch {
             return (nil, error)
         }
+    }
+
+    private func fetchCatalogPage(from url: URL?) async -> (rows: [[String: Any]]?, error: Error?) {
+        guard let url else { return (nil, nil) }
+        return await fetchCatalogRows(from: url)
     }
 
     private static func uniqueItems(_ items: [MediaItem]) -> [MediaItem] {
@@ -1645,7 +1884,10 @@ final class LibraryModel: ObservableObject {
         guard !uniqueItems.isEmpty else { return false }
         database.saveRemoteItems(uniqueItems)
         items = database.loadCatalog()
-        if IMDbMetadataStore.shared.isAvailable { Task { await enrichCatalogWithIMDb() } }
+        Task {
+            if IMDbMetadataStore.shared.isAvailable { await enrichCatalogWithIMDb() }
+            scheduleCatalogReferenceEnrichment()
+        }
         catalogName = "Denbox API"
         let movieCount = uniqueItems.filter { $0.kind == "Movie" }.count
         let seriesCount = uniqueItems.filter { $0.kind == "Series" }.count
@@ -2058,6 +2300,10 @@ final class LibraryModel: ObservableObject {
         items = database.loadCatalog()
         section = .home
         searchText = ""
+        Task {
+            await enrichCatalogWithIMDb()
+            scheduleCatalogReferenceEnrichment()
+        }
     }
 }
 
@@ -2079,13 +2325,19 @@ private enum DirectMediaAPIError: LocalizedError {
     }
 }
 
-private enum DirectMediaAPI {
+enum DirectMediaAPI {
     static let pageSize = 30
     private static let feedHost = "https://rubyxpin.info"
     // Current HTTPS origin advertised by the APK's config endpoint.
     private static let apkAPIBase = "https://ninwinios.info/api"
     private static let knownMediaHost = "https://gitcss.info"
     private static let searchHost = "https://gitcss.info/api-user/newapi/like.php"
+
+    private struct RouteResponse: Sendable {
+        let data: Data?
+        let statusCode: Int?
+        let error: String?
+    }
 
     static func feedURL(filter: Int, page: Int, routeKey: String) -> URL? {
         let key = pathComponent(routeKey)
@@ -2157,14 +2409,61 @@ private enum DirectMediaAPI {
         return nil
     }
 
+    @MainActor
     static func getJSON(url: URL, timeout: TimeInterval = 25) async throws -> Any {
+        try await getJSON(firstAcceptableFrom: [url], timeout: timeout, accepting: { _ in true })
+    }
+
+    @MainActor
+    static func getJSON(
+        firstAcceptableFrom urls: [URL],
+        timeout: TimeInterval,
+        accepting: (Any) -> Bool
+    ) async throws -> Any {
+        guard !urls.isEmpty else { throw DirectMediaAPIError.invalidURL }
+        var lastError = "No route returned usable JSON."
+        let payload = await withTaskGroup(of: RouteResponse.self, returning: Any?.self) { group in
+            for url in urls {
+                group.addTask { await fetchJSON(url: url, timeout: timeout) }
+            }
+            while let response = await group.next() {
+                guard let data = response.data else {
+                    lastError = response.error ?? lastError
+                    continue
+                }
+                guard let statusCode = response.statusCode, (200..<300).contains(statusCode) else {
+                    lastError = response.statusCode.map { "HTTP \($0)" } ?? lastError
+                    continue
+                }
+                guard let candidate = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                    lastError = "The server returned invalid JSON."
+                    continue
+                }
+                if accepting(candidate) {
+                    group.cancelAll()
+                    return candidate
+                }
+                lastError = "The server returned no matching titles."
+            }
+            return nil
+        }
+        guard let payload else { throw DirectMediaAPIError.server(lastError) }
+        return payload
+    }
+
+    private static func fetchJSON(url: URL, timeout: TimeInterval) async -> RouteResponse {
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = timeout
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw DirectMediaAPIError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else { throw DirectMediaAPIError.server("HTTP \(http.statusCode)") }
-        return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return RouteResponse(data: nil, statusCode: nil, error: "The server returned an invalid response.")
+            }
+            return RouteResponse(data: data, statusCode: http.statusCode, error: nil)
+        } catch {
+            return RouteResponse(data: nil, statusCode: nil, error: error.localizedDescription)
+        }
     }
 
     private static func pathComponent(_ value: String) -> String {
@@ -2256,6 +2555,12 @@ final class MediaDatabase {
         CREATE TABLE IF NOT EXISTS saved_items (
             media_id TEXT PRIMARY KEY,
             saved_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS personal_ratings (
+            media_id TEXT PRIMARY KEY,
+            rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+            item_payload TEXT NOT NULL,
+            updated_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS media_details_cache (
             media_id TEXT PRIMARY KEY,
@@ -2530,6 +2835,66 @@ final class MediaDatabase {
             if let id = columnText(statement, 0) { result.insert(id) }
         }
         return result
+    }
+
+    func loadPersonalRatings() -> [String: PersonalRating] {
+        guard let handle else { return [:] }
+        var statement: OpaquePointer?
+        let sql = "SELECT media_id,rating,item_payload,updated_at FROM personal_ratings"
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [:] }
+        defer { sqlite3_finalize(statement) }
+        var result: [String: PersonalRating] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let mediaID = columnText(statement, 0),
+                  let payload = columnText(statement, 2),
+                  let data = payload.data(using: .utf8),
+                  let item = try? JSONDecoder().decode(MediaItem.self, from: data) else { continue }
+            result[mediaID] = PersonalRating(
+                rating: Int(sqlite3_column_int(statement, 1)),
+                item: item,
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
+            )
+        }
+        return result
+    }
+
+    func setPersonalRating(_ rating: Int?, for item: MediaItem) -> Bool {
+        guard let handle else { return false }
+        var statement: OpaquePointer?
+        if let rating {
+            guard (1...5).contains(rating),
+                  let data = try? JSONEncoder().encode(item),
+                  let payload = String(data: data, encoding: .utf8) else { return false }
+            let sql = "INSERT OR REPLACE INTO personal_ratings(media_id,rating,item_payload,updated_at) VALUES(?,?,?,?)"
+            guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+            bind(item.id, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(rating))
+            bind(payload, at: 3, in: statement)
+            sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
+            let result = sqlite3_step(statement) == SQLITE_DONE
+            sqlite3_finalize(statement)
+            return result
+        } else {
+            guard sqlite3_prepare_v2(handle, "DELETE FROM personal_ratings WHERE media_id=?", -1, &statement, nil) == SQLITE_OK,
+                  let statement else { return false }
+            bind(item.id, at: 1, in: statement)
+            let result = sqlite3_step(statement) == SQLITE_DONE
+            sqlite3_finalize(statement)
+            return result
+        }
+    }
+
+    func updatePersonalRatingSnapshot(_ item: MediaItem) -> Bool {
+        guard let handle,
+              let data = try? JSONEncoder().encode(item),
+              let payload = String(data: data, encoding: .utf8) else { return false }
+        var statement: OpaquePointer?
+        let sql = "UPDATE personal_ratings SET item_payload=? WHERE media_id=?"
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        bind(payload, at: 1, in: statement)
+        bind(item.id, at: 2, in: statement)
+        return sqlite3_step(statement) == SQLITE_DONE
     }
 
     func loadDownloadedMedia() -> [DownloadedMedia] {
@@ -2853,6 +3218,30 @@ extension MediaDatabase {
         return result
     }
 
+    func mergeViewingData(_ export: ViewingDataExport) -> Bool {
+        guard let export = try? export.validated(), handle != nil,
+              execute("BEGIN IMMEDIATE") == SQLITE_OK else { return false }
+
+        for progress in export.progress where !mergeWatchProgress(progress) {
+            _ = execute("ROLLBACK")
+            return false
+        }
+        for entry in export.history where !mergeWatchHistory(entry) {
+            _ = execute("ROLLBACK")
+            return false
+        }
+        for rating in export.personalRatings where !mergePersonalRating(rating) {
+            _ = execute("ROLLBACK")
+            return false
+        }
+
+        guard execute("COMMIT") == SQLITE_OK else {
+            _ = execute("ROLLBACK")
+            return false
+        }
+        return true
+    }
+
     func clearViewingActivity() -> Bool {
         guard execute("BEGIN IMMEDIATE") == SQLITE_OK else { return false }
         guard execute("DELETE FROM watch_sessions") == SQLITE_OK,
@@ -2944,6 +3333,82 @@ extension MediaDatabase {
         sqlite3_bind_int(statement, 14, progress.isWatched ? 1 : 0)
         sqlite3_bind_double(statement, 15, progress.updatedAt.timeIntervalSince1970)
         sqlite3_step(statement)
+    }
+
+    private func mergeWatchProgress(_ progress: WatchProgress) -> Bool {
+        guard let handle else { return false }
+        let sql = """
+        INSERT INTO watch_progress(media_id,episode_id,media_title,kind,episode_title,episode_label,year,artwork_url,imdb_id,genres,
+                                   position_seconds,duration_seconds,watched_seconds,is_watched,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(media_id,episode_id) DO UPDATE SET media_title=excluded.media_title,kind=excluded.kind,
+          episode_title=excluded.episode_title,episode_label=excluded.episode_label,year=excluded.year,
+          artwork_url=excluded.artwork_url,imdb_id=excluded.imdb_id,genres=excluded.genres,
+          position_seconds=excluded.position_seconds,duration_seconds=COALESCE(excluded.duration_seconds,watch_progress.duration_seconds),
+          watched_seconds=excluded.watched_seconds,is_watched=excluded.is_watched,updated_at=excluded.updated_at
+        WHERE excluded.updated_at>watch_progress.updated_at
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        Self.bind(progress, to: statement, startingAt: 1, using: self)
+        sqlite3_bind_double(statement, 11, progress.positionSeconds)
+        if let duration = progress.durationSeconds { sqlite3_bind_double(statement, 12, duration) }
+        else { sqlite3_bind_null(statement, 12) }
+        sqlite3_bind_double(statement, 13, progress.watchedSeconds)
+        sqlite3_bind_int(statement, 14, progress.isWatched ? 1 : 0)
+        sqlite3_bind_double(statement, 15, progress.updatedAt.timeIntervalSince1970)
+        return sqlite3_step(statement) == SQLITE_DONE
+    }
+
+    private func mergeWatchHistory(_ entry: WatchHistoryEntry) -> Bool {
+        guard let handle else { return false }
+        let sql = """
+        INSERT OR IGNORE INTO watch_sessions(id,media_id,episode_id,media_title,kind,episode_title,episode_label,year,artwork_url,imdb_id,genres,
+                                             started_at,position_seconds,duration_seconds,watched_seconds,player_kind,ended_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        bind(entry.id, at: 1, in: statement)
+        bind(entry.mediaID, at: 2, in: statement)
+        bind(entry.episodeID ?? "", at: 3, in: statement)
+        bind(entry.mediaTitle, at: 4, in: statement)
+        bind(entry.kind, at: 5, in: statement)
+        bind(entry.episodeTitle, at: 6, in: statement)
+        bind(entry.episodeLabel, at: 7, in: statement)
+        bind(entry.year, at: 8, in: statement)
+        bind(entry.artworkURL?.absoluteString, at: 9, in: statement)
+        bind(entry.imdbID, at: 10, in: statement)
+        bind(Self.encodeGenres(entry.genres), at: 11, in: statement)
+        sqlite3_bind_double(statement, 12, entry.startedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 13, entry.positionSeconds)
+        if let duration = entry.durationSeconds { sqlite3_bind_double(statement, 14, duration) }
+        else { sqlite3_bind_null(statement, 14) }
+        sqlite3_bind_double(statement, 15, entry.watchedSeconds)
+        bind(entry.playerKind, at: 16, in: statement)
+        sqlite3_bind_double(statement, 17, entry.startedAt.timeIntervalSince1970 + entry.watchedSeconds)
+        return sqlite3_step(statement) == SQLITE_DONE
+    }
+
+    private func mergePersonalRating(_ rating: PersonalRating) -> Bool {
+        guard let handle,
+              let data = try? JSONEncoder().encode(rating.item),
+              let payload = String(data: data, encoding: .utf8) else { return false }
+        let sql = """
+        INSERT INTO personal_ratings(media_id,rating,item_payload,updated_at) VALUES(?,?,?,?)
+        ON CONFLICT(media_id) DO UPDATE SET rating=excluded.rating,item_payload=excluded.item_payload,updated_at=excluded.updated_at
+        WHERE excluded.updated_at>personal_ratings.updated_at
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        bind(rating.item.id, at: 1, in: statement)
+        sqlite3_bind_int(statement, 2, Int32(rating.rating))
+        bind(payload, at: 3, in: statement)
+        sqlite3_bind_double(statement, 4, rating.updatedAt.timeIntervalSince1970)
+        return sqlite3_step(statement) == SQLITE_DONE
     }
 
     func closeUnfinishedWatchSessions() {
@@ -3343,7 +3808,10 @@ struct MainWindow: View {
                     } else if model.section == .imdbCharts {
                         IMDbChartsPage()
                     } else if model.visibleItems.isEmpty {
-                        EmptyLibraryState(isWatchlist: model.section == .watchlist)
+                        EmptyLibraryState(
+                            isWatchlist: model.section == .watchlist,
+                            isMyRatings: model.section == .myRatings
+                        )
                     } else {
                         if model.section == .home && model.searchText.isEmpty {
                             MediaShelf(title: "Featured in your library", subtitle: "A closer look at what’s available", items: Array(model.visibleItems.prefix(4)), landscape: true)
@@ -3353,7 +3821,7 @@ struct MainWindow: View {
                             MediaGrid(items: model.visibleItems)
                         }
                     }
-                    if model.section != .downloads && model.section != .watchlist
+                    if model.section != .downloads && model.section != .watchlist && model.section != .myRatings
                         && (model.canLoadMoreCatalog || model.isLoadingMore) {
                         CatalogPaginationFooter()
                     }
@@ -3429,7 +3897,7 @@ struct MainWindow: View {
     private var headingSubtitle: String {
         if !model.searchText.isEmpty { return "\(model.visibleItems.count) results · From \(model.catalogName)" }
         return switch model.section {
-        case .forYou: "Recommendations from IMDb, tuned to your viewing and the genres you choose"
+        case .forYou: "Recommendations from IMDb, tuned to your viewing, ratings, and chosen genres"
         case .genres: "Choose your favorite genres and filter the local catalog"
         case .continueWatching: "\(model.continueWatchingItems.count) titles ready to resume"
         case .watchHistory: "\(model.watchHistory.count) recent sessions stored on this Mac"
@@ -3489,6 +3957,7 @@ private struct Sidebar: View {
                             case .movies: model.items.filter { $0.kind == "Movie" }.count
                             case .shows: model.items.filter { $0.kind == "Series" }.count
                             case .watchlist: model.savedIDs.count
+                            case .myRatings: model.personalRatings.count
                             default: nil
                             }
                             if let count, count > 0 {
@@ -3704,7 +4173,9 @@ private struct MediaShelf: View {
                 HStack(alignment: .top, spacing: 14) {
                     ForEach(items) { item in
                         Button { model.selectedItem = item } label: {
-                            if landscape { LandscapeCard(item: item) } else { PosterCard(item: item) }
+                            if landscape { LandscapeCard(item: item) } else {
+                                PosterCard(item: item, personalRating: model.personalRatings[item.id]?.rating)
+                            }
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
@@ -3724,12 +4195,24 @@ private struct MediaShelf: View {
 
 private struct PosterCard: View {
     let item: MediaItem
+    let personalRating: Int?
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .bottomLeading) {
                 CardArtwork(item: item)
                     .frame(width: 160, height: 216)
                     .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .overlay(alignment: .topTrailing) {
+                        if let personalRating {
+                            Label("\(personalRating)", systemImage: "star.fill")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .foregroundStyle(Color.yellow)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(.black.opacity(0.72), in: Capsule())
+                                .padding(9)
+                        }
+                    }
                 LinearGradient(colors: [.clear, .black.opacity(0.65)], startPoint: .center, endPoint: .bottom)
                     .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
                 VStack(alignment: .leading, spacing: 5) {
@@ -4368,7 +4851,7 @@ private struct GenresPage: View {
             }
             if model.genreFacets.isEmpty {
                 VStack(spacing: 11) {
-                    if model.isUpdatingIMDbDataset || model.isLoadingRecommendations {
+                    if model.isUpdatingIMDbDataset || model.isLoadingGenreFacets {
                         ProgressView("Preparing genres…")
                             .tint(.white)
                     } else {
@@ -4380,7 +4863,7 @@ private struct GenresPage: View {
                         Button(DenboxLanguage.localizedMessage(model.hasIMDbData ? "Try again" : "Download IMDb data"),
                                systemImage: model.hasIMDbData ? "arrow.clockwise" : "arrow.down.circle") {
                             Task {
-                                if model.hasIMDbData { await model.refreshDiscoveryData() }
+                                if model.hasIMDbData { await model.loadGenreFacets() }
                                 else { await model.refreshIMDbDataset() }
                             }
                         }
@@ -4426,6 +4909,7 @@ private struct GenresPage: View {
                 .buttonStyle(.bordered)
             }
         }
+        .task { await model.loadGenreFacets() }
     }
 }
 
@@ -4438,7 +4922,7 @@ private struct PersonalizedRecommendationsPage: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("For You")
                     .font(.system(size: 21, weight: .bold, design: .rounded))
-                Text("IMDb ratings and votes are combined with your watch history and selected genres. This ranking is calculated locally.")
+                Text("IMDb ratings and votes are combined with your personal star ratings, viewing history, and preferred genres. This ranking is calculated locally.")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.secondaryText)
             }
@@ -4707,7 +5191,7 @@ private struct ViewingStatsPage: View {
                     Label("Export JSON…", systemImage: "square.and.arrow.down")
                 }
                 .buttonStyle(.bordered)
-                .help("Export includes titles, times, progress, and local file paths.")
+                .help("Export includes titles, personal ratings, watch times, progress, and local file paths.")
 
                 Button(role: .destructive) {
                     isConfirmingClear = true
@@ -4717,7 +5201,7 @@ private struct ViewingStatsPage: View {
                 .buttonStyle(.bordered)
                 .disabled(model.isTrackingPlayback)
             }
-            Text("The export includes watch time and local file paths. Save it somewhere you choose.")
+            Text("The export includes watch progress, personal ratings, watch time, and local file paths. Save it somewhere you choose.")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.secondaryText)
             if model.isTrackingPlayback {
@@ -4738,11 +5222,11 @@ private struct ViewingStatsPage: View {
     private func exportViewingActivity() {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.json]
-        panel.title = DenboxLanguage.localizedMessage("Export viewing history")
+        panel.title = DenboxLanguage.localizedMessage("Export viewing data")
         panel.prompt = DenboxLanguage.localizedMessage("Save")
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
-        panel.nameFieldStringValue = "Denbox-viewing-history-\(formatter.string(from: Date())).json"
+        panel.nameFieldStringValue = "Denbox-viewing-data-\(formatter.string(from: Date())).json"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         model.exportViewingActivity(to: url)
     }
@@ -5096,7 +5580,9 @@ private struct GridPoster: View {
     @EnvironmentObject private var model: LibraryModel
     let item: MediaItem
     var body: some View {
-        Button { model.selectedItem = item } label: { PosterCard(item: item) }
+        Button { model.selectedItem = item } label: {
+            PosterCard(item: item, personalRating: model.personalRatings[item.id]?.rating)
+        }
             .buttonStyle(.plain)
     }
 }
@@ -5104,9 +5590,10 @@ private struct GridPoster: View {
 private struct EmptyLibraryState: View {
     @EnvironmentObject private var model: LibraryModel
     let isWatchlist: Bool
+    let isMyRatings: Bool
     var body: some View {
         VStack(spacing: 13) {
-            Image(systemName: isWatchlist ? "bookmark" : (model.searchText.isEmpty ? "film" : "magnifyingglass"))
+            Image(systemName: isWatchlist ? "bookmark" : (isMyRatings ? "star" : (model.searchText.isEmpty ? "film" : "magnifyingglass")))
                 .font(.system(size: 31, weight: .light))
                 .foregroundStyle(Color.white.opacity(0.45))
             Text(LocalizedStringKey(emptyTitle))
@@ -5141,6 +5628,7 @@ private struct EmptyLibraryState: View {
 
     private var emptyTitle: String {
         if isWatchlist { return "Your list is ready" }
+        if isMyRatings { return "No personal ratings yet" }
         if !model.searchText.isEmpty { return "No matches found" }
         if model.items.isEmpty { return "Your catalog is empty" }
         return "No titles in this section"
@@ -5148,6 +5636,7 @@ private struct EmptyLibraryState: View {
 
     private var emptyMessage: String {
         if isWatchlist { return "Save a movie or show to keep it close." }
+        if isMyRatings { return "Rate a movie or show from its details page to build this list." }
         if !model.searchText.isEmpty { return "Try a different title or clear your search." }
         if model.items.isEmpty { return "Refresh the API catalog or add your keys in Settings." }
         return "There are no movies or shows in this section yet."
@@ -5323,6 +5812,7 @@ private struct MediaDetailPage: View {
     @Environment(\.dismiss) private var dismiss
     let item: MediaItem
     @State private var details: MediaDetails?
+    @State private var personalRating: Int?
     @State private var referenceMetadata: ReferenceTitleMetadata?
     @State private var selectedSeasonID: String?
     @State private var selectedEpisodeID: String?
@@ -5391,6 +5881,7 @@ private struct MediaDetailPage: View {
                 }
                 .padding(.horizontal, 36)
 
+                personalRatingSection
                 publicMetadataSection
 
                 if item.kind == "Series" {
@@ -5448,6 +5939,7 @@ private struct MediaDetailPage: View {
             if selectedSourceID == nil { selectedSourceID = details?.sources.first?.id }
         }
         .task(id: item.id) {
+            personalRating = model.personalRatings[item.id]?.rating
             filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
             hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
             referenceMetadata = model.referenceMetadata(mediaID: item.id)
@@ -5480,6 +5972,49 @@ private struct MediaDetailPage: View {
 
     private var displayedArtworkURL: URL? {
         filimoMetadata?.posterURL ?? hexDLMetadata?.posterURL ?? referenceMetadata?.posterURL ?? item.artworkURL
+    }
+
+    private var personalRatingSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Your rating")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                if let personalRating {
+                    Text("\(personalRating) / 5")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(Color.secondaryText)
+                    Button("Clear rating") {
+                        self.personalRating = nil
+                        model.setPersonalRating(nil, for: item)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.secondaryText)
+                }
+            }
+            HStack(spacing: 7) {
+                ForEach(1...5, id: \.self) { score in
+                    Button {
+                        personalRating = score
+                        model.setPersonalRating(score, for: item)
+                    } label: {
+                        Image(systemName: score <= (personalRating ?? 0) ? "star.fill" : "star")
+                            .font(.system(size: 21))
+                            .foregroundStyle(score <= (personalRating ?? 0) ? Color.yellow : Color.white.opacity(0.55))
+                    }
+                    .buttonStyle(.plain)
+                    .help(DenboxLanguage.localizedMessage("Rate \(score) out of 5 stars"))
+                    .accessibilityLabel(Text(DenboxLanguage.localizedMessage("Rate \(score) out of 5 stars")))
+                }
+            }
+            Text("Saved only on this Mac. Separate from IMDb.")
+                .font(.system(size: 10))
+                .foregroundStyle(Color.secondaryText)
+        }
+        .padding(14)
+        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 13))
+        .padding(.horizontal, 36)
     }
 
     private var publicMetadataSection: some View {
@@ -6533,6 +7068,21 @@ private struct SettingsSheet: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
+                Text("Wikidata and TVmaze are checked automatically for every loaded movie and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    model.checkPublicReferencesForCatalog()
+                } label: {
+                    Label(DenboxLanguage.localizedMessage(model.isCheckingPublicReferences ? "Checking public references…" : "Check public references for loaded titles"),
+                          systemImage: model.isCheckingPublicReferences ? "hourglass" : "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isCheckingPublicReferences || model.items.isEmpty)
+                Text(DenboxLanguage.localizedMessage(model.publicReferenceStatus))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.secondaryText)
                 HStack(spacing: 10) {
                     Button {
                         Task { await model.refreshIMDbDataset() }

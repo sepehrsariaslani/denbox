@@ -61,7 +61,7 @@ enum ReferenceMetadataService {
         if age > (cached.isEmpty ? emptyCacheLifetime : cacheLifetime) { return true }
         let attempted = Set(cached.attemptedProviders)
         if item.kind == "Series", !attempted.contains("TVmaze") { return true }
-        let wantsWikidata = item.kind == "Movie" || validIMDbID(imdbID)
+        let wantsWikidata = item.kind == "Movie" || item.kind == "Series"
         if wantsWikidata, !attempted.contains("Wikidata") { return true }
         return false
     }
@@ -70,7 +70,7 @@ enum ReferenceMetadataService {
         MediaDetails(
             description: details.description?.referenceNonEmpty ?? metadata.synopsis,
             year: details.year?.referenceNonEmpty ?? metadata.year,
-            rating: details.rating,
+            rating: details.rating?.referenceNonEmpty ?? metadata.rating,
             runtime: details.runtime?.referenceNonEmpty ?? metadata.runtime,
             genres: details.genres.isEmpty ? metadata.genres : details.genres,
             country: details.country?.referenceNonEmpty ?? metadata.country,
@@ -91,7 +91,7 @@ enum ReferenceMetadataService {
         let stale = existingAge > ((existing?.isEmpty ?? true) ? emptyCacheLifetime : cacheLifetime)
         let attempted = Set(existing?.attemptedProviders ?? [])
         let wantsTVmaze = item.kind == "Series" && (stale || !attempted.contains("TVmaze"))
-        let wantsWikidata = (item.kind == "Movie" || validIMDbID(imdbID))
+        let wantsWikidata = (item.kind == "Movie" || item.kind == "Series")
             && (stale || !attempted.contains("Wikidata"))
         guard wantsTVmaze || wantsWikidata else {
             var unchanged = existing ?? .empty()

@@ -71,9 +71,13 @@ struct ReferenceMetadataTests {
         try require(merged.synopsis == "A & B" && merged.country == "United States", "higher-priority metadata was overwritten")
 
         var attempted = ReferenceTitleMetadata.empty()
-        attempted.attemptedProviders = ["TVmaze"]
+        attempted.attemptedProviders = ["TVmaze", "Wikidata"]
         try require(!ReferenceMetadataService.shouldRefresh(attempted, for: series, imdbID: nil),
                     "the service ignored the one-day retry window after an empty lookup")
+        var tvmazeOnly = ReferenceTitleMetadata.empty()
+        tvmazeOnly.attemptedProviders = ["TVmaze"]
+        try require(ReferenceMetadataService.shouldRefresh(tvmazeOnly, for: series, imdbID: nil),
+                    "a series with no IMDb ID did not schedule Wikidata lookup")
         try require(ReferenceMetadataService.shouldRefresh(.empty(), for: movie, imdbID: nil),
                     "Wikidata title search did not run for a movie without a local IMDb ID")
 
@@ -83,7 +87,8 @@ struct ReferenceMetadataTests {
             imdbID: "tt1234567", imdbRating: nil, imdbVotes: nil, similarSeries: []
         )
         let enriched = ReferenceMetadataService.enrich(detail, with: merged)
-        try require(enriched.description == "A & B" && enriched.cast == ["Actor One"], "external metadata did not fill empty detail fields")
+        try require(enriched.description == "A & B" && enriched.cast == ["Actor One"] && enriched.rating == "8.4",
+                    "external metadata did not fill empty detail fields and rating")
         try require(ReferenceMetadataService.shouldRefresh(.empty(), for: series, imdbID: nil), "a cache without provider data was not refreshed")
 
         let databaseURL = FileManager.default.temporaryDirectory.appendingPathComponent("Denbox-reference-\(UUID().uuidString).sqlite")

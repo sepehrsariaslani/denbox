@@ -77,7 +77,7 @@ enum DenboxLanguage {
             (#"^Resume at (.+)$"#, "Resume at %@"),
             (#"^Watch time: (.+)$"#, "Watch time: %@"),
             (#"^(\d+(?:\.\d+)?) hours$"#, "%@ hours"),
-            (#"^Could not save the viewing history export: (.+)$"#, "Could not save the viewing history export: %@"),
+            (#"^Could not save the viewing data export: (.+)$"#, "Could not save the viewing data export: %@"),
             (#"^(.+)× Speed$"#, "%@× Speed"),
             (#"^Audio (\d+)$"#, "Audio %@"),
             (#"^Subtitle (\d+)$"#, "Subtitle %@"),
@@ -91,11 +91,14 @@ enum DenboxLanguage {
             (#"^(\d+) results · From (.+)$"#, "%@ results · From %@"),
             (#"^(\d+) titles ready to resume$"#, "%@ titles ready to resume"),
             (#"^(\d+) recent sessions stored on this Mac$"#, "%@ recent sessions stored on this Mac"),
+            (#"^Rate (\d+) out of 5 stars$"#, "Rate %@ out of 5 stars"),
             (#"^(\d+) titles · From (.+)$"#, "%@ titles · From %@"),
             (#"^Simba did not return a matching title for (.+)\.$"#, "Simba did not return a matching title for %@."),
             (#"^IMDb dataset download failed: (.+)$"#, "IMDb dataset download failed: %@"),
             (#"^IMDb dataset import failed: (.+)$"#, "IMDb dataset import failed: %@"),
             (#"^IMDb dataset ready · updated (.+)$"#, "IMDb dataset ready · updated %@"),
+            (#"^Checking public metadata for (\d+) titles…$"#, "Checking public metadata for %@ titles…"),
+            (#"^Checked public references for (\d+) titles\.$"#, "Checked public references for %@ titles."),
             (#"^(.+) votes$"#, "%@ votes"),
             (#"^Downloading IMDb (.+)…$"#, "Downloading IMDb %@…")
         ]
@@ -146,6 +149,7 @@ extension LibrarySection {
         case .imdbPeople: "IMDb People"
         case .imdbFranchises: "IMDb Franchises"
         case .watchlist: "My List"
+        case .myRatings: "My Ratings"
         case .downloads: "Downloads"
         }
     }

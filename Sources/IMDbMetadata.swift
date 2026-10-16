@@ -163,8 +163,13 @@ final class IMDbMetadataStore: @unchecked Sendable {
     private let fileManager = FileManager.default
     private let searchIndexLock = NSLock()
     private var hasSearchIndexes = false
+    private let discoveryIndexLock = NSLock()
+    private var hasDiscoveryIndex = false
     private let seriesGenreIndexLock = NSLock()
     private var hasSeriesGenreIndex = false
+    private let datasetCacheLock = NSLock()
+    private var cachedGenreFacets: [IMDbGenreFacet]?
+    private var cachedDiscoveryCandidates: [Int: [IMDbTitleMetadata]] = [:]
     private let endpoints: [(String, URL)] = [
         ("titles", URL(string: "https://datasets.imdbws.com/title.basics.tsv.gz")!),
         ("episodes", URL(string: "https://datasets.imdbws.com/title.episode.tsv.gz")!),
@@ -416,6 +421,13 @@ final class IMDbMetadataStore: @unchecked Sendable {
     }
 
     func genreFacets() -> [IMDbGenreFacet] {
+        datasetCacheLock.lock()
+        if let cachedGenreFacets {
+            datasetCacheLock.unlock()
+            return cachedGenreFacets
+        }
+        datasetCacheLock.unlock()
+
         guard let db = openReadOnly() else { return [] }
         defer { sqlite3_close(db) }
         var statement: OpaquePointer?
@@ -427,20 +439,34 @@ final class IMDbMetadataStore: @unchecked Sendable {
             let genres = Set((text(statement, 0) ?? "").split(separator: ",").map(String.init))
             for genre in genres where !genre.isEmpty { counts[genre, default: 0] += 1 }
         }
-        return counts.map { IMDbGenreFacet(name: $0.key, titleCount: $0.value) }
+        let facets = counts.map { IMDbGenreFacet(name: $0.key, titleCount: $0.value) }
             .sorted { lhs, rhs in
                 if lhs.titleCount != rhs.titleCount { return lhs.titleCount > rhs.titleCount }
                 return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
             }
+        datasetCacheLock.lock()
+        if cachedGenreFacets == nil { cachedGenreFacets = facets }
+        let result = cachedGenreFacets ?? facets
+        datasetCacheLock.unlock()
+        return result
     }
 
     func discoveryCandidates(limit: Int = 30_000) -> [IMDbTitleMetadata] {
+        let bounded = max(1, min(limit, 50_000))
+        datasetCacheLock.lock()
+        if let cached = cachedDiscoveryCandidates[bounded] {
+            datasetCacheLock.unlock()
+            return cached
+        }
+        datasetCacheLock.unlock()
+
+        let indexReady = ensureDiscoveryIndex()
         guard let db = openReadOnly() else { return [] }
         defer { sqlite3_close(db) }
-        let bounded = max(1, min(limit, 50_000))
+        let discoveryIndex = indexReady ? " INDEXED BY idx_discovery_rating" : ""
         let sql = """
         SELECT tconst,primary_title,start_year,genres,rating,votes,title_type
-        FROM titles
+        FROM titles\(discoveryIndex)
         WHERE title_type IN ('movie','tvSeries','tvMiniSeries')
           AND rating IS NOT NULL AND votes >= 50
         ORDER BY rating DESC,votes DESC
@@ -462,8 +488,35 @@ final class IMDbMetadataStore: @unchecked Sendable {
                 kind: type == "movie" ? "Movie" : "Series"
             ))
         }
-        return result
+        datasetCacheLock.lock()
+        if cachedDiscoveryCandidates[bounded] == nil { cachedDiscoveryCandidates[bounded] = result }
+        let cachedResult = cachedDiscoveryCandidates[bounded] ?? result
+        datasetCacheLock.unlock()
+        return cachedResult
     }
+
+#if DENBOX_TESTING
+    func discoveryQueryPlanForTesting() -> [String] {
+        guard let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        let sql = """
+        EXPLAIN QUERY PLAN
+        SELECT tconst,primary_title,start_year,genres,rating,votes,title_type
+        FROM titles INDEXED BY idx_discovery_rating
+        WHERE title_type IN ('movie','tvSeries','tvMiniSeries')
+          AND rating IS NOT NULL AND votes >= 50
+        ORDER BY rating DESC,votes DESC LIMIT 30000
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var rows: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let detail = text(statement, 3) { rows.append(detail) }
+        }
+        return rows
+    }
+#endif
 
     func matchTitle(title: String, year: String?, kind: String) -> IMDbTitleMetadata? {
         let normalized = imdbNormalize(title)
@@ -714,6 +767,37 @@ final class IMDbMetadataStore: @unchecked Sendable {
         sqlite3_close(db)
         hasSearchIndexes = result == SQLITE_OK
         return hasSearchIndexes
+    }
+
+    private func ensureDiscoveryIndex() -> Bool {
+        discoveryIndexLock.lock()
+        defer { discoveryIndexLock.unlock() }
+        if hasDiscoveryIndex { return true }
+        guard isAvailable else { return false }
+
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db else {
+            if let db { sqlite3_close(db) }
+            return false
+        }
+        sqlite3_busy_timeout(db, 20_000)
+        let result = sqlite3_exec(db, """
+            CREATE INDEX IF NOT EXISTS idx_discovery_rating
+                ON titles(rating DESC,votes DESC)
+                WHERE title_type IN ('movie','tvSeries','tvMiniSeries')
+                  AND rating IS NOT NULL AND votes >= 50;
+            """, nil, nil, nil)
+        sqlite3_close(db)
+        hasDiscoveryIndex = result == SQLITE_OK
+        return hasDiscoveryIndex
+    }
+
+    private func invalidateDatasetCaches() {
+        datasetCacheLock.lock()
+        cachedGenreFacets = nil
+        cachedDiscoveryCandidates.removeAll(keepingCapacity: false)
+        datasetCacheLock.unlock()
     }
 
     private func ensureSeriesGenreIndex() -> Bool {
@@ -1063,6 +1147,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
         CREATE INDEX idx_series_start_year ON titles(start_year) WHERE title_type IN ('tvSeries','tvMiniSeries');
         CREATE INDEX idx_movie_normalized_original ON titles(normalized_original) WHERE title_type='movie';
         CREATE INDEX idx_movie_start_year ON titles(start_year,votes DESC) WHERE title_type='movie' AND rating IS NOT NULL;
+        CREATE INDEX idx_discovery_rating ON titles(rating DESC,votes DESC) WHERE title_type IN ('movie','tvSeries','tvMiniSeries') AND rating IS NOT NULL AND votes >= 50;
         CREATE INDEX idx_episode_parent ON titles(parent_tconst,season_number,episode_number);
         CREATE INDEX idx_genres ON titles(title_type,genres);
         CREATE INDEX idx_title_chart ON titles(title_type,votes DESC,rating DESC);
@@ -1086,9 +1171,13 @@ final class IMDbMetadataStore: @unchecked Sendable {
             searchIndexLock.lock()
             hasSearchIndexes = false
             searchIndexLock.unlock()
+            discoveryIndexLock.lock()
+            hasDiscoveryIndex = false
+            discoveryIndexLock.unlock()
             seriesGenreIndexLock.lock()
             hasSeriesGenreIndex = false
             seriesGenreIndexLock.unlock()
+            invalidateDatasetCaches()
         } catch {
             if hadPrevious { try? fileManager.moveItem(at: backup, to: databaseURL) }
             throw error
