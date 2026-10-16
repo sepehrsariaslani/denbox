@@ -5,10 +5,39 @@ import AppKit
 struct PlaybackRoutingTests {
     @MainActor
     static func main() throws {
-        let playback = MPVPlaybackController()
+        let configurationDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DenboxPlaybackRoutingTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: configurationDirectory.appendingPathComponent("scripts", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data("audio-delay=0.23\nvolume=23\n".utf8).write(to: configurationDirectory.appendingPathComponent("mpv.conf"))
+        try Data("Ctrl+Alt+p set pause yes\n".utf8).write(to: configurationDirectory.appendingPathComponent("input.conf"))
+        try Data("mp.set_property_number('volume', 31)\n".utf8)
+            .write(to: configurationDirectory.appendingPathComponent("scripts/routing-test.lua"))
+
+        let inputPreferenceKey = DenboxMPVConfiguration.useInputConfigurationKey
+        let previousInputPreference = UserDefaults.standard.object(forKey: inputPreferenceKey)
+        UserDefaults.standard.set(false, forKey: inputPreferenceKey)
+        defer {
+            if let previousInputPreference {
+                UserDefaults.standard.set(previousInputPreference, forKey: inputPreferenceKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: inputPreferenceKey)
+            }
+            try? FileManager.default.removeItem(at: configurationDirectory)
+        }
+
+        let playback = MPVPlaybackController(configurationDirectoryURL: configurationDirectory)
         guard playback.errorMessage == nil else {
             throw TestFailure(message: "the embedded libmpv engine did not initialize: \(playback.errorMessage!)")
         }
+        try require(Double(playback.testingProperty("audio-delay") ?? "") == 0.23, "mpv.conf was not read from Denbox's configuration folder")
+        let scriptDeadline = Date(timeIntervalSinceNow: 2)
+        while Date() < scriptDeadline, Double(playback.testingProperty("volume") ?? "") != 31 {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+        }
+        try require(Double(playback.testingProperty("volume") ?? "") == 31, "a user Lua script was not loaded at player startup")
         try require(playback.audioDevices.contains(where: { $0.id == "auto" }), "the system-default audio device was not listed")
         try require(playback.setAudioDevice("auto"), "libmpv rejected the system-default audio device")
         try require(playback.selectedAudioDeviceID == "auto", "the selected audio output was not updated")
@@ -63,6 +92,35 @@ struct PlaybackRoutingTests {
         )
         try require(fullscreenHandled && fullscreenRequested, "Control-Command-F did not request full screen")
         playback.onToggleFullscreen = nil
+
+        let customInputKeyName = MPVInputKeyMapper.keyName(
+            keyCode: 35,
+            charactersIgnoringModifiers: "p",
+            characters: "p",
+            modifiers: [.control, .option]
+        )
+        try require(customInputKeyName == "Ctrl+Alt+p", "the input.conf key name did not preserve its modifiers")
+        let arrowInputKeyName = MPVInputKeyMapper.keyName(
+            keyCode: 123,
+            charactersIgnoringModifiers: "",
+            characters: nil,
+            modifiers: [.option]
+        )
+        try require(arrowInputKeyName == "Alt+LEFT", "special keys were not mapped to mpv key names")
+        UserDefaults.standard.set(true, forKey: inputPreferenceKey)
+        let customKeyHandled = playback.handleKeyboardShortcut(
+            keyCode: 35,
+            characters: "p",
+            modifiers: [.control, .option],
+            charactersWithModifiers: "p"
+        )
+        try require(customKeyHandled, "the custom mpv input binding was not forwarded")
+        let keypressDeadline = Date(timeIntervalSinceNow: 1)
+        while Date() < keypressDeadline, playback.testingProperty("pause") != "yes" {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+        }
+        try require(playback.testingProperty("pause") == "yes", "input.conf keypress did not run its configured mpv command")
+        UserDefaults.standard.set(false, forKey: inputPreferenceKey)
 
         let playerWindow = NSWindow(
             contentRect: NSRect(x: 80, y: 90, width: 1280, height: 800),

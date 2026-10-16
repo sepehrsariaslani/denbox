@@ -5,6 +5,99 @@ import OpenGL.GL
 import OpenGL.GL3
 import SwiftUI
 
+enum DenboxMPVConfiguration {
+    static let useInputConfigurationKey = "denbox.player.useMPVInputConfig"
+
+    static let directoryURL: URL = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        return appSupport.appendingPathComponent("Denbox/mpv", isDirectory: true)
+    }()
+
+    static var scriptsDirectoryURL: URL {
+        directoryURL.appendingPathComponent("scripts", isDirectory: true)
+    }
+
+    static var inputConfigurationURL: URL {
+        directoryURL.appendingPathComponent("input.conf", isDirectory: false)
+    }
+
+    @discardableResult
+    static func prepare(directory: URL = directoryURL) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: directory.appendingPathComponent("scripts", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    @MainActor
+    static func reveal(_ directory: URL) -> Bool {
+        guard prepare(directory: directory) else { return false }
+        return NSWorkspace.shared.open(directory)
+    }
+
+    @discardableResult
+    @MainActor
+    static func openInputConfiguration() -> Bool {
+        guard prepare(), FileManager.default.fileExists(atPath: inputConfigurationURL.path) || createInputConfiguration() else {
+            return false
+        }
+        return NSWorkspace.shared.open(inputConfigurationURL)
+    }
+
+    private static func createInputConfiguration() -> Bool {
+        let template = "# mpv key bindings for Denbox. Changes apply after reopening the player.\n# Example: Ctrl+Alt+P cycle pause\n"
+        return FileManager.default.createFile(atPath: inputConfigurationURL.path, contents: Data(template.utf8))
+    }
+}
+
+enum MPVInputKeyMapper {
+    private static let specialKeys: [UInt16: String] = [
+        36: "ENTER", 48: "TAB", 49: "SPACE", 51: "BS", 53: "ESC",
+        76: "KP_ENTER", 115: "HOME", 116: "PGUP", 117: "DEL", 119: "END",
+        121: "PGDWN", 123: "LEFT", 124: "RIGHT", 125: "DOWN", 126: "UP",
+        122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6",
+        98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12",
+        105: "F13", 107: "F14", 113: "F15", 106: "F16", 64: "F17", 79: "F18",
+        80: "F19", 90: "F20"
+    ]
+
+    static func keyName(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String,
+        characters: String?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> String? {
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask)
+        let specialKey = specialKeys[keyCode]
+        let eventCharacter = singlePrintableCharacter(characters)
+        let baseCharacter = eventCharacter ?? singlePrintableCharacter(charactersIgnoringModifiers)
+        guard let key = specialKey ?? baseCharacter else { return nil }
+
+        var prefix: [String] = []
+        if flags.contains(.shift), specialKey != nil { prefix.append("Shift") }
+        if flags.contains(.control) { prefix.append("Ctrl") }
+        if flags.contains(.option) { prefix.append("Alt") }
+        if flags.contains(.command) { prefix.append("Meta") }
+        return (prefix + [key]).joined(separator: "+")
+    }
+
+    private static func singlePrintableCharacter(_ value: String?) -> String? {
+        guard let value, value.unicodeScalars.count == 1,
+              let scalar = value.unicodeScalars.first,
+              !CharacterSet.controlCharacters.contains(scalar),
+              scalar.value != 0x7F else { return nil }
+        return value
+    }
+}
+
 struct MPVPlaybackTrack: Identifiable, Hashable {
     enum Kind: String { case video, audio, subtitle }
 
@@ -139,19 +232,22 @@ final class MPVPlaybackController: ObservableObject {
         return framework.isLoaded || framework.load()
     }()
 
-    init() {
+    init(configurationDirectoryURL: URL? = nil) {
         guard let handle = mpv_create() else {
             errorMessage = "The embedded playback engine could not be created."
             return
         }
         self.handle = handle
 
-        let options: [(String, String)] = [
+        let configurationDirectory = configurationDirectoryURL ?? DenboxMPVConfiguration.directoryURL
+        let shouldLoadUserConfiguration = DenboxMPVConfiguration.prepare(directory: configurationDirectory)
+
+        var options: [(String, String)] = [
             ("vo", "libmpv"),
             ("hwdec", "auto-safe"),
             ("keep-open", "yes"),
             ("audio-display", "no"),
-            ("config", "no"),
+            ("config", shouldLoadUserConfiguration ? "yes" : "no"),
             ("osc", "no"),
             ("osd-level", "1"),
             ("cache", "yes"),
@@ -165,6 +261,10 @@ final class MPVPlaybackController: ObservableObject {
             ("sub-font-provider", "auto"),
             ("screenshot-directory", "~/Pictures/Denbox")
         ]
+        if shouldLoadUserConfiguration {
+            options.insert(("config-dir", configurationDirectory.path), at: 0)
+            options.insert(("load-scripts", "yes"), at: 1)
+        }
         for (name, value) in options {
             _ = name.withCString { key in value.withCString { mpv_set_option_string(handle, key, $0) } }
         }
@@ -908,13 +1008,29 @@ final class MPVPlaybackController: ObservableObject {
         refreshTracks()
     }
 
-    func handleKeyboardShortcut(keyCode: UInt16, characters: String, modifiers: NSEvent.ModifierFlags) -> Bool {
+    func handleKeyboardShortcut(
+        keyCode: UInt16,
+        characters: String,
+        modifiers: NSEvent.ModifierFlags,
+        charactersWithModifiers: String? = nil
+    ) -> Bool {
         let flags = modifiers.intersection(.deviceIndependentFlagsMask)
         let command = flags.contains(.command)
         let control = flags.contains(.control)
         let option = flags.contains(.option)
         let shift = flags.contains(.shift)
         let key = characters.lowercased()
+
+        if UserDefaults.standard.bool(forKey: DenboxMPVConfiguration.useInputConfigurationKey),
+           !(command && control && key == "f") {
+            guard let mpvKey = MPVInputKeyMapper.keyName(
+                keyCode: keyCode,
+                charactersIgnoringModifiers: characters,
+                characters: charactersWithModifiers,
+                modifiers: flags
+            ) else { return false }
+            return self.command(["keypress", mpvKey]) >= 0
+        }
 
         if command && control && key == "f" { onToggleFullscreen?(); return true }
         if command && key == "s" { onScreenshotRequested?(shift); return true }
@@ -1244,6 +1360,10 @@ final class MPVPlaybackController: ObservableObject {
         return value
     }
 
+#if DENBOX_TESTING
+    func testingProperty(_ name: String) -> String? { getProperty(name) }
+#endif
+
     private func command(_ arguments: [String]) -> Int32 {
         guard let handle else { return -1 }
         let owned = arguments.map { strdup($0) }
@@ -1399,7 +1519,8 @@ final class MPVRenderView: NSOpenGLView {
                 return self.controller.handleKeyboardShortcut(
                     keyCode: event.keyCode,
                     characters: event.charactersIgnoringModifiers ?? "",
-                    modifiers: event.modifierFlags
+                    modifiers: event.modifierFlags,
+                    charactersWithModifiers: event.characters
                 ) ? nil : event
             }
         }
@@ -1478,7 +1599,8 @@ final class MPVRenderView: NSOpenGLView {
         controller.onUserActivity?()
         if !controller.handleKeyboardShortcut(keyCode: event.keyCode,
                                               characters: event.charactersIgnoringModifiers ?? "",
-                                              modifiers: event.modifierFlags) {
+                                              modifiers: event.modifierFlags,
+                                              charactersWithModifiers: event.characters) {
             super.keyDown(with: event)
         }
     }

@@ -100,6 +100,13 @@
 "IMDb popularity charts use user interest signals and reflect current trends." = "نمودارهای محبوبیت IMDb بر اساس توجه کاربران، روندهای فعلی را نشان می‌دهند.";
 "Refresh catalog" = "تازه‌سازی فهرست";
 "Settings" = "تنظیمات";
+"Advanced player" = "تنظیمات پیشرفتهٔ پلیر";
+"Denbox reads mpv.conf and input.conf from its own configuration folder and loads Lua/JavaScript scripts from the scripts subfolder when the player opens." = "Denbox هنگام باز شدن پلیر، فایل‌های mpv.conf و input.conf را از پوشهٔ تنظیمات خودش می‌خواند و اسکریپت‌های Lua و JavaScript را از زیرپوشهٔ scripts بارگذاری می‌کند.";
+"Use mpv input.conf key bindings" = "استفاده از کلیدهای input.conf در mpv";
+"Open mpv configuration folder" = "باز کردن پوشهٔ تنظیمات mpv";
+"Open scripts folder" = "باز کردن پوشهٔ اسکریپت‌ها";
+"Edit input.conf" = "ویرایش input.conf";
+"Close and reopen the player after installing or changing scripts and mpv.conf." = "پس از نصب یا تغییر اسکریپت‌ها و mpv.conf، پلیر را ببند و دوباره باز کن.";
 "Clear search" = "پاک کردن جست‌وجو";
 "Loading more titles…" = "در حال بارگذاری عنوان‌های بیشتر…";
 "Load more titles" = "بارگذاری عنوان‌های بیشتر";

@@ -690,6 +690,7 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var pendingEpisodeProgress: WatchProgress?
     @Published private(set) var watchHistory: [WatchHistoryEntry] = []
     @Published private(set) var viewingStats = ViewingStats()
+    @Published private(set) var isLoadingViewingStats = false
     @Published private(set) var viewingUpdateMessage: String?
     @Published private(set) var resolvingSimilarTitleID: String?
     @Published private(set) var similarTitleSearchMessage: String?
@@ -727,6 +728,8 @@ final class LibraryModel: ObservableObject {
     )?
     private var activeWatchSessionID: String?
     private var activeWatchProgress: WatchProgress?
+    private var viewingStatsTask: Task<Void, Never>?
+    private var viewingStatsNeedsRefresh = true
     private var activeWatchPlayerKind = "AVPlayer"
     private var iinaPlaybackMonitor: IINAPlaybackMonitor?
     private var nextMoviePage = 0
@@ -836,7 +839,42 @@ final class LibraryModel: ObservableObject {
         continueWatchingItems = database.loadWatchProgress(limit: 500)
             .filter { !$0.isWatched && $0.positionSeconds >= 15 }
         watchHistory = database.loadWatchHistory(limit: 500)
-        viewingStats = database.viewingStats()
+    }
+
+    func refreshViewingStats(force: Bool = false) {
+        if force { viewingStatsNeedsRefresh = true }
+        guard viewingStatsNeedsRefresh, viewingStatsTask == nil else { return }
+        viewingStatsNeedsRefresh = false
+        isLoadingViewingStats = true
+        viewingStatsTask = Task { [weak self] in
+            guard let self else { return }
+            let stats = await self.database.viewingStatsAsync()
+            self.viewingStats = stats
+            self.isLoadingViewingStats = false
+            self.viewingStatsTask = nil
+            if self.viewingStatsNeedsRefresh { self.refreshViewingStats() }
+        }
+    }
+
+    private func invalidateViewingStats() {
+        viewingStatsNeedsRefresh = true
+        if section == .viewingStats { refreshViewingStats() }
+    }
+
+    private func updateContinueWatching(with progress: WatchProgress) {
+        let existingIndex = continueWatchingItems.firstIndex { $0.id == progress.id }
+        guard !progress.isWatched, progress.positionSeconds >= 15 else {
+            if let existingIndex { continueWatchingItems.remove(at: existingIndex) }
+            return
+        }
+        if let existingIndex {
+            continueWatchingItems[existingIndex] = progress
+        } else {
+            continueWatchingItems.insert(progress, at: 0)
+            if continueWatchingItems.count > 500 {
+                continueWatchingItems.removeLast(continueWatchingItems.count - 500)
+            }
+        }
     }
 
     func openProgressTitle(_ progress: WatchProgress) {
@@ -1047,6 +1085,7 @@ final class LibraryModel: ObservableObject {
         }
         personalRatings = database.loadPersonalRatings()
         refreshViewingData()
+        invalidateViewingStats()
         viewingUpdateMessage = "Viewing data merged. Newer local progress and ratings were kept; duplicate sessions were skipped."
         invalidateRecommendations()
         return true
@@ -1062,6 +1101,7 @@ final class LibraryModel: ObservableObject {
             return
         }
         refreshViewingData()
+        invalidateViewingStats()
         viewingUpdateMessage = "Viewing history and progress cleared."
         invalidateRecommendations()
     }
@@ -1767,7 +1807,7 @@ final class LibraryModel: ObservableObject {
         progress.updatedAt = Date()
         database.updateWatchSession(id: sessionID, progress: progress, watchedDelta: watchedDelta)
         activeWatchProgress = progress
-        refreshViewingData()
+        updateContinueWatching(with: progress)
     }
 
     func finishPlaybackSession(position: Double, duration: Double?) {
@@ -1782,6 +1822,7 @@ final class LibraryModel: ObservableObject {
         activeWatchSessionID = nil
         activeWatchProgress = nil
         refreshViewingData()
+        invalidateViewingStats()
         invalidateRecommendations()
     }
 
@@ -1814,6 +1855,7 @@ final class LibraryModel: ObservableObject {
     func setWatched(_ progress: WatchProgress, watched: Bool) {
         database.setWatched(progress, watched: watched)
         refreshViewingData()
+        invalidateViewingStats()
         invalidateRecommendations()
     }
 
@@ -1861,6 +1903,7 @@ final class LibraryModel: ObservableObject {
         )
         database.setWatched(progress, watched: watched)
         refreshViewingData()
+        invalidateViewingStats()
         invalidateRecommendations()
     }
 
@@ -3121,6 +3164,7 @@ private struct CachedCatalogMetadata: Sendable {
 
 final class MediaDatabase {
     private var handle: OpaquePointer?
+    private let databasePath: String
 
     init(databaseURL: URL? = nil) {
         let dbURL: URL
@@ -3136,6 +3180,7 @@ final class MediaDatabase {
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             dbURL = directory.appendingPathComponent("library.sqlite")
         }
+        databasePath = dbURL.path
         guard sqlite3_open(dbURL.path, &handle) == SQLITE_OK else { return }
         sqlite3_busy_timeout(handle, 5000)
         execute("""
@@ -3993,6 +4038,21 @@ extension MediaDatabase {
 
     func viewingStats() -> ViewingStats {
         guard let handle else { return ViewingStats() }
+        return Self.viewingStats(handle: handle)
+    }
+
+    func viewingStatsAsync() async -> ViewingStats {
+        let path = databasePath
+        return await Task.detached(priority: .utility) {
+            var readHandle: OpaquePointer?
+            guard sqlite3_open_v2(path, &readHandle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+                  let readHandle else { return ViewingStats() }
+            defer { sqlite3_close(readHandle) }
+            return Self.viewingStats(handle: readHandle)
+        }.value
+    }
+
+    private static func viewingStats(handle: OpaquePointer) -> ViewingStats {
         var stats = ViewingStats()
         var sessionStatement: OpaquePointer?
         if sqlite3_prepare_v2(handle, "SELECT genres,watched_seconds FROM watch_sessions WHERE watched_seconds>0", -1, &sessionStatement, nil) == SQLITE_OK,
@@ -4001,7 +4061,8 @@ extension MediaDatabase {
                 let watchedSeconds = sqlite3_column_double(sessionStatement, 1)
                 stats.totalWatchedSeconds += watchedSeconds
                 stats.sessionCount += 1
-                for genre in Self.decodeGenres(columnText(sessionStatement, 0)) {
+                let genreData = sqlite3_column_text(sessionStatement, 0).map { String(cString: $0) }
+                for genre in Self.decodeGenres(genreData) {
                     stats.genreSeconds[genre, default: 0] += watchedSeconds
                 }
             }
@@ -4218,7 +4279,7 @@ extension MediaDatabase {
         return value.isFinite ? value : nil
     }
 
-    private func scalarCount(_ sql: String, handle: OpaquePointer) -> Int {
+    private static func scalarCount(_ sql: String, handle: OpaquePointer) -> Int {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return 0 }
         defer { sqlite3_finalize(statement) }
@@ -6095,6 +6156,11 @@ private struct ViewingStatsPage: View {
             if let message = model.viewingUpdateMessage {
                 Text(DenboxLanguage.localizedMessage(message)).font(.denbox(size: 11)).foregroundStyle(Color.secondaryText)
             }
+            if model.isLoadingViewingStats {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                 statCard(title: "Total watch time", value: DenboxLanguage.localizedMessage(String(format: "%.1f hours", model.viewingStats.watchedHours)), symbol: "clock")
                 statCard(title: "Movies completed", value: "\(model.viewingStats.completedMovies)", symbol: "film")
@@ -6163,7 +6229,7 @@ private struct ViewingStatsPage: View {
                     .foregroundStyle(Color.secondaryText)
             }
         }
-        .onAppear { model.refreshViewingData() }
+        .onAppear { model.refreshViewingStats(force: true) }
         .sheet(item: $importPreview) { preview in
             VStack(alignment: .leading, spacing: 16) {
                 Text("Review viewing-data import")
@@ -9661,6 +9727,8 @@ private struct SettingsSheet: View {
     @EnvironmentObject private var model: LibraryModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage(DenboxLanguage.preferenceKey) private var interfaceLanguage = DenboxLanguage.defaultCode
+    @AppStorage(DenboxMPVConfiguration.useInputConfigurationKey) private var useMPVInputConfiguration = false
+    @State private var showAdvancedPlayerSettings = false
     @State private var mediaAPIKey = SecretVault.read(account: "media-api-key") ?? ""
     @State private var feedKey = SecretVault.read(account: "catalog-feed-key") ?? ""
     @State private var tmdbReadToken = SecretVault.read(account: "tmdb-read-access-token") ?? ""
@@ -9721,6 +9789,45 @@ private struct SettingsSheet: View {
                 }
             }
             .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12))
+
+            DisclosureGroup(isExpanded: $showAdvancedPlayerSettings) {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Denbox reads mpv.conf and input.conf from its own configuration folder and loads Lua/JavaScript scripts from the scripts subfolder when the player opens.")
+                        .font(.denbox(size: 10))
+                        .foregroundStyle(Color.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Toggle("Use mpv input.conf key bindings", isOn: $useMPVInputConfiguration)
+                        .font(.denbox(size: 11))
+                    HStack(spacing: 8) {
+                        Button("Open mpv configuration folder") {
+                            _ = DenboxMPVConfiguration.reveal(DenboxMPVConfiguration.directoryURL)
+                        }
+                        .buttonStyle(.bordered)
+                        Button("Open scripts folder") {
+                            _ = DenboxMPVConfiguration.reveal(DenboxMPVConfiguration.scriptsDirectoryURL)
+                        }
+                        .buttonStyle(.bordered)
+                        Button("Edit input.conf") {
+                            _ = DenboxMPVConfiguration.openInputConfiguration()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    Text(DenboxMPVConfiguration.directoryURL.path)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Color.secondaryText.opacity(0.8))
+                        .textSelection(.enabled)
+                    Text("Close and reopen the player after installing or changing scripts and mpv.conf.")
+                        .font(.denbox(size: 9))
+                        .foregroundStyle(Color.secondaryText.opacity(0.8))
+                }
+                .padding(.top, 9)
+            } label: {
+                Label("Advanced player", systemImage: "slider.horizontal.3")
+                    .font(.denbox(size: 13, weight: .semibold))
+            }
+            .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12))
 
