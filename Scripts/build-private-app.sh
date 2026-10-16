@@ -12,11 +12,6 @@ OUTPUT_DIR="$ROOT/dist"
 APP=""
 BUILD_SUCCEEDED=0
 
-if [[ "$(uname -m)" != "arm64" ]]; then
-  echo "Denbox's bundled libmpv build targets Apple Silicon; run this script on an Apple Silicon Mac." >&2
-  exit 1
-fi
-
 for tool in swiftc codesign curl hdiutil shasum lipo python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Required macOS build tool not found: $tool (install Xcode Command Line Tools)." >&2
@@ -77,10 +72,13 @@ if [[ ! -f "$MPV_LIBRARY" ]]; then
   echo "IINA's libmpv runtime was not found at $MPV_LIBRARY." >&2
   exit 1
 fi
-if ! lipo -archs "$MPV_LIBRARY" | tr ' ' '\n' | grep -qx arm64; then
-  echo "The selected IINA libmpv library does not contain Apple Silicon code." >&2
-  exit 1
-fi
+MPV_ARCHS="$(lipo -archs "$MPV_LIBRARY")"
+for architecture in arm64 x86_64; do
+  if ! printf '%s\n' "$MPV_ARCHS" | tr ' ' '\n' | grep -qx "$architecture"; then
+    echo "The selected IINA libmpv library must contain both arm64 and x86_64 slices (found: $MPV_ARCHS)." >&2
+    exit 1
+  fi
+done
 
 mkdir -p "$OUTPUT_DIR"
 APP="$OUTPUT_DIR/Denbox-${APP_VERSION}-build${BUILD_NUMBER}.app"
@@ -116,21 +114,44 @@ if ! python3 "$ROOT/Scripts/embed-private-api-keys.py" "$APP"; then
   cp "$source_keys" "$APP/Contents/Resources/DenboxPrivateAPIKeys.plist"
 fi
 
-swiftc -parse-as-library -swift-version 5 -O \
-  -target arm64-apple-macosx13.0 \
-  -I "$ROOT/Sources/MPV" \
-  -framework SwiftUI -framework AppKit -framework MediaPlayer -framework OpenGL \
-  -framework ImageIO -framework Network -framework Security \
-  -framework UniformTypeIdentifiers -framework WebKit -lsqlite3 \
-  -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
-  "$ROOT/Sources/SimbaMac.swift" "$ROOT/Sources/DenboxLanguage.swift" \
-  "$ROOT/Sources/DiscoveryFeeds.swift" "$ROOT/Sources/MPVPlayback.swift" \
-  "$ROOT/Sources/IINAPlaybackMonitor.swift" "$ROOT/Sources/PublicTitleMetadata.swift" \
-  "$ROOT/Sources/PublicMetadataDiscovery.swift" "$ROOT/Sources/PublicTitlePageImportView.swift" \
-  "$ROOT/Sources/ReferenceMetadata.swift" "$ROOT/Sources/SegmentedDownloader.swift" \
-  "$ROOT/Sources/IMDbMetadata.swift" "$ROOT/Sources/ViewingActivity.swift" \
-  "$ROOT/Sources/OnlineSubtitleSearchView.swift" "$ROOT/Sources/OpenSubtitles.swift" \
-  "$MPV_LIBRARY" -o "$APP/Contents/MacOS/Denbox"
+APP_SOURCES=(
+  "$ROOT/Sources/SimbaMac.swift"
+  "$ROOT/Sources/DenboxLanguage.swift"
+  "$ROOT/Sources/DiscoveryFeeds.swift"
+  "$ROOT/Sources/MPVPlayback.swift"
+  "$ROOT/Sources/IINAPlaybackMonitor.swift"
+  "$ROOT/Sources/PublicTitleMetadata.swift"
+  "$ROOT/Sources/PublicMetadataDiscovery.swift"
+  "$ROOT/Sources/PublicTitlePageImportView.swift"
+  "$ROOT/Sources/ReferenceMetadata.swift"
+  "$ROOT/Sources/SegmentedDownloader.swift"
+  "$ROOT/Sources/IMDbMetadata.swift"
+  "$ROOT/Sources/ViewingActivity.swift"
+  "$ROOT/Sources/OnlineSubtitleSearchView.swift"
+  "$ROOT/Sources/OpenSubtitles.swift"
+)
+
+for architecture in arm64 x86_64; do
+  echo "Compiling Denbox for $architecture (macOS 13+)."
+  swiftc -parse-as-library -swift-version 5 -O \
+    -target "$architecture-apple-macosx13.0" \
+    -I "$ROOT/Sources/MPV" \
+    -framework SwiftUI -framework AppKit -framework MediaPlayer -framework OpenGL \
+    -framework ImageIO -framework Network -framework Security \
+    -framework UniformTypeIdentifiers -framework WebKit -lsqlite3 \
+    -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
+    "${APP_SOURCES[@]}" "$MPV_LIBRARY" -o "$WORK/Denbox-$architecture"
+done
+
+lipo -create "$WORK/Denbox-arm64" "$WORK/Denbox-x86_64" \
+  -output "$APP/Contents/MacOS/Denbox"
+APP_ARCHS="$(lipo -archs "$APP/Contents/MacOS/Denbox")"
+for architecture in arm64 x86_64; do
+  if ! printf '%s\n' "$APP_ARCHS" | tr ' ' '\n' | grep -qx "$architecture"; then
+    echo "The built Denbox executable is missing the $architecture slice (found: $APP_ARCHS)." >&2
+    exit 1
+  fi
+done
 
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
@@ -141,5 +162,5 @@ if ! /usr/bin/plutil -lint "$APP/Contents/Resources/DenboxPrivateAPIKeys.plist" 
 fi
 
 BUILD_SUCCEEDED=1
-echo "Built and verified $APP (Apple Silicon, macOS 13+)."
+echo "Built and verified $APP (Universal: Apple Silicon + Intel, macOS 13 Ventura+)."
 echo "This private build contains extractable shared API keys; restrict access to trusted recipients."
