@@ -24,6 +24,16 @@ struct IMDbGenreIndexPerformanceTests {
         try require(firstPage.count == 10, "genre-index migration did not return the ten highest-ranked matches")
         try require(firstPage.allSatisfy { $0.tconst != "tt-source" && $0.genres.contains("Drama") },
                     "genre-index migration returned the source series or unrelated genres")
+        try require(indexExists("idx_series_similarity_lookup", in: databaseURL),
+                    "the compact covering index for similar-series lookups was not created")
+
+        let cachedSimilarStarted = Date()
+        var cachedSimilarCount = 0
+        for _ in 0..<100 { cachedSimilarCount += store.similarSeries(for: "tt-source").count }
+        let cachedSimilarSeconds = Date().timeIntervalSince(cachedSimilarStarted)
+        try require(cachedSimilarCount == 1_000, "the cached similar-series results changed")
+        try require(cachedSimilarSeconds < 0.2,
+                    String(format: "100 similar-series cache hits took %.3fs", cachedSimilarSeconds))
 
         let seriesMatch = store.matchTitle(title: "Drama Series 49999", year: "2020", kind: "Series")
         try require(seriesMatch?.tconst == "tt0049999",
@@ -72,6 +82,7 @@ struct IMDbGenreIndexPerformanceTests {
                     String(format: "twenty indexed recommendation queries took %.3fs, over two seconds", indexedQuerySeconds))
 
         print(String(format: "Legacy genre-index migration: %.3fs for 50,000 series", migrationSeconds))
+        print(String(format: "Similar-series cache: 100 requests in %.3fs", cachedSimilarSeconds))
         print(String(format: "Indexed discovery query: %.3fs first run · %.3fs cached; 30,000-title ranking: %.3fs", discoverySeconds, repeatedDiscoverySeconds, rankingSeconds))
         print(String(format: "Indexed recommendations and exact title lookups: %.3fs for 60 queries", indexedQuerySeconds))
         print("PASS IMDb indexes: legacy migration, discovery ordering/cache, similar-title lookup, and exact series/movie title lookup")
@@ -170,6 +181,21 @@ struct IMDbGenreIndexPerformanceTests {
             sqlite3_free(message)
             throw GenreIndexTestFailure(message: detail)
         }
+    }
+
+    private static func indexExists(_ name: String, in url: URL) -> Bool {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
+            if let db { sqlite3_close(db) }
+            return false
+        }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", -1, &statement, nil) == SQLITE_OK,
+              let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        _ = name.withCString { sqlite3_bind_text(statement, 1, $0, -1, sqliteTransient) }
+        return sqlite3_step(statement) == SQLITE_ROW
     }
 
     private static func bind(_ value: String, to statement: OpaquePointer, at index: Int32) {

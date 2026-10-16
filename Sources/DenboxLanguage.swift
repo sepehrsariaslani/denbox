@@ -1,5 +1,31 @@
 import SwiftUI
 
+extension Font {
+    static func denbox(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        let postScriptName: String
+        if weight == .black {
+            postScriptName = "Peyda-Black"
+        } else if weight == .heavy {
+            postScriptName = "Peyda-ExtraBold"
+        } else if weight == .bold {
+            postScriptName = "Peyda-Bold"
+        } else if weight == .semibold {
+            postScriptName = "Peyda-SemiBold"
+        } else if weight == .medium {
+            postScriptName = "Peyda-Medium"
+        } else if weight == .light {
+            postScriptName = "Peyda-Light"
+        } else if weight == .thin {
+            postScriptName = "Peyda-Thin"
+        } else if weight == .ultraLight {
+            postScriptName = "Peyda-ExtraLight"
+        } else {
+            postScriptName = "Peyda-Regular"
+        }
+        return .custom(postScriptName, size: size)
+    }
+}
+
 enum DenboxLanguage {
     static let preferenceKey = "denbox.interfaceLanguage"
     static let defaultCode = persianCode
@@ -77,6 +103,7 @@ enum DenboxLanguage {
             (#"^(\d+) titles in IMDb · (.+)$"#, "%@ titles in IMDb · %@"),
             (#"^Watched (.+) of (.+)$"#, "Watched %@ of %@"),
             (#"^Resume at (.+)$"#, "Resume at %@"),
+            (#"^Season downloads: (\d+) added · (\d+) unavailable · (\d+) already queued or downloaded$"#, "Season downloads: %@ added · %@ unavailable · %@ already queued or downloaded"),
             (#"^Watch time: (.+)$"#, "Watch time: %@"),
             (#"^(\d+(?:\.\d+)?) hours$"#, "%@ hours"),
             (#"^Could not save the viewing data export: (.+)$"#, "Could not save the viewing data export: %@"),
@@ -89,6 +116,7 @@ enum DenboxLanguage {
             (#"^Video (\d+)$"#, "Video %@"),
             (#"^Subtitle (\d+)$"#, "Subtitle %@"),
             (#"^Chapter (\d+)$"#, "Chapter %@"),
+            (#"^Chapters: (\d+)$"#, "Chapters: %@"),
             (#"^Local database · (\d+) movies · (\d+) series$"#, "Local database · %@ movies · %@ series"),
             (#"^Live catalog unavailable\. Showing (\d+) saved movies and (\d+) saved series\.$"#, "Live catalog unavailable. Showing %@ saved movies and %@ saved series."),
             (#"^Live catalog loaded · (\d+) movies · (\d+) series · (movies|series) feed unavailable$"#, "Live catalog loaded · %@ movies · %@ series · %@ feed unavailable"),

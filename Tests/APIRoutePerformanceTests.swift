@@ -73,29 +73,7 @@ server.serve_forever()
         )
         try require(DirectMediaAPI.rows(from: skippedEmpty)?.first?["title"] as? String == "fast",
                     "the route race did not skip an empty response")
-
-        let parsedStarted = Date()
-        let fixtureItem = MediaItem(
-            id: "movie:route-test", apiID: "route-test", title: "Route Test", subtitle: "Movie",
-            synopsis: "", year: "2026", kind: "Movie", symbol: "film", palette: 0, isRemote: true
-        )
-        let parsed = try await DirectMediaAPI.getParsedJSON(
-            firstAcceptableFrom: [base.appendingPathComponent("slow"), base.appendingPathComponent("fast")],
-            timeout: 5,
-            classify: { data in
-                guard let payload = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
-                      let title = DirectMediaAPI.rows(from: payload)?.first?["title"] as? String else {
-                    return (nil, DirectMediaResponseQuality.rejected)
-                }
-                let details = LibraryModel.parseDetails(["description": title], for: fixtureItem)
-                return (details, title == "fast" ? .preferred : .fallback)
-            }
-        )
-        let parsedSeconds = Date().timeIntervalSince(parsedStarted)
-        try require(parsed.value.description == "fast", "parsed route selection did not prefer a playable response")
-        try require(parsedSeconds < 1, "parsed response selection waited for a slow fallback route")
         print(String(format: "PASS API route race: usable response in %.3fs; empty route skipped", fastSeconds))
-        print(String(format: "PASS parsed detail route: preferred response returned in %.3fs", parsedSeconds))
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

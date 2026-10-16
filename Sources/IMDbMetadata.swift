@@ -31,14 +31,21 @@ struct IMDbPersonMetadata: Identifiable, Sendable {
     let deathYear: Int?
     let professions: [String]
     let knownForTitleIDs: [String]
+    var imageURL: URL? = nil
 
     var id: String { nconst }
     var imdbURL: URL? { URL(string: "https://www.imdb.com/name/\(nconst)/") }
+
+    func usingImage(_ imageURL: URL?) -> Self {
+        Self(nconst: nconst, name: name, birthYear: birthYear, deathYear: deathYear,
+             professions: professions, knownForTitleIDs: knownForTitleIDs, imageURL: imageURL ?? self.imageURL)
+    }
 }
 
 struct IMDbPersonLookupRequest: Equatable, Sendable {
     let nconst: String?
     let name: String
+    var imageURL: URL? = nil
 }
 
 struct IMDbPersonCredit: Identifiable, Sendable {
@@ -174,9 +181,12 @@ final class IMDbMetadataStore: @unchecked Sendable {
     private var hasDiscoveryIndex = false
     private let seriesGenreIndexLock = NSLock()
     private var hasSeriesGenreIndex = false
+    private let similarityIndexLock = NSLock()
+    private var hasSimilarityIndex = false
     private let datasetCacheLock = NSLock()
     private var cachedGenreFacets: [IMDbGenreFacet]?
     private var cachedDiscoveryCandidates: [Int: [IMDbTitleMetadata]] = [:]
+    private var cachedSimilarSeriesByGenres: [String: [IMDbTitleMetadata]] = [:]
     private var cachedIMDbChartMeans: (movies: Double, series: Double)?
     private let endpoints: [(String, URL)] = [
         ("titles", URL(string: "https://datasets.imdbws.com/title.basics.tsv.gz")!),
@@ -267,11 +277,12 @@ final class IMDbMetadataStore: @unchecked Sendable {
 
     func enrichment(title: String, year: String, includeSimilar: Bool = true) -> IMDbEnrichment? {
         let indexesReady = ensureSearchIndexes()
+        let similarReady = !includeSimilar || (ensureSeriesGenreIndex() && ensureSimilarityIndex())
         guard let db = openReadOnly() else { return nil }
         defer { sqlite3_close(db) }
         guard let series = matchSeries(db: db, title: title, year: Int(year), indexesReady: indexesReady) else { return nil }
         let episodes = episodeRows(db: db, parent: series.tconst)
-        let similar = includeSimilar ? similarRows(db: db, to: series) : []
+        let similar = includeSimilar && similarReady ? similarRows(db: db, to: series) : []
         return IMDbEnrichment(series: series, episodes: episodes, similarSeries: similar)
     }
 
@@ -459,6 +470,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
     func similarSeries(for seriesID: String) -> [IMDbTitleMetadata] {
         _ = ensureSearchIndexes()
         guard ensureSeriesGenreIndex() else { return [] }
+        guard ensureSimilarityIndex() else { return [] }
         guard let db = openReadOnly() else { return [] }
         defer { sqlite3_close(db) }
         var statement: OpaquePointer?
@@ -877,6 +889,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
         datasetCacheLock.lock()
         cachedGenreFacets = nil
         cachedDiscoveryCandidates.removeAll(keepingCapacity: false)
+        cachedSimilarSeriesByGenres.removeAll(keepingCapacity: false)
         cachedIMDbChartMeans = nil
         datasetCacheLock.unlock()
     }
@@ -938,6 +951,30 @@ final class IMDbMetadataStore: @unchecked Sendable {
         committed = true
         hasSeriesGenreIndex = true
         return true
+    }
+
+    private func ensureSimilarityIndex() -> Bool {
+        similarityIndexLock.lock()
+        defer { similarityIndexLock.unlock() }
+        if hasSimilarityIndex { return true }
+        guard isAvailable else { return false }
+
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db else {
+            if let db { sqlite3_close(db) }
+            return false
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 20_000)
+
+        let result = sqlite3_exec(db, """
+            CREATE INDEX IF NOT EXISTS idx_series_similarity_lookup
+            ON titles(tconst,primary_title,start_year,genres,rating,votes)
+            WHERE title_type IN ('tvSeries','tvMiniSeries') AND rating IS NOT NULL;
+            """, nil, nil, nil)
+        hasSimilarityIndex = result == SQLITE_OK
+        return hasSimilarityIndex
     }
 
     private func metadataValue(_ key: String, db: OpaquePointer) -> String? {
@@ -1013,21 +1050,28 @@ final class IMDbMetadataStore: @unchecked Sendable {
     private func similarRows(db: OpaquePointer, to series: IMDbTitleMetadata) -> [IMDbTitleMetadata] {
         let genres = Array(series.genres.prefix(4))
         guard !genres.isEmpty else { return [] }
+        let sourceGenres = Set(series.genres)
+        let cacheKey = sourceGenres.sorted().joined(separator: "\u{1F}")
+        datasetCacheLock.lock()
+        let cached = cachedSimilarSeriesByGenres[cacheKey]
+        datasetCacheLock.unlock()
+        if let cached {
+            return Array(cached.lazy.filter { $0.tconst != series.tconst }.prefix(10))
+        }
+
         let placeholders = Array(repeating: "?", count: genres.count).joined(separator: ",")
         let sql = """
         SELECT t.tconst,t.primary_title,t.start_year,t.genres,t.rating,t.votes
-        FROM series_genres g JOIN titles t ON t.tconst=g.tconst
+        FROM series_genres g JOIN titles AS t INDEXED BY idx_series_similarity_lookup ON t.tconst=g.tconst
         WHERE t.title_type IN ('tvSeries','tvMiniSeries') AND t.rating IS NOT NULL
-          AND t.tconst<>? AND g.genre IN (\(placeholders))
+          AND g.genre IN (\(placeholders))
         GROUP BY t.tconst
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
         defer { sqlite3_finalize(statement) }
-        bind(series.tconst, to: statement, at: 1)
-        for (index, genre) in genres.enumerated() { bind(genre, to: statement, at: Int32(index + 2)) }
+        for (index, genre) in genres.enumerated() { bind(genre, to: statement, at: Int32(index + 1)) }
         var candidates: [(IMDbTitleMetadata, Double)] = []
-        let sourceGenres = Set(series.genres)
         while sqlite3_step(statement) == SQLITE_ROW {
             guard let id = text(statement, 0), let title = text(statement, 1) else { continue }
             let relatedGenres = (text(statement, 3) ?? "").split(separator: ",").map(String.init)
@@ -1042,7 +1086,14 @@ final class IMDbMetadataStore: @unchecked Sendable {
             candidates.append((IMDbTitleMetadata(tconst: id, title: title, year: integer(statement, 2),
                                                   genres: relatedGenres, rating: rating, votes: votes), rank))
         }
-        return candidates.sorted { $0.1 > $1.1 }.prefix(10).map(\.0)
+        let bestCandidates = candidates.sorted { $0.1 > $1.1 }.prefix(11).map(\.0)
+        datasetCacheLock.lock()
+        if cachedSimilarSeriesByGenres[cacheKey] == nil {
+            cachedSimilarSeriesByGenres[cacheKey] = bestCandidates
+        }
+        let cachedBestCandidates = cachedSimilarSeriesByGenres[cacheKey] ?? bestCandidates
+        datasetCacheLock.unlock()
+        return Array(cachedBestCandidates.lazy.filter { $0.tconst != series.tconst }.prefix(10))
     }
 
     private func importDataset(titles: URL, episodes: URL, ratings: URL, names: URL?, principals: URL?, crew: URL?, to destination: URL,
@@ -1258,6 +1309,9 @@ final class IMDbMetadataStore: @unchecked Sendable {
             seriesGenreIndexLock.lock()
             hasSeriesGenreIndex = false
             seriesGenreIndexLock.unlock()
+            similarityIndexLock.lock()
+            hasSimilarityIndex = false
+            similarityIndexLock.unlock()
             invalidateDatasetCaches()
         } catch {
             if hadPrevious { try? fileManager.moveItem(at: backup, to: databaseURL) }

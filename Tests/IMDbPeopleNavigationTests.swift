@@ -57,6 +57,17 @@ struct IMDbPeopleNavigationTests {
         let modelDatabaseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("Denbox-genre-browse-\(UUID().uuidString).sqlite")
         let model = LibraryModel(loadRemoteCatalog: false, databaseURL: modelDatabaseURL)
+        let portraitURL = URL(string: "https://static.tvmaze.com/actors/1001.jpg")!
+        model.openIMDbPerson(named: "  Actor First  ", imdbID: " NM0000001 ", imageURL: portraitURL)
+        let idRequest = model.consumePendingIMDbPersonRequest()
+        try require(idRequest?.nconst == "nm0000001" && idRequest?.name == "Actor First"
+                    && idRequest?.imageURL == portraitURL && model.section == .imdbPeople,
+                    "a cast card did not open IMDb People with its normalized IMDb ID and portrait")
+        model.openIMDbPerson(named: "Fallback Actor", imdbID: "not-an-imdb-id")
+        let nameRequest = model.consumePendingIMDbPersonRequest()
+        try require(nameRequest?.nconst == nil && nameRequest?.name == "Fallback Actor",
+                    "a cast card with an invalid IMDb ID did not fall back to its name")
+
         model.browseGenre("Comedy", kind: "Series")
         try require(model.section == .shows && model.selectedGenreFilters == ["Comedy"],
                     "browsing a series genre did not open a filtered series catalog")
@@ -64,7 +75,7 @@ struct IMDbPeopleNavigationTests {
         try require(model.section == .movies && model.selectedGenreFilters == ["Drama"],
                     "browsing a movie genre did not open a filtered movie catalog")
 
-        print("PASS IMDb people/genre navigation: cast IDs, ordering, person lookup, Persian genres, and filtered browsing")
+        print("PASS IMDb people/genre navigation: cast-ID routing, portraits, name fallback, person lookup, Persian genres, and browsing")
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

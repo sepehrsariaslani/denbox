@@ -25,6 +25,19 @@ struct CatalogPersistencePerformanceTests {
         let writeSeconds = Date().timeIntervalSince(started)
         try require(database?.loadCatalog().count == items.count,
                     "the transaction did not persist every catalog title")
+
+        let metadata = Dictionary(uniqueKeysWithValues: items.enumerated().map { index, item in
+            (item.id, IMDbTitleMetadata(
+                tconst: String(format: "tt%07d", index + 1), title: item.title, year: 2026,
+                genres: ["Drama"], rating: 7.5, votes: 10_000, kind: item.kind
+            ))
+        })
+        let metadataStarted = Date()
+        database?.saveIMDbMetadata(metadata)
+        let metadataWriteSeconds = Date().timeIntervalSince(metadataStarted)
+        let enriched = database?.loadCatalog() ?? []
+        try require(enriched.count == items.count && enriched.allSatisfy { $0.imdbID != nil && $0.genres == ["Drama"] },
+                    "batched IMDb catalog metadata did not persist every match")
         database = nil
 
         let reopened = MediaDatabase(databaseURL: databaseURL)
@@ -32,7 +45,9 @@ struct CatalogPersistencePerformanceTests {
                     "the transaction was not durable after reopening the catalog")
         try require(writeSeconds < 1.0,
                     String(format: "writing 1,000 catalog titles took %.3fs", writeSeconds))
-        print(String(format: "PASS catalog persistence: 1,000 titles saved atomically in %.3fs and reloaded", writeSeconds))
+        try require(metadataWriteSeconds < 0.5,
+                    String(format: "writing 1,000 IMDb metadata rows took %.3fs", metadataWriteSeconds))
+        print(String(format: "PASS catalog persistence: 1,000 titles in %.3fs; 1,000 IMDb rows in %.3fs", writeSeconds, metadataWriteSeconds))
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
