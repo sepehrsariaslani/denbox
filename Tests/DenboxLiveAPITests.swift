@@ -4,6 +4,11 @@ import Foundation
 struct DenboxLiveAPITests {
     @MainActor
     static func main() async throws {
+        if CommandLine.arguments.contains("--cached-player-probe") {
+            try await probeCachedPlayerSources()
+            return
+        }
+
         let model = LibraryModel()
         try await Task.sleep(nanoseconds: 250_000_000)
         await model.refreshCatalog()
@@ -24,11 +29,11 @@ struct DenboxLiveAPITests {
               let series = model.items.first(where: { $0.kind == "Series" && $0.isRemote }) else {
             throw TestFailure(message: "live catalog did not provide both media types")
         }
-        guard let movieDetails = await model.loadDetails(for: movie),
+        guard let movieDetails = await model.loadDetails(for: movie, forceRefresh: true),
               !movieDetails.sources.isEmpty || !movieDetails.downloadSources.isEmpty else {
             throw TestFailure(message: "live movie detail has no playable/download URL")
         }
-        guard let seriesDetails = await model.loadDetails(for: series),
+        guard let seriesDetails = await model.loadDetails(for: series, forceRefresh: true),
               let episode = seriesDetails.seasons.flatMap(\.episodes).first,
               !episode.sources.isEmpty || !episode.downloadSources.isEmpty else {
             throw TestFailure(message: "live series detail has no episode playback/download URL")
@@ -43,6 +48,13 @@ struct DenboxLiveAPITests {
                     && firstRange.totalBytes == secondRange.totalBytes,
                     "live media server did not honor arbitrary HTTP byte ranges")
         let livePartCount = min(8, max(2, Int((firstRange.totalBytes + 4_194_303) / 4_194_304)))
+
+        let moviePlaybackSource = movieDetails.sources.first ?? movieDetails.downloadSources.first!
+        let episodePlaybackSource = episode.sources.first ?? episode.downloadSources.first!
+        let moviePlayback = await probeMediaResponse(moviePlaybackSource)
+        let episodePlayback = await probeMediaResponse(episodePlaybackSource)
+        print("Live movie stream: .\(moviePlaybackSource.url.pathExtension.lowercased()) · \(moviePlayback)")
+        print("Live episode stream: .\(episodePlaybackSource.url.pathExtension.lowercased()) · \(episodePlayback)")
 
         model.section = .movies
         for _ in 0..<4 where model.items.filter({ $0.kind == "Movie" }).count == initialMovieCount {
@@ -59,6 +71,57 @@ struct DenboxLiveAPITests {
         print("PASS live details: movie links=\(movieLinkCount), episode links=\(episodeLinkCount)")
         print("PASS live media source: arbitrary byte ranges accepted; planned parts=\(livePartCount)")
         print("PASS live pagination: movie titles grew to \(expandedMovieCount)")
+    }
+
+    @MainActor
+    private static func probeCachedPlayerSources() async throws {
+        let model = LibraryModel(loadRemoteCatalog: false, refreshStaleDetailsInBackground: false)
+        let database = MediaDatabase()
+        let itemsWithCachedDetails = database.loadCatalog().filter {
+            $0.isRemote && database.loadDetailsPayload(for: $0.id) != nil
+        }
+        guard let movie = itemsWithCachedDetails.first(where: { $0.kind == "Movie" }),
+              let series = itemsWithCachedDetails.first(where: { $0.kind == "Series" }) else {
+            throw TestFailure(message: "the local database needs cached movie and series details before the AVPlayer probe")
+        }
+        guard let movieDetails = await model.loadDetails(for: movie),
+              let movieSource = movieDetails.sources.first ?? movieDetails.downloadSources.first,
+              let seriesDetails = await model.loadDetails(for: series),
+              let episode = seriesDetails.seasons.flatMap(\.episodes).first,
+              let episodeSource = episode.sources.first ?? episode.downloadSources.first else {
+            throw TestFailure(message: "cached detail data did not contain movie and episode streams")
+        }
+
+        let movieResult = await probeMediaResponse(movieSource)
+        let episodeResult = await probeMediaResponse(episodeSource)
+        print("Cached movie stream: .\(movieSource.url.pathExtension.lowercased()) · \(movieResult)")
+        print("Cached episode stream: .\(episodeSource.url.pathExtension.lowercased()) · \(episodeResult)")
+    }
+
+    private static func probeMediaResponse(_ source: MediaStreamSource) async -> String {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = 8
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        var request = URLRequest(url: source.url)
+        request.setValue("bytes=0-63", forHTTPHeaderField: "Range")
+        request.setValue("video/*,*/*", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 8
+        for (name, value) in source.headers { request.setValue(value, forHTTPHeaderField: name) }
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else { return "non-HTTP response" }
+            var iterator = bytes.makeAsyncIterator()
+            var count = 0
+            while count < 64, try await iterator.next() != nil { count += 1 }
+            let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "unknown-type"
+            let contentRange = http.value(forHTTPHeaderField: "Content-Range") ?? "no-range"
+            return "HTTP \(http.statusCode) · \(contentType) · \(count) bytes · \(contentRange)"
+        } catch {
+            let failure = error as NSError
+            return "request-error \(failure.domain)/\(failure.code)"
+        }
     }
 
     private static func probeRange(
