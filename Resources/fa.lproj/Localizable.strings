@@ -275,6 +275,16 @@
 "Preparing genres…" = "در حال آماده‌سازی ژانرها…";
 "IMDb data is available, but the genre list could not be prepared. Try again." = "داده‌های IMDb موجودند، اما فهرست ژانرها آماده نشد. دوباره تلاش کن.";
 "Download IMDb data to build the genre list." = "برای ساخت فهرست ژانرها، داده‌های IMDb را دریافت کن.";
+"All genres" = "همهٔ ژانرها";
+"Titles from IMDb, sorted by rating and votes. Selecting one searches Simba." = "عنوان‌های IMDb بر اساس امتیاز و تعداد رأی مرتب شده‌اند. با انتخاب هر عنوان، در Simba جست‌وجو می‌شود.";
+"Title type" = "نوع عنوان";
+"TV series" = "سریال‌ها";
+"Search within this genre" = "جست‌وجو در این ژانر";
+"%@ IMDb titles loaded" = "%@ عنوان از IMDb بارگیری شد";
+"Loading IMDb titles…" = "در حال بارگیری عنوان‌های IMDb…";
+"No rated IMDb titles were found for this genre." = "برای این ژانر عنوان امتیازدار IMDb پیدا نشد.";
+"No titles on the loaded pages match this search." = "در صفحه‌های بارگیری‌شده عنوانی با این جست‌وجو پیدا نشد.";
+"Load more IMDb titles" = "بارگیری عنوان‌های بیشتر از IMDb";
 "Download IMDb data" = "دریافت داده‌های IMDb";
 "%@ titles in IMDb · %@" = "%@ عنوان در IMDb · %@";
 "Clear genre filters" = "پاک کردن فیلتر ژانرها";

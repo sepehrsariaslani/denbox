@@ -70,6 +70,8 @@ struct IMDbGenreIndexPerformanceTests {
         try require(ranked.count == 80, "recommendation ranking returned fewer than 80 eligible titles")
         try require(rankingSeconds < 1, "ranking 30,000 discovery candidates took more than one second")
 
+        try verifyIMDbGenreBrowse(store: store)
+
         let queryStarted = Date()
         var resultCount = 0
         for _ in 0..<20 {
@@ -86,7 +88,35 @@ struct IMDbGenreIndexPerformanceTests {
         print(String(format: "Similar-series cache: 100 requests in %.3fs", cachedSimilarSeconds))
         print(String(format: "Indexed discovery query: %.3fs first run · %.3fs cached; 30,000-title ranking: %.3fs", discoverySeconds, repeatedDiscoverySeconds, rankingSeconds))
         print(String(format: "Indexed recommendations and exact title lookups: %.3fs for 60 queries", indexedQuerySeconds))
-        print("PASS IMDb indexes: legacy migration, discovery ordering/cache, similar-title lookup, and exact series/movie title lookup")
+        print("PASS IMDb indexes: genre browsing/pagination, legacy migration, discovery ordering/cache, similar-title lookup, and exact series/movie title lookup")
+    }
+
+    private static func verifyIMDbGenreBrowse(store: IMDbMetadataStore) throws {
+        let firstPage = store.genreTitles(named: "Drama", offset: 0, limit: 10)
+        let nextPage = store.genreTitles(named: "Drama", offset: 10, limit: 10)
+        let movieTitles = store.genreTitles(named: "Drama", kind: "Movie", limit: 10)
+        let seriesTitles = store.genreTitles(named: "Drama", kind: "Series", limit: 10)
+        let wrongToken = store.genreTitles(named: "Dramatic", limit: 10)
+        try require(firstPage.count == 10 && nextPage.count == 10,
+                    "IMDb genre browsing did not return full pages from the local dataset")
+        try require(Set(firstPage.map(\.tconst)).isDisjoint(with: Set(nextPage.map(\.tconst))),
+                    "IMDb genre pagination repeated titles")
+        try require(movieTitles.count == 1 && movieTitles.first?.kind == "Movie",
+                    "IMDb movie genre filter did not restrict results to movies")
+        try require(seriesTitles.count == 10 && seriesTitles.allSatisfy { $0.kind == "Series" },
+                    "IMDb series genre filter did not restrict results to series")
+        try require(wrongToken.isEmpty,
+                    "IMDb genre matching treated a partial genre word as a match")
+        let queryPlan = store.genreBrowseQueryPlanForTesting().joined(separator: " | ")
+        try require(queryPlan.contains("idx_discovery_rating"),
+                    "IMDb genre browsing did not use the indexed rating order: \(queryPlan)")
+        try require(!queryPlan.localizedCaseInsensitiveContains("temp b-tree"),
+                    "IMDb genre browsing sorted into a temporary B-tree: \(queryPlan)")
+        for kind in ["Movie", "Series"] {
+            let kindPlan = store.genreBrowseQueryPlanForTesting(kind: kind).joined(separator: " | ")
+            try require(kindPlan.contains("idx_discovery_rating"),
+                        "IMDb \(kind.lowercased()) genre browsing did not use the indexed rating order: \(kindPlan)")
+        }
     }
 
     private static func verifyCatalogMatchIndexes(in root: URL) throws {
@@ -138,6 +168,20 @@ struct IMDbGenreIndexPerformanceTests {
         try require(plan.contains("idx_discovery_rating"), "the installed database did not use its discovery index: \(plan)")
         try require(!plan.localizedCaseInsensitiveContains("temp b-tree"), "the installed discovery query still uses a temporary sort: \(plan)")
 
+        let genreStarted = Date()
+        let dramaTitles = store.genreTitles(named: "Drama", limit: 60)
+        let genreSeconds = Date().timeIntervalSince(genreStarted)
+        try require(dramaTitles.count == 60 && dramaTitles.allSatisfy { $0.genres.contains("Drama") },
+                    "the installed IMDb database returned an incomplete or mismatched first Drama page")
+        let genrePlan = store.genreBrowseQueryPlanForTesting().joined(separator: " | ")
+        try require(genrePlan.contains("idx_discovery_rating"), "the installed genre query did not use its rating index: \(genrePlan)")
+        try require(!genrePlan.localizedCaseInsensitiveContains("temp b-tree"), "the installed genre query uses a temporary sort: \(genrePlan)")
+        let movieGenreTitles = store.genreTitles(named: "Drama", kind: "Movie", limit: 10)
+        let seriesGenreTitles = store.genreTitles(named: "Drama", kind: "Series", limit: 10)
+        try require(movieGenreTitles.allSatisfy { $0.kind == "Movie" }
+                    && seriesGenreTitles.allSatisfy { $0.kind == "Series" },
+                    "the installed IMDb genre query returned a title in the wrong type filter")
+
         let repeatedStarted = Date()
         let repeatedCount = store.discoveryCandidates().count
         let repeatedSeconds = Date().timeIntervalSince(repeatedStarted)
@@ -154,6 +198,7 @@ struct IMDbGenreIndexPerformanceTests {
         try require(cachedFacetsSeconds < 0.2, "cached installed genre facets took more than 200 ms")
 
         print(String(format: "Installed IMDb index build + discovery query: %.3fs · %d candidates", firstSeconds, candidates.count))
+        print(String(format: "Installed 60-title genre page: %.3fs · %d movies · %d series", genreSeconds, movieGenreTitles.count, seriesGenreTitles.count))
         print(String(format: "Installed discovery cache hit: %.4fs · genre scan %.3fs · cache hit %.4fs", repeatedSeconds, facetsSeconds, cachedFacetsSeconds))
         print("PASS installed IMDb discovery index and in-memory caches")
     }

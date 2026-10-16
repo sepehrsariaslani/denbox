@@ -5802,9 +5802,22 @@ private struct GenreFilterBar: View {
 
 private struct GenresPage: View {
     @EnvironmentObject private var model: LibraryModel
+    @State private var selectedGenre: String?
     private let columns = [GridItem(.adaptive(minimum: 175), spacing: 12)]
 
     var body: some View {
+        Group {
+            if let selectedGenre {
+                IMDbGenreTitlesPage(genre: selectedGenre) {
+                    self.selectedGenre = nil
+                }
+            } else {
+                genrePicker
+            }
+        }
+    }
+
+    private var genrePicker: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
                 Text("Favorite genres")
@@ -5844,7 +5857,7 @@ private struct GenresPage: View {
                     ForEach(model.genreFacets) { facet in
                         let selected = model.preferredGenres.contains(facet.name)
                         HStack(spacing: 12) {
-                            Button { model.browseGenre(facet.name) } label: {
+                            Button { selectedGenre = facet.name } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(facet.displayName)
                                         .font(.denbox(size: 13, weight: .semibold))
@@ -5872,14 +5885,139 @@ private struct GenresPage: View {
                     }
                 }
             }
-            if !model.selectedGenreFilters.isEmpty {
-                Button("Clear genre filters", systemImage: "xmark.circle") {
-                    model.clearGenreFilters()
-                }
-                .buttonStyle(.bordered)
-            }
         }
         .task { await model.loadGenreFacets() }
+    }
+}
+
+private struct IMDbGenreTitlesPage: View {
+    @EnvironmentObject private var model: LibraryModel
+    let genre: String
+    let onBack: () -> Void
+
+    @State private var selectedKind = "Any"
+    @State private var searchText = ""
+    @State private var titles: [IMDbTitleMetadata] = []
+    @State private var nextOffset = 0
+    @State private var hasMore = true
+    @State private var isLoading = false
+    @State private var requestID = UUID()
+
+    private let pageSize = 60
+    private let columns = [GridItem(.adaptive(minimum: 155), spacing: 16, alignment: .top)]
+
+    private var filteredTitles: [IMDbTitleMetadata] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return titles }
+        return titles.filter { $0.title.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Button("All genres", systemImage: "chevron.left", action: onBack)
+                    .buttonStyle(.plain)
+                Spacer()
+                Text(IMDbGenreLocalization.displayName(for: genre))
+                    .font(.denbox(size: 22, weight: .bold))
+            }
+
+            Text("Titles from IMDb, sorted by rating and votes. Selecting one searches Simba.")
+                .font(.denbox(size: 11))
+                .foregroundStyle(Color.secondaryText)
+
+            Picker("Title type", selection: $selectedKind) {
+                Text("All").tag("Any")
+                Text("Movies").tag("Movie")
+                Text("TV series").tag("Series")
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 460)
+
+            TextField("Search within this genre", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 460)
+
+            HStack {
+                Text("\(filteredTitles.count.formatted()) IMDb titles loaded")
+                    .font(.denbox(size: 10))
+                    .foregroundStyle(Color.secondaryText)
+                Spacer()
+                Text("IMDb")
+                    .font(.denbox(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.secondaryText)
+            }
+
+            if titles.isEmpty && isLoading {
+                HStack(spacing: 9) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading IMDb titles…")
+                        .font(.denbox(size: 11))
+                        .foregroundStyle(Color.secondaryText)
+                }
+                .frame(maxWidth: .infinity, minHeight: 150)
+            } else if filteredTitles.isEmpty {
+                Text(searchText.isEmpty
+                     ? "No rated IMDb titles were found for this genre."
+                     : "No titles on the loaded pages match this search.")
+                    .font(.denbox(size: 12))
+                    .foregroundStyle(Color.secondaryText)
+                    .frame(maxWidth: .infinity, minHeight: 150)
+            } else {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 22) {
+                    ForEach(Array(filteredTitles.enumerated()), id: \.element.id) { index, title in
+                        Button {
+                            Task { await model.openCatalogTitle(matching: title) }
+                        } label: {
+                            IMDbTitleCard(metadata: title, rank: index + 1, width: 155, artworkHeight: 210)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Search in Simba and open")
+                    }
+                }
+            }
+
+            if hasMore || isLoading {
+                Button("Load more IMDb titles", systemImage: "arrow.down.circle") {
+                    Task { await loadNextPage(reset: false) }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isLoading || !hasMore)
+            }
+
+            if let message = model.similarTitleSearchMessage {
+                Text(DenboxLanguage.localizedMessage(message))
+                    .font(.denbox(size: 11))
+                    .foregroundStyle(Color.secondaryText)
+            }
+        }
+        .task(id: "\(genre)|\(selectedKind)") {
+            await loadNextPage(reset: true)
+        }
+    }
+
+    @MainActor
+    private func loadNextPage(reset: Bool) async {
+        guard !isLoading || reset else { return }
+        let kind = selectedKind == "Any" ? nil : selectedKind
+        let offset = reset ? 0 : nextOffset
+        let generation = UUID()
+        requestID = generation
+        isLoading = true
+        if reset {
+            titles = []
+            nextOffset = 0
+            hasMore = true
+        }
+        let page = await Task.detached(priority: .userInitiated) {
+            IMDbMetadataStore.shared.genreTitles(named: genre, kind: kind, offset: offset, limit: pageSize)
+        }.value
+        guard requestID == generation else { return }
+        isLoading = false
+        guard !Task.isCancelled else { return }
+        if reset { titles = page } else { titles.append(contentsOf: page) }
+        nextOffset = offset + page.count
+        hasMore = page.count == pageSize
     }
 }
 

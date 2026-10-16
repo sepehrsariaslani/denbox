@@ -552,6 +552,82 @@ final class IMDbMetadataStore: @unchecked Sendable {
         return result
     }
 
+    func genreTitles(named genre: String, kind: String? = nil, offset: Int = 0, limit: Int = 60) -> [IMDbTitleMetadata] {
+        let genre = genre.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !genre.isEmpty else { return [] }
+        let kindPredicate: String
+        switch kind {
+        case "Movie": kindPredicate = "AND title_type='movie'"
+        case "Series": kindPredicate = "AND title_type IN ('tvSeries','tvMiniSeries')"
+        case nil: kindPredicate = ""
+        default: return []
+        }
+        let indexReady = ensureDiscoveryIndex()
+        guard let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        let index = indexReady ? " INDEXED BY idx_discovery_rating" : ""
+        let sql = """
+        SELECT tconst,primary_title,start_year,genres,rating,votes,title_type
+        FROM titles\(index)
+        WHERE title_type IN ('movie','tvSeries','tvMiniSeries') \(kindPredicate)
+          AND genres IS NOT NULL AND instr(','||genres||',', ','||?||',') > 0
+          AND rating IS NOT NULL AND votes >= 50
+        ORDER BY rating DESC,votes DESC
+        LIMIT ? OFFSET ?
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        bind(genre, to: statement, at: 1)
+        sqlite3_bind_int(statement, 2, Int32(max(1, min(limit, 200))))
+        sqlite3_bind_int64(statement, 3, sqlite3_int64(max(0, offset)))
+        var result: [IMDbTitleMetadata] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = text(statement, 0), let title = text(statement, 1), let titleType = text(statement, 6) else { continue }
+            result.append(IMDbTitleMetadata(
+                tconst: id,
+                title: title,
+                year: integer(statement, 2),
+                genres: (text(statement, 3) ?? "").split(separator: ",").map(String.init),
+                rating: double(statement, 4),
+                votes: integer(statement, 5),
+                kind: titleType == "movie" ? "Movie" : "Series"
+            ))
+        }
+        return result
+    }
+
+#if DENBOX_TESTING
+    func genreBrowseQueryPlanForTesting(kind: String? = nil) -> [String] {
+        let kindPredicate: String
+        switch kind {
+        case "Movie": kindPredicate = "AND title_type='movie'"
+        case "Series": kindPredicate = "AND title_type IN ('tvSeries','tvMiniSeries')"
+        case nil: kindPredicate = ""
+        default: return []
+        }
+        guard let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        let sql = """
+        EXPLAIN QUERY PLAN
+        SELECT tconst,primary_title,start_year,genres,rating,votes,title_type
+        FROM titles INDEXED BY idx_discovery_rating
+        WHERE title_type IN ('movie','tvSeries','tvMiniSeries') \(kindPredicate)
+          AND genres IS NOT NULL AND instr(','||genres||',', ',Drama,') > 0
+          AND rating IS NOT NULL AND votes >= 50
+        ORDER BY rating DESC,votes DESC LIMIT 60
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var rows: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let detail = text(statement, 3) { rows.append(detail) }
+        }
+        return rows
+    }
+#endif
+
     func discoveryCandidates(limit: Int = 30_000) -> [IMDbTitleMetadata] {
         let bounded = max(1, min(limit, 50_000))
         datasetCacheLock.lock()
