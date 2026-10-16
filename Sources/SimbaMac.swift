@@ -3530,7 +3530,7 @@ private struct Sidebar: View {
                         .foregroundStyle(Color.secondaryText)
                 }
                 .buttonStyle(.plain)
-                .help("Catalog settings")
+                .help(DenboxLanguage.localizedMessage("Catalog settings"))
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 17)
@@ -4157,14 +4157,14 @@ private struct IMDbPersonCreditRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Search this title in the Simba catalog")
+            .help(DenboxLanguage.localizedMessage("Search this title in the Simba catalog"))
 
             if let url = credit.title.imdbURL {
                 Link(destination: url) {
                     Image(systemName: "arrow.up.right.square")
                         .font(.system(size: 12))
                 }
-                .help("Open IMDb title page")
+                .help(DenboxLanguage.localizedMessage("Open IMDb title page"))
             }
         }
         .padding(9)

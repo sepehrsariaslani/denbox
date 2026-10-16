@@ -43,14 +43,14 @@ struct PublicTitlePageImportView: View {
     @State private var title = ""
     @State private var synopsis = ""
     @State private var captureRequest = 0
-    @State private var status = "در حال بارگذاری صفحهٔ عمومی…"
+    @State private var status = "Loading public page…"
     @State private var errorMessage: String?
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("اطلاعات عمومی از \(provider.rawValue)")
+                    Text(DenboxLanguage.localizedMessage("Public details from \(provider.rawValue)"))
                         .font(.system(size: 17, weight: .semibold))
                     Text(url.absoluteString)
                         .font(.system(size: 10))
@@ -58,9 +58,9 @@ struct PublicTitlePageImportView: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                Button("بازخوانی متن نمایان") { captureRequest += 1 }
+                Button("Recapture visible text") { captureRequest += 1 }
                     .disabled(capture == nil)
-                Button("بستن") { dismiss() }
+                Button("Close") { dismiss() }
                     .keyboardShortcut(.cancelAction)
             }
             .padding(16)
@@ -71,7 +71,7 @@ struct PublicTitlePageImportView: View {
                     capture = newCapture
                     title = newCapture.title
                     synopsis = newCapture.synopsis
-                    status = "اطلاعات قابل‌مشاهدهٔ صفحه آماده است؛ پیش از ذخیره مرورشان کن."
+                    status = "Visible page text is ready. Review it before saving."
                     errorMessage = nil
                 case .failure(let message):
                     status = ""
@@ -93,12 +93,12 @@ struct PublicTitlePageImportView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("عنوان برای تطبیق با کاتالوگ")
+                            Text("Title to match in the catalog")
                                 .font(.system(size: 10, weight: .medium))
                                 .foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
-                            TextField("عنوان فارسی یا انگلیسی", text: $title)
+                            TextField("Persian or English title", text: $title)
                                 .textFieldStyle(.roundedBorder)
-                            Text("خلاصهٔ فارسی")
+                            Text("Persian synopsis")
                                 .font(.system(size: 10, weight: .medium))
                                 .foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
                             TextEditor(text: $synopsis)
@@ -111,7 +111,7 @@ struct PublicTitlePageImportView: View {
                     }
 
                     if !capture.episodeSnippets.isEmpty {
-                        DisclosureGroup("قسمت‌های قابل‌مشاهده در این صفحه (\(capture.episodeSnippets.count))") {
+                        DisclosureGroup(DenboxLanguage.localizedMessage("Visible episodes on this page (\(capture.episodeSnippets.count))")) {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 6) {
                                     ForEach(Array(capture.episodeSnippets.enumerated()), id: \.offset) { _, snippet in
@@ -127,7 +127,7 @@ struct PublicTitlePageImportView: View {
                     }
 
                     if !capture.visiblePageText.isEmpty {
-                        DisclosureGroup("متن عمومی کامل همین صفحه") {
+                        DisclosureGroup("Full public text on this page") {
                             ScrollView {
                                 Text(capture.visiblePageText)
                                     .font(.system(size: 11))
@@ -141,21 +141,21 @@ struct PublicTitlePageImportView: View {
                 } else {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text(status).font(.system(size: 11)).foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
+                        Text(DenboxLanguage.localizedMessage(status)).font(.system(size: 11)).foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
                     }
                 }
 
                 if let errorMessage {
-                    Text(errorMessage).font(.system(size: 11)).foregroundStyle(.orange)
+                    Text(DenboxLanguage.localizedMessage(errorMessage)).font(.system(size: 11)).foregroundStyle(.orange)
                 }
 
                 HStack {
                     if let capture, let imageURL = capture.posterURL {
-                        Link("باز کردن تصویر اصلی", destination: imageURL)
+                        Link("Open original image", destination: imageURL)
                             .font(.system(size: 10))
                     }
                     Spacer()
-                    Button("ذخیره در کاتالوگ محلی") {
+                    Button("Save to local catalog") {
                         guard let capture, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                         onImport(capture.metadata(provider: provider, title: title, synopsis: synopsis))
                         dismiss()
@@ -223,11 +223,11 @@ private struct PublicTitlePageWebView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            onCapture(.failure(PublicPageCaptureError(message: "صفحهٔ عمومی بارگیری نشد: \(error.localizedDescription)")))
+            onCapture(.failure(PublicPageCaptureError(message: "The public page failed to load: \(error.localizedDescription)")))
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            onCapture(.failure(PublicPageCaptureError(message: "اتصال به صفحهٔ عمومی برقرار نشد: \(error.localizedDescription)")))
+            onCapture(.failure(PublicPageCaptureError(message: "Could not connect to the public page: \(error.localizedDescription)")))
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
@@ -251,7 +251,7 @@ private struct PublicTitlePageWebView: NSViewRepresentable {
             webView.evaluateJavaScript(script) { [weak self, weak webView] result, error in
                 guard let self else { return }
                 if let error {
-                    self.onCapture(.failure(PublicPageCaptureError(message: "خواندن متن نمایان صفحه ممکن نشد: \(error.localizedDescription)")))
+                    self.onCapture(.failure(PublicPageCaptureError(message: "Could not read the visible page text: \(error.localizedDescription)")))
                     return
                 }
                 guard let json = result as? String,
@@ -287,7 +287,7 @@ private struct PublicTitlePageWebView: NSViewRepresentable {
 
         private func retryOrFail(webView: WKWebView?, attempt: Int) {
             guard attempt < 15, let webView else {
-                onCapture(.failure(PublicPageCaptureError(message: "متن عمومی برای استخراج پیدا نشد. از صفحهٔ عنوان و بخش «درباره» استفاده کن.")))
+                onCapture(.failure(PublicPageCaptureError(message: "No public page text could be extracted. Try a title page with an About section.")))
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self, weak webView] in
