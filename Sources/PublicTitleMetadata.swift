@@ -273,7 +273,9 @@ struct PublicTitleMetadata: Codable, Sendable, Identifiable {
     }
 
     func needsPageDetailsRefresh(now: Date = Date()) -> Bool {
-        guard pageDetailsVersion != Self.currentPageDetailsVersion else { return false }
+        if let pageDetailsVersion {
+            return pageDetailsVersion < Self.currentPageDetailsVersion
+        }
         guard let pageDetailsAttemptedAt else { return true }
         return now.timeIntervalSince(pageDetailsAttemptedAt) >= PublicTitleMetadataRefreshPolicy.retryInterval
     }
