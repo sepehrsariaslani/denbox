@@ -192,7 +192,7 @@ struct MediaDetails: Sendable {
     let imdbRating: String?
     let imdbVotes: Int?
     let similarSeries: [IMDbTitleMetadata]
-    let castPeople: [IMDbPersonMetadata]
+    var castPeople: [IMDbPersonMetadata] = []
 
     var hasUsefulContent: Bool {
         !sources.isEmpty || !downloadSources.isEmpty || !seasons.isEmpty
@@ -581,7 +581,7 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var imdbPeopleAvailable = false
     @Published private(set) var pendingIMDbPersonRequest: IMDbPersonLookupRequest?
-    @Published private(set) var publicReferenceStatus = "Open a title to load public reference metadata, or check the loaded catalog from Settings."
+    @Published private(set) var publicReferenceStatus = "Public references are checked automatically when the catalog loads."
     @Published private(set) var genreFacets: [IMDbGenreFacet] = []
     @Published private(set) var isLoadingGenreFacets = false
     @Published private(set) var preferredGenres: Set<String> = []
@@ -651,6 +651,9 @@ final class LibraryModel: ObservableObject {
         refreshViewingData()
         Task {
             await enrichCatalogWithIMDb()
+            if loadRemoteCatalog && !cached.isEmpty {
+                scheduleCatalogReferenceEnrichment()
+            }
         }
         if loadRemoteCatalog {
             if SecretVault.read(account: "media-api-key") != nil,
@@ -1036,6 +1039,7 @@ final class LibraryModel: ObservableObject {
 
     func openIMDbPerson(_ person: IMDbPersonMetadata) {
         pendingIMDbPersonRequest = IMDbPersonLookupRequest(nconst: person.nconst, name: person.name)
+        searchText = ""
         section = .imdbPeople
     }
 
@@ -1043,6 +1047,7 @@ final class LibraryModel: ObservableObject {
         let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
         pendingIMDbPersonRequest = IMDbPersonLookupRequest(nconst: nil, name: value)
+        searchText = ""
         section = .imdbPeople
     }
 
@@ -1245,6 +1250,42 @@ final class LibraryModel: ObservableObject {
         playerTitle = title
         playerHeaders = source.headers
         playerURL = source.url
+    }
+
+    var nextEpisodeTitle: String? { nextPlayableEpisode?.episode.title }
+
+    @discardableResult
+    func playNextEpisode() -> Bool {
+        guard let next = nextPlayableEpisode else { return false }
+        playRemoteSource(
+            next.source,
+            title: "\(next.item.title) · \(next.episode.title)",
+            item: next.item,
+            episode: next.episode,
+            details: next.details
+        )
+        return true
+    }
+
+    private var nextPlayableEpisode: (
+        item: MediaItem,
+        episode: MediaEpisode,
+        details: MediaDetails,
+        source: MediaStreamSource
+    )? {
+        guard let active = activeRemotePlayback,
+              active.item.kind == "Series",
+              let details = active.details else { return nil }
+        let episodes = details.seasons.flatMap(\.episodes)
+        let currentIndex = active.episodeID.flatMap { id in episodes.firstIndex(where: { $0.id == id }) }
+            ?? active.episodeLabel.flatMap { label in episodes.firstIndex(where: { $0.episodeLabel == label }) }
+        guard let currentIndex else { return nil }
+        for episode in episodes.dropFirst(currentIndex + 1) {
+            if let source = (episode.sources + episode.downloadSources).first {
+                return (active.item, episode, details, source)
+            }
+        }
+        return nil
     }
 
     func startPlaybackSession(playerKind: String, localURL: URL? = nil) -> Double {
@@ -1572,6 +1613,7 @@ final class LibraryModel: ObservableObject {
             imdbChartLists = nil
             imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
             await enrichCatalogWithIMDb()
+            scheduleCatalogReferenceEnrichment()
             genreFacets = []
             recommendations = []
             await loadGenreFacets()
@@ -1653,6 +1695,7 @@ final class LibraryModel: ObservableObject {
         database.saveRemoteItems([resolved])
         items = database.loadCatalog()
         await enrichCatalogWithIMDb()
+        scheduleCatalogReferenceEnrichment()
         selectedItem = items.first(where: { $0.id == resolved.id }) ?? resolved
         similarTitleSearchMessage = nil
     }
@@ -1813,6 +1856,7 @@ final class LibraryModel: ObservableObject {
                 items = cached
                 connectionStatus = "Live catalog unavailable. Showing \(cached.filter { $0.kind == "Movie" }.count) saved movies and \(cached.filter { $0.kind == "Series" }.count) saved series."
                 await enrichCatalogWithIMDb()
+                scheduleCatalogReferenceEnrichment()
             } else {
                 let failures = [movieResponse.error, seriesResponse.error].compactMap { $0 }
                 connectionStatus = failures.isEmpty
@@ -1839,6 +1883,7 @@ final class LibraryModel: ObservableObject {
         }
         section = .home
         await enrichCatalogWithIMDb()
+        scheduleCatalogReferenceEnrichment()
     }
 
     var canLoadMoreCatalog: Bool {
@@ -1902,6 +1947,7 @@ final class LibraryModel: ObservableObject {
         }
         if added > 0 {
             await enrichCatalogWithIMDb()
+            scheduleCatalogReferenceEnrichment()
         }
     }
 
@@ -1949,6 +1995,7 @@ final class LibraryModel: ObservableObject {
         items = database.loadCatalog()
         Task {
             if IMDbMetadataStore.shared.isAvailable { await enrichCatalogWithIMDb() }
+            scheduleCatalogReferenceEnrichment()
         }
         catalogName = "Denbox API"
         let movieCount = uniqueItems.filter { $0.kind == "Movie" }.count
@@ -2118,8 +2165,7 @@ final class LibraryModel: ObservableObject {
             imdbID: nil,
             imdbRating: nil,
             imdbVotes: nil,
-            similarSeries: [],
-            castPeople: []
+            similarSeries: []
         )
     }
 
@@ -2365,6 +2411,7 @@ final class LibraryModel: ObservableObject {
         searchText = ""
         Task {
             await enrichCatalogWithIMDb()
+            scheduleCatalogReferenceEnrichment()
         }
     }
 }
@@ -5552,7 +5599,7 @@ private struct IMDbChartsPage: View {
                             .help("Find this title in the Simba catalog")
                         }
                     }
-                    Text("Ranking is calculated from IMDb's public ratings and vote counts; IMDb's exact chart eligibility formula is not included in the downloadable dataset.")
+                    Text("Local rankings use IMDb's public ratings and vote counts. Top 250-style lists approximate IMDb's weighted formula and 25,000-vote minimum; IMDb does not publish its regular-voter filter, so these lists may differ from its official charts.")
                         .font(.system(size: 9))
                         .foregroundStyle(Color.secondaryText.opacity(0.85))
                     imdbAttribution
@@ -6816,9 +6863,9 @@ private struct LocalPlayerSheet: View {
     @EnvironmentObject private var model: LibraryModel
     @Environment(\.dismiss) private var dismiss
     @StateObject private var playback = MPVPlaybackController()
-    let url: URL
-    let title: String
-    let headers: [String: String]
+    @State private var currentURL: URL
+    @State private var currentTitle: String
+    @State private var currentHeaders: [String: String]
 
     @State private var didAutoRefreshSource = false
     @State private var isRefreshingSource = false
@@ -6834,6 +6881,12 @@ private struct LocalPlayerSheet: View {
     @State private var rotation = 0
     @State private var loopsCurrentFile = false
     @State private var playbackSpeed = 1.0
+
+    init(url: URL, title: String, headers: [String: String]) {
+        _currentURL = State(initialValue: url)
+        _currentTitle = State(initialValue: title)
+        _currentHeaders = State(initialValue: headers)
+    }
 
     var body: some View {
         ZStack {
@@ -6864,12 +6917,33 @@ private struct LocalPlayerSheet: View {
                         .buttonStyle(.bordered)
                         .disabled(isRefreshingSource || !model.hasActiveRemotePlayback)
                     Button("Try again") {
-                        playback.retry(url, headers: headers)
+                        playback.retry(currentURL, headers: currentHeaders)
                     }
                     .buttonStyle(.borderedProminent)
                 }
                 .padding(24)
                 .frame(maxWidth: 460)
+                .background(.black.opacity(0.9), in: RoundedRectangle(cornerRadius: 16))
+            }
+
+            if playback.didReachEnd {
+                VStack(spacing: 10) {
+                    Text("Playback finished")
+                        .font(.system(size: 15, weight: .semibold))
+                    if let nextTitle = model.nextEpisodeTitle {
+                        Text(nextTitle)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white.opacity(0.72))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                        Button(action: playNextEpisode) {
+                            Label("Play next episode", systemImage: "forward.end.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(22)
+                .frame(maxWidth: 420)
                 .background(.black.opacity(0.9), in: RoundedRectangle(cornerRadius: 16))
             }
         }
@@ -6887,11 +6961,11 @@ private struct LocalPlayerSheet: View {
         .background(.black)
         .preferredColorScheme(.dark)
         .onAppear {
-            scrubPosition = model.startPlaybackSession(playerKind: "Denbox Player", localURL: url)
+            scrubPosition = model.startPlaybackSession(playerKind: "Denbox Player", localURL: currentURL)
             playback.onProgress = { position, duration, delta in
                 model.recordPlaybackProgress(position: position, duration: duration, watchedDelta: delta)
             }
-            playback.play(url, headers: headers, startAtSeconds: scrubPosition)
+            playback.play(currentURL, headers: currentHeaders, startAtSeconds: scrubPosition)
         }
         .onChange(of: playback.currentTimeSeconds) { value in
             if !isScrubbing { scrubPosition = value }
@@ -6903,7 +6977,7 @@ private struct LocalPlayerSheet: View {
             playback.setSubtitleBackgroundColor("0/0/0/\(min(1, max(0, opacity)))")
         }
         .onChange(of: playback.errorMessage) { error in
-            guard error != nil, !url.isFileURL, !didAutoRefreshSource,
+            guard error != nil, !currentURL.isFileURL, !didAutoRefreshSource,
                   model.hasActiveRemotePlayback else { return }
             didAutoRefreshSource = true
             refreshPlaybackSource()
@@ -6929,9 +7003,9 @@ private struct LocalPlayerSheet: View {
             .help("Close player")
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.system(size: 14, weight: .semibold))
+                Text(currentTitle).font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
-                Text(DenboxLanguage.localizedMessage(url.isFileURL ? "Local file" : (url.host ?? "Online playback")))
+                Text(DenboxLanguage.localizedMessage(currentURL.isFileURL ? "Local file" : (currentURL.host ?? "Online playback")))
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.68))
             }
@@ -7362,12 +7436,28 @@ private struct LocalPlayerSheet: View {
     private func saveScreenshot() {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
-        panel.nameFieldStringValue = "\(title.replacingOccurrences(of: "/", with: "-"))-frame.png"
+        panel.nameFieldStringValue = "\(currentTitle.replacingOccurrences(of: "/", with: "-"))-frame.png"
         panel.title = DenboxLanguage.localizedMessage("Save frame")
         panel.begin { response in
             guard response == .OK, let fileURL = panel.url else { return }
             DispatchQueue.main.async { playback.captureScreenshot(to: fileURL) }
         }
+    }
+
+    private func playNextEpisode() {
+        playback.flushWatchProgress()
+        model.finishPlaybackSession(position: playback.currentTimeSeconds, duration: playback.durationSeconds)
+        guard model.playNextEpisode(), let nextURL = model.playerURL else { return }
+        currentURL = nextURL
+        currentTitle = model.playerTitle
+        currentHeaders = model.playerHeaders
+        didAutoRefreshSource = false
+        isRefreshingSource = false
+        loopsCurrentFile = false
+        playback.setFileLoop(false)
+        playback.clearABLoop()
+        scrubPosition = model.startPlaybackSession(playerKind: "Denbox Player")
+        playback.retry(currentURL, headers: currentHeaders, startAtSeconds: scrubPosition)
     }
 
     private func refreshPlaybackSource() {
@@ -7484,7 +7574,7 @@ private struct SettingsSheet: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("Wikidata and TVmaze load on a title's detail page. This Settings action checks all loaded movies and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page.")
+                Text("Wikidata and TVmaze are checked automatically for every loaded movie and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page.")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)

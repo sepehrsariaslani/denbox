@@ -92,7 +92,7 @@ struct ReferenceMetadataTests {
         let detail = MediaDetails(
             description: nil, year: nil, rating: nil, runtime: nil, genres: [], country: nil,
             director: nil, cast: [], sources: [], downloadSources: [], seasons: [],
-            imdbID: "tt1234567", imdbRating: nil, imdbVotes: nil, similarSeries: [], castPeople: []
+            imdbID: "tt1234567", imdbRating: nil, imdbVotes: nil, similarSeries: []
         )
         let enriched = ReferenceMetadataService.enrich(detail, with: merged)
         try require(enriched.description == "A & B" && enriched.cast == ["Actor One", "Actor Two"] && enriched.rating == "8.4",

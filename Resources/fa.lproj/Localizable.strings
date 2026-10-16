@@ -36,7 +36,7 @@
 "IMDb Franchise Interests" = "مجموعه‌های داستانی IMDb";
 "IMDb's bulk download does not include franchise membership. This page shows IMDb's live franchise interests; choose a title there to search for it in Simba." = "داده‌های دانلودی IMDb عضویت عنوان‌ها در مجموعه‌ها را ندارند. این صفحه مجموعه‌های زندهٔ IMDb را نشان می‌دهد؛ عنوانی را برای جست‌وجو در Simba انتخاب کن.";
 "Loading local IMDb rankings…" = "در حال بارگذاری رتبه‌بندی‌های محلی IMDb…";
-"Ranking is calculated from IMDb's public ratings and vote counts; IMDb's exact chart eligibility formula is not included in the downloadable dataset." = "رتبه‌بندی از امتیازها و تعداد رأی‌های عمومی IMDb محاسبه می‌شود؛ فرمول دقیق انتخاب عنوان‌ها در دادهٔ دانلودی موجود نیست.";
+"Local rankings use IMDb's public ratings and vote counts. Top 250-style lists approximate IMDb's weighted formula and 25,000-vote minimum; IMDb does not publish its regular-voter filter, so these lists may differ from its official charts." = "رتبه‌بندی‌های محلی از امتیاز و تعداد رأی‌های عمومی IMDb استفاده می‌کنند. فهرست‌های شبیه Top 250 تقریبی از فرمول وزن‌دار IMDb و حداقل ۲۵هزار رأی را به‌کار می‌برند؛ چون IMDb معیار رأی‌دهنده‌های «معمولی» را منتشر نمی‌کند، نتیجه می‌تواند با نمودار رسمی آن فرق داشته باشد.";
 "Refresh IMDb data to build these lists" = "برای ساخت این فهرست‌ها داده‌های IMDb را تازه‌سازی کن";
 "The current local index may only contain TV series. Refresh imports movie ratings too." = "ممکن است نمایهٔ محلی فعلی فقط سریال‌ها را داشته باشد. تازه‌سازی، امتیاز فیلم‌ها را هم وارد می‌کند.";
 "Download / refresh IMDb data" = "دریافت یا تازه‌سازی داده‌های IMDb";
@@ -129,6 +129,8 @@
 "Open audio file" = "انتخاب فایل صدا";
 "Picture options" = "گزینه‌های تصویر";
 "Picture and sound" = "تصویر و صدا";
+"Playback finished" = "پخش به پایان رسید";
+"Play next episode" = "پخش قسمت بعدی";
 "Crop" = "برش";
 "Video adjustments" = "تنظیم تصویر";
 "Audio equalizer" = "اکولایزر صدا";
@@ -408,9 +410,10 @@
 "Checking public metadata for %@ titles…" = "در حال بررسی فرادادهٔ عمومی برای %@ عنوان…";
 "Checked public references for %@ titles." = "منابع عمومی برای %@ عنوان بررسی شدند.";
 "Public reference metadata has not been checked yet." = "فرادادهٔ منابع عمومی هنوز بررسی نشده است.";
-"Open a title to load public reference metadata, or check the loaded catalog from Settings." = "برای بارگیری فرادادهٔ عمومی، جزئیات یک عنوان را باز کن یا از تنظیمات فهرست را بررسی کن.";
-"Wikidata and TVmaze load on a title's detail page. This Settings action checks all loaded movies and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page." = "فرادادهٔ Wikidata و TVmaze در صفحهٔ جزئیات عنوان بارگیری می‌شود. این دکمه در تنظیمات همهٔ فیلم‌ها و سریال‌های بارگیری‌شده را بررسی می‌کند و اطلاعات ناقص مانند توضیحات، ژانر، پوستر، کشور، مدت، کارگردان و بازیگران را تکمیل می‌کند. Filimo و HexDL همچنان به پیوند صفحهٔ عمومی عنوان نیاز دارند.";
+"Public references are checked automatically when the catalog loads." = "با بارگذاری فهرست، منابع عمومی به‌صورت خودکار بررسی می‌شوند.";
+"Wikidata and TVmaze are checked automatically for every loaded movie and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page." = "برای هر فیلم و سریال بارگیری‌شده، Wikidata و TVmaze خودکار بررسی می‌شوند و توضیحات، امتیاز، ژانر، پوستر، کشور، مدت، کارگردان و بازیگرانِ ناقص را تکمیل می‌کنند. Filimo و HexDL هنوز به پیوند صفحهٔ عمومی نیاز دارند که از جزئیات عنوان وارد می‌شود.";
 "Open a title to load public metadata, or check the loaded catalog." = "برای بارگیری فرادادهٔ عمومی، صفحهٔ یک عنوان را باز کن یا فهرست بارگیری‌شده را بررسی کن.";
+"Loaded catalog movies and series are checked automatically in the background when the catalog opens and as pages are added. Opening a title also checks references on demand. Use the Settings action to retry the loaded catalog." = "فیلم‌ها و سریال‌های فهرست، هنگام بازشدن برنامه و بارگیری صفحه‌های بیشتر، در پس‌زمینه و خودکار از مراجع عمومی بررسی می‌شوند. با بازکردن جزئیات عنوان نیز بررسی انجام می‌شود. برای بررسی دوبارهٔ فهرست بارگیری‌شده از دکمهٔ تنظیمات استفاده کن.";
 "Check public references for loaded titles" = "بررسی منابع عمومی عنوان‌های بارگیری‌شده";
 "Checking public references…" = "در حال بررسی منابع عمومی…";
 "Load a catalog to check public metadata references." = "برای بررسی منابع عمومی، ابتدا فهرست عنوان‌ها را بارگذاری کن.";

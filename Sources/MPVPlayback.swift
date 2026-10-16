@@ -29,6 +29,7 @@ private struct MPVHandleBox: @unchecked Sendable {
 final class MPVPlaybackController: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isPlaying = false
+    @Published private(set) var didReachEnd = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var currentTimeSeconds = 0.0
     @Published private(set) var durationSeconds: Double?
@@ -208,6 +209,7 @@ final class MPVPlaybackController: ObservableObject {
         pendingResumeSeconds = max(0, startAtSeconds)
         isLoading = true
         isPlaying = false
+        didReachEnd = false
         errorMessage = nil
         currentTimeSeconds = 0
         durationSeconds = nil
@@ -432,6 +434,16 @@ final class MPVPlaybackController: ObservableObject {
                 if eventID == MPV_EVENT_SHUTDOWN { break }
                 if eventID == MPV_EVENT_FILE_LOADED {
                     Task { @MainActor [weak self] in self?.fileDidLoad() }
+                } else if eventID == MPV_EVENT_END_FILE,
+                          let data = event.pointee.data?.assumingMemoryBound(to: mpv_event_end_file.self).pointee,
+                          data.reason == MPV_END_FILE_REASON_EOF.rawValue {
+                    Task { @MainActor [weak self] in
+                        self?.isLoading = false
+                        self?.isPlaying = false
+                        self?.lastWatchTick = nil
+                        self?.flushPendingWatchTime()
+                        self?.didReachEnd = true
+                    }
                 } else if eventID == MPV_EVENT_END_FILE,
                           let data = event.pointee.data?.assumingMemoryBound(to: mpv_event_end_file.self).pointee,
                           data.reason == MPV_END_FILE_REASON_ERROR.rawValue {

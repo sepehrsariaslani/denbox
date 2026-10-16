@@ -163,6 +163,8 @@ enum IMDbMetadataError: LocalizedError {
 
 final class IMDbMetadataStore: @unchecked Sendable {
     static let shared = IMDbMetadataStore()
+    private static let topChartMinimumVotes = 25_000
+    private static let topChartFallbackMeanRating = 7.0
 
     private let databaseURL: URL
     private let fileManager = FileManager.default
@@ -175,6 +177,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
     private let datasetCacheLock = NSLock()
     private var cachedGenreFacets: [IMDbGenreFacet]?
     private var cachedDiscoveryCandidates: [Int: [IMDbTitleMetadata]] = [:]
+    private var cachedIMDbChartMeans: (movies: Double, series: Double)?
     private let endpoints: [(String, URL)] = [
         ("titles", URL(string: "https://datasets.imdbws.com/title.basics.tsv.gz")!),
         ("episodes", URL(string: "https://datasets.imdbws.com/title.episode.tsv.gz")!),
@@ -659,18 +662,19 @@ final class IMDbMetadataStore: @unchecked Sendable {
     func chartLists() -> IMDbChartLists? {
         guard let db = openReadOnly() else { return nil }
         defer { sqlite3_close(db) }
+        let means = chartMeanRatings(db: db)
         return IMDbChartLists(
             topMovies: chartRows(
                 db: db,
-                predicate: "title_type='movie' AND rating IS NOT NULL AND votes >= 25000",
-                order: "((votes * rating + 175000.0) / (votes + 25000.0)) DESC, votes DESC",
+                predicate: "title_type='movie' AND rating IS NOT NULL AND votes >= \(Self.topChartMinimumVotes)",
+                order: chartOrder(meanRating: means.movies),
                 limit: 250,
                 kind: "Movie"
             ),
             topSeries: chartRows(
                 db: db,
-                predicate: "title_type IN ('tvSeries','tvMiniSeries') AND rating IS NOT NULL AND votes >= 10000",
-                order: "((votes * rating + 175000.0) / (votes + 25000.0)) DESC, votes DESC",
+                predicate: "title_type IN ('tvSeries','tvMiniSeries') AND rating IS NOT NULL AND votes >= \(Self.topChartMinimumVotes)",
+                order: chartOrder(meanRating: means.series),
                 limit: 250,
                 kind: "Series"
             ),
@@ -726,6 +730,44 @@ final class IMDbMetadataStore: @unchecked Sendable {
             ))
         }
         return result
+    }
+
+    private func chartMeanRatings(db: OpaquePointer) -> (movies: Double, series: Double) {
+        datasetCacheLock.lock()
+        if let cachedIMDbChartMeans {
+            datasetCacheLock.unlock()
+            return cachedIMDbChartMeans
+        }
+        datasetCacheLock.unlock()
+
+        let computed = (
+            movies: chartMeanRating(db: db, titleTypePredicate: "title_type='movie'") ?? Self.topChartFallbackMeanRating,
+            series: chartMeanRating(db: db, titleTypePredicate: "title_type IN ('tvSeries','tvMiniSeries')") ?? Self.topChartFallbackMeanRating
+        )
+
+        datasetCacheLock.lock()
+        if let cachedIMDbChartMeans {
+            datasetCacheLock.unlock()
+            return cachedIMDbChartMeans
+        }
+        cachedIMDbChartMeans = computed
+        datasetCacheLock.unlock()
+        return computed
+    }
+
+    private func chartMeanRating(db: OpaquePointer, titleTypePredicate: String) -> Double? {
+        let sql = "SELECT AVG(rating) FROM titles WHERE \(titleTypePredicate) AND rating IS NOT NULL"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let value = double(statement, 0), value.isFinite, (1.0...10.0).contains(value) else { return nil }
+        return value
+    }
+
+    private func chartOrder(meanRating: Double) -> String {
+        let priorWeight = Double(Self.topChartMinimumVotes) * meanRating
+        return "((votes * rating + \(priorWeight)) / (votes + \(Self.topChartMinimumVotes))) DESC, votes DESC"
     }
 
     private func queryTitleRows(db: OpaquePointer, sql: String, normalized: String, year: Int?) -> [(title: IMDbTitleMetadata, primary: String, original: String, score: Double)] {
@@ -835,6 +877,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
         datasetCacheLock.lock()
         cachedGenreFacets = nil
         cachedDiscoveryCandidates.removeAll(keepingCapacity: false)
+        cachedIMDbChartMeans = nil
         datasetCacheLock.unlock()
     }
 
