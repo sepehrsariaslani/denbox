@@ -581,7 +581,7 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var imdbPeopleAvailable = false
     @Published private(set) var pendingIMDbPersonRequest: IMDbPersonLookupRequest?
-    @Published private(set) var publicReferenceStatus = "Public references are checked automatically when the catalog loads."
+    @Published private(set) var publicReferenceStatus = "Public reference metadata loads when a title opens or when you start a catalog check in Settings."
     @Published private(set) var genreFacets: [IMDbGenreFacet] = []
     @Published private(set) var isLoadingGenreFacets = false
     @Published private(set) var preferredGenres: Set<String> = []
@@ -651,9 +651,6 @@ final class LibraryModel: ObservableObject {
         refreshViewingData()
         Task {
             await enrichCatalogWithIMDb()
-            if loadRemoteCatalog && !cached.isEmpty {
-                scheduleCatalogReferenceEnrichment()
-            }
         }
         if loadRemoteCatalog {
             if SecretVault.read(account: "media-api-key") != nil,
@@ -902,13 +899,17 @@ final class LibraryModel: ObservableObject {
         } else {
             metadata = [:]
         }
+        database.saveIMDbMetadataBatch(metadata)
+        // Catalog refreshes can complete while IMDb matching runs off the main actor.
+        // Apply those results to the latest catalog snapshot so an older task cannot
+        // replace newly loaded titles when it resumes.
+        let latestCatalog = items
         var enriched: [MediaItem] = []
-        enriched.reserveCapacity(catalog.count)
+        enriched.reserveCapacity(latestCatalog.count)
         var refreshedRatedMetadata = false
-        for item in catalog {
+        for item in latestCatalog {
             var resolved = item
             if let title = metadata[item.id] {
-                database.saveIMDbMetadata(title, for: item.id)
                 resolved = resolved.applyingIMDb(title)
             }
             if let reference = database.loadReferenceMetadata(mediaID: item.id) {
@@ -1080,8 +1081,7 @@ final class LibraryModel: ObservableObject {
         guard item.isRemote else { return nil }
         if !forceRefresh,
            let cached = database.loadDetailsPayload(for: item.id),
-           let payload = try? JSONSerialization.jsonObject(with: cached.payload, options: [.fragmentsAllowed]) {
-            let details = Self.parseDetails(payload, for: item)
+           let details = await Self.parseDetailsData(cached.payload, for: item) {
             scheduleIMDbEnrichment(for: item, details: details)
             scheduleReferenceEnrichment(for: item, details: details)
             let refreshInterval: TimeInterval = details.hasPlayableResources ? 5 * 60 : 60
@@ -1114,30 +1114,25 @@ final class LibraryModel: ObservableObject {
     }
 
     private func fetchDetails(for item: MediaItem, apiKey: String, reportFailure: Bool) async -> MediaDetails? {
-        var fallback: (details: MediaDetails, payload: Any)?
-        let response = try? await DirectMediaAPI.getJSON(
+        let response = try? await DirectMediaAPI.getParsedJSON(
             firstAcceptableFrom: DirectMediaAPI.detailsURLs(for: item, apiKey: apiKey),
-            timeout: 12
-        ) { payload in
-            let details = Self.parseDetails(payload, for: item)
-            if details.hasPlayableResources { return true }
-            if fallback == nil, details.hasUsefulContent { fallback = (details, payload) }
-            return false
-        }
-        if let response {
-            let details = Self.parseDetails(response, for: item)
-            if details.hasPlayableResources {
-                cacheDetailsPayload(response, for: item)
-                scheduleIMDbEnrichment(for: item, details: details)
-                scheduleReferenceEnrichment(for: item, details: details)
-                return details
+            timeout: 12,
+            classify: { data in
+                guard let payload = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                    return (nil, DirectMediaResponseQuality.rejected)
+                }
+                let details = Self.parseDetails(payload, for: item)
+                let quality: DirectMediaResponseQuality = details.hasPlayableResources
+                    ? .preferred
+                    : (details.hasUsefulContent ? .fallback : .rejected)
+                return (details, quality)
             }
-        }
-        if let fallback {
-            cacheDetailsPayload(fallback.payload, for: item)
-            scheduleIMDbEnrichment(for: item, details: fallback.details)
-            scheduleReferenceEnrichment(for: item, details: fallback.details)
-            return fallback.details
+        )
+        if let response {
+            cacheDetailsPayload(response.payload, for: item)
+            scheduleIMDbEnrichment(for: item, details: response.value)
+            scheduleReferenceEnrichment(for: item, details: response.value)
+            return response.value
         }
         if reportFailure && !Task.isCancelled {
             connectionStatus = "Details could not be loaded. Check the API key and connection."
@@ -1145,10 +1140,8 @@ final class LibraryModel: ObservableObject {
         return nil
     }
 
-    private func cacheDetailsPayload(_ payload: Any, for item: MediaItem) {
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return }
-        database.saveDetailsPayload(data, for: item.id, fetchedAt: Date())
+    private func cacheDetailsPayload(_ payload: Data, for item: MediaItem) {
+        database.saveDetailsPayload(payload, for: item.id, fetchedAt: Date())
     }
 
     private func scheduleIMDbEnrichment(for item: MediaItem, details: MediaDetails) {
@@ -1612,8 +1605,7 @@ final class LibraryModel: ObservableObject {
             imdbDatasetStatus = "IMDb dataset ready · updated \(timestamp)"
             imdbChartLists = nil
             imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
-            await enrichCatalogWithIMDb()
-            scheduleCatalogReferenceEnrichment()
+            Task { await enrichCatalogWithIMDb() }
             genreFacets = []
             recommendations = []
             await loadGenreFacets()
@@ -1693,10 +1685,9 @@ final class LibraryModel: ObservableObject {
             return
         }
         database.saveRemoteItems([resolved])
-        items = database.loadCatalog()
-        await enrichCatalogWithIMDb()
-        scheduleCatalogReferenceEnrichment()
-        selectedItem = items.first(where: { $0.id == resolved.id }) ?? resolved
+        if !items.contains(where: { $0.id == resolved.id }) { items.append(resolved) }
+        selectedItem = resolved
+        Task { await enrichCatalogWithIMDb() }
         similarTitleSearchMessage = nil
     }
 
@@ -1855,8 +1846,7 @@ final class LibraryModel: ObservableObject {
             if !cached.isEmpty {
                 items = cached
                 connectionStatus = "Live catalog unavailable. Showing \(cached.filter { $0.kind == "Movie" }.count) saved movies and \(cached.filter { $0.kind == "Series" }.count) saved series."
-                await enrichCatalogWithIMDb()
-                scheduleCatalogReferenceEnrichment()
+                Task { await enrichCatalogWithIMDb() }
             } else {
                 let failures = [movieResponse.error, seriesResponse.error].compactMap { $0 }
                 connectionStatus = failures.isEmpty
@@ -1882,8 +1872,7 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Live catalog · \(movieCount) movies · \(seriesCount) series"
         }
         section = .home
-        await enrichCatalogWithIMDb()
-        scheduleCatalogReferenceEnrichment()
+        Task { await enrichCatalogWithIMDb() }
     }
 
     var canLoadMoreCatalog: Bool {
@@ -1946,8 +1935,7 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Loaded \(added) more titles · \(items.filter { $0.kind == "Movie" }.count) movies · \(items.filter { $0.kind == "Series" }.count) series"
         }
         if added > 0 {
-            await enrichCatalogWithIMDb()
-            scheduleCatalogReferenceEnrichment()
+            Task { await enrichCatalogWithIMDb() }
         }
     }
 
@@ -1995,7 +1983,6 @@ final class LibraryModel: ObservableObject {
         items = database.loadCatalog()
         Task {
             if IMDbMetadataStore.shared.isAvailable { await enrichCatalogWithIMDb() }
-            scheduleCatalogReferenceEnrichment()
         }
         catalogName = "Denbox API"
         let movieCount = uniqueItems.filter { $0.kind == "Movie" }.count
@@ -2127,7 +2114,7 @@ final class LibraryModel: ObservableObject {
         return result
     }
 
-    private static func string(_ value: Any?) -> String? {
+    private nonisolated static func string(_ value: Any?) -> String? {
         guard let value, !(value is NSNull) else { return nil }
         if let string = value as? String {
             let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2137,7 +2124,7 @@ final class LibraryModel: ObservableObject {
         return nil
     }
 
-    static func parseDetails(_ payload: Any, for item: MediaItem) -> MediaDetails {
+    nonisolated static func parseDetails(_ payload: Any, for item: MediaItem) -> MediaDetails {
         let detail = detailObject(payload, isSeries: item.kind == "Series")
         let description = string(detail["description"]) ?? string(detail["story"])
             ?? string(detail["overview"]) ?? string(detail["synopsis"])
@@ -2169,7 +2156,14 @@ final class LibraryModel: ObservableObject {
         )
     }
 
-    private static func detailObject(_ payload: Any, isSeries: Bool) -> [String: Any] {
+    nonisolated static func parseDetailsData(_ data: Data, for item: MediaItem) async -> MediaDetails? {
+        await Task.detached(priority: .userInitiated) {
+            guard let payload = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else { return nil }
+            return Self.parseDetails(payload, for: item)
+        }.value
+    }
+
+    private nonisolated static func detailObject(_ payload: Any, isSeries: Bool) -> [String: Any] {
         if let object = payload as? [String: Any] {
             for key in ["data", "result", "message", "details", "movie", "serie", "series", "poster", "item"] {
                 if let nested = object[key] as? [String: Any] {
@@ -2187,7 +2181,7 @@ final class LibraryModel: ObservableObject {
         return [:]
     }
 
-    private static func stringList(_ value: Any?) -> [String] {
+    private nonisolated static func stringList(_ value: Any?) -> [String] {
         guard let value, !(value is NSNull) else { return [] }
         if let value = string(value) { return [value] }
         guard let rows = value as? [Any] else { return [] }
@@ -2198,7 +2192,7 @@ final class LibraryModel: ObservableObject {
         }
     }
 
-    private static func parseSeasons(from detail: [String: Any]) -> [MediaSeason] {
+    private nonisolated static func parseSeasons(from detail: [String: Any]) -> [MediaSeason] {
         let rawSeasons = detail["seasons"] ?? detail["episodes"] ?? detail["sources"]
         guard let rows = rawSeasons as? [Any] else { return [] }
         let hasSeasonWrappers = rows.contains { value in
@@ -2260,7 +2254,7 @@ final class LibraryModel: ObservableObject {
         return result
     }
 
-    private static func streamSources(from value: Any, includeDownloadFields: Bool = false) -> [MediaStreamSource] {
+    private nonisolated static func streamSources(from value: Any, includeDownloadFields: Bool = false) -> [MediaStreamSource] {
         let playableExtensions: Set<String> = ["m3u8", "mp4", "m4v", "mkv", "mov", "webm", "mpd", "mpeg", "mpg", "ts", "avi", "flv"]
         let excludedExtensions: Set<String> = ["srt", "vtt", "ass", "ssa", "sub", "jpg", "jpeg", "png", "webp", "gif", "zip", "rar", "pdf"]
         let sourceContainers: Set<String> = includeDownloadFields
@@ -2330,7 +2324,7 @@ final class LibraryModel: ObservableObject {
         return result
     }
 
-    private static func integer(_ value: Any?) -> Int? {
+    private nonisolated static func integer(_ value: Any?) -> Int? {
         guard let value else { return nil }
         if let number = value as? NSNumber { return number.intValue }
         if let string = value as? String { return Int(string) }
@@ -2411,7 +2405,6 @@ final class LibraryModel: ObservableObject {
         searchText = ""
         Task {
             await enrichCatalogWithIMDb()
-            scheduleCatalogReferenceEnrichment()
         }
     }
 }
@@ -2432,6 +2425,19 @@ private enum DirectMediaAPIError: LocalizedError {
         case .server(let message): message
         }
     }
+}
+
+enum DirectMediaResponseQuality: Sendable, Equatable {
+    case rejected
+    case fallback
+    case preferred
+}
+
+private struct DirectMediaParsedResponse: Sendable {
+    let data: Data?
+    let value: MediaDetails?
+    let quality: DirectMediaResponseQuality
+    let error: String?
 }
 
 enum DirectMediaAPI {
@@ -2558,6 +2564,59 @@ enum DirectMediaAPI {
         }
         guard let payload else { throw DirectMediaAPIError.server(lastError) }
         return payload
+    }
+
+    @MainActor
+    static func getParsedJSON(
+        firstAcceptableFrom urls: [URL],
+        timeout: TimeInterval,
+        classify: @escaping @Sendable (Data) -> (MediaDetails?, DirectMediaResponseQuality)
+    ) async throws -> (payload: Data, value: MediaDetails) {
+        guard !urls.isEmpty else { throw DirectMediaAPIError.invalidURL }
+        var lastError = "No route returned usable JSON."
+        let selected = await withTaskGroup(
+            of: DirectMediaParsedResponse.self,
+            returning: DirectMediaParsedResponse?.self
+        ) { group in
+            for url in urls {
+                group.addTask {
+                    let response = await fetchJSON(url: url, timeout: timeout)
+                    guard let data = response.data else {
+                        return DirectMediaParsedResponse(data: nil, value: nil, quality: .rejected,
+                                                         error: response.error ?? "No route returned usable JSON.")
+                    }
+                    guard let statusCode = response.statusCode, (200..<300).contains(statusCode) else {
+                        return DirectMediaParsedResponse(data: nil, value: nil, quality: .rejected,
+                                                         error: response.statusCode.map { "HTTP \($0)" } ?? "The server returned an invalid response.")
+                    }
+                    let (value, quality) = await Task.detached(priority: .userInitiated) {
+                        classify(data)
+                    }.value
+                    let error = quality == .rejected ? "The server returned no matching titles." : nil
+                    return DirectMediaParsedResponse(data: data, value: value, quality: quality, error: error)
+                }
+            }
+
+            var fallback: DirectMediaParsedResponse?
+            while let response = await group.next() {
+                switch response.quality {
+                case .preferred:
+                    if response.value != nil {
+                        group.cancelAll()
+                        return response
+                    }
+                case .fallback:
+                    if fallback == nil, response.value != nil { fallback = response }
+                case .rejected:
+                    lastError = response.error ?? lastError
+                }
+            }
+            return fallback
+        }
+        guard let selected, let payload = selected.data, let value = selected.value else {
+            throw DirectMediaAPIError.server(lastError)
+        }
+        return (payload, value)
     }
 
     private static func fetchJSON(url: URL, timeout: TimeInterval) async -> RouteResponse {
@@ -2901,6 +2960,36 @@ final class MediaDatabase {
         sqlite3_step(statement)
     }
 
+    func saveIMDbMetadataBatch(_ metadataByMediaID: [String: IMDbTitleMetadata]) {
+        guard let handle, !metadataByMediaID.isEmpty,
+              execute("BEGIN IMMEDIATE;") == SQLITE_OK else { return }
+        let sql = "INSERT OR REPLACE INTO imdb_media_metadata(media_id,imdb_id,genres,rating,votes) VALUES(?,?,?,?,?)"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            execute("ROLLBACK;")
+            return
+        }
+        var success = true
+        for (mediaID, metadata) in metadataByMediaID.sorted(by: { $0.key < $1.key }) {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            bind(mediaID, at: 1, in: statement)
+            bind(metadata.tconst, at: 2, in: statement)
+            bind(Self.encodeGenres(metadata.genres), at: 3, in: statement)
+            if let rating = metadata.rating { bind(String(format: "%.1f", rating), at: 4, in: statement) }
+            else { sqlite3_bind_null(statement, 4) }
+            if let votes = metadata.votes { sqlite3_bind_int(statement, 5, Int32(votes)) }
+            else { sqlite3_bind_null(statement, 5) }
+            if sqlite3_step(statement) != SQLITE_DONE {
+                success = false
+                break
+            }
+        }
+        sqlite3_finalize(statement)
+        if success, execute("COMMIT;") == SQLITE_OK { return }
+        execute("ROLLBACK;")
+    }
+
     func cachedIMDbArtwork(for tconst: String) -> (cached: Bool, data: Data?) {
         guard let handle else { return (false, nil) }
         var statement: OpaquePointer?
@@ -3064,7 +3153,7 @@ final class MediaDatabase {
             execute("ROLLBACK;")
             return
         }
-        guard save(items, source: "api") else {
+        guard save(items, source: "api", insideTransaction: true) else {
             execute("ROLLBACK;")
             return
         }
@@ -3091,16 +3180,21 @@ final class MediaDatabase {
         sqlite3_step(statement)
     }
 
-    private func save(_ items: [MediaItem], source: String) -> Bool {
+    private func save(_ items: [MediaItem], source: String, insideTransaction: Bool = false) -> Bool {
         guard let handle else { return false }
+        guard !items.isEmpty else { return true }
+        if !insideTransaction, execute("BEGIN IMMEDIATE;") != SQLITE_OK { return false }
         let sql = "INSERT OR REPLACE INTO media(id,api_id,title,subtitle,synopsis,year,kind,symbol,palette,artwork_url,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            if !insideTransaction { execute("ROLLBACK;") }
+            return false
+        }
+        defer { sqlite3_finalize(statement) }
         var success = true
         for item in items {
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-                success = false
-                continue
-            }
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
             bind(item.id, at: 1, in: statement)
             bind(item.apiID, at: 2, in: statement)
             bind(item.title, at: 3, in: statement)
@@ -3112,8 +3206,15 @@ final class MediaDatabase {
             sqlite3_bind_int(statement, 9, Int32(item.palette))
             bind(item.artworkURL?.absoluteString, at: 10, in: statement)
             bind(source, at: 11, in: statement)
-            if sqlite3_step(statement) != SQLITE_DONE { success = false }
-            sqlite3_finalize(statement)
+            if sqlite3_step(statement) != SQLITE_DONE {
+                success = false
+                break
+            }
+        }
+        if !insideTransaction {
+            if success, execute("COMMIT;") == SQLITE_OK { return true }
+            execute("ROLLBACK;")
+            return false
         }
         return success
     }
@@ -7574,7 +7675,7 @@ private struct SettingsSheet: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("Wikidata and TVmaze are checked automatically for every loaded movie and series. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page.")
+                Text("Wikidata and TVmaze load when a title is opened or when you choose a catalog check in Settings. They fill missing descriptions, ratings, genres, artwork, country, runtime, director, and cast. Filimo and HexDL still use a public title-page link imported from the detail page.")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
