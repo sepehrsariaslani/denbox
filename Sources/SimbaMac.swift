@@ -142,6 +142,43 @@ struct MediaStreamSource: Identifiable, Sendable {
     let headers: [String: String]
 }
 
+enum MediaStreamSourceSelection {
+    private static let qualityExpression = try! NSRegularExpression(
+        pattern: #"\b(2160p|1440p|1080p|720p|576p|540p|480p|360p|240p|4k|uhd|fhd|hd|sd)\b"#,
+        options: [.caseInsensitive]
+    )
+
+    static func preferred(
+        in sources: [MediaStreamSource],
+        selectedID: String? = nil,
+        selectedTitle: String? = nil
+    ) -> MediaStreamSource? {
+        guard !sources.isEmpty else { return nil }
+        if let selectedID, let exact = sources.first(where: { $0.id == selectedID }) { return exact }
+        guard let selectedTitle else { return sources.first }
+
+        let normalizedTitle = normalize(selectedTitle)
+        if let exact = sources.first(where: { normalize($0.title) == normalizedTitle }) { return exact }
+        if let quality = qualityToken(selectedTitle),
+           let sameQuality = sources.first(where: { qualityToken($0.title) == quality }) {
+            return sameQuality
+        }
+        return sources.first
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private static func qualityToken(_ value: String) -> String? {
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard let match = qualityExpression.firstMatch(in: value, range: range),
+              let tokenRange = Range(match.range(at: 1), in: value) else { return nil }
+        return value[tokenRange].lowercased()
+    }
+}
+
 struct MediaEpisode: Identifiable, Sendable {
     let id: String
     let title: String
@@ -600,15 +637,18 @@ enum IMDbEpisodeMatcher {
 }
 
 enum IMDbMediaEnricher {
-    static func enrich(_ details: MediaDetails, for item: MediaItem) -> MediaDetails {
+    static func match(_ details: MediaDetails, for item: MediaItem) -> IMDbTitleMetadata? {
         let store = IMDbMetadataStore.shared
-        guard let matched = store.matchTitle(title: item.title, year: details.year ?? item.year, kind: item.kind) else {
-            return details
-        }
+        if let imdbID = details.imdbID ?? item.imdbID, let matched = store.title(tconst: imdbID) { return matched }
+        return store.matchTitle(title: item.title, year: details.year ?? item.year, kind: item.kind)
+    }
+
+    static func enrich(_ details: MediaDetails, for item: MediaItem, matched: IMDbTitleMetadata) -> MediaDetails {
+        let store = IMDbMetadataStore.shared
         let castPeople = store.principalPeople(for: matched.tconst)
         let cast = castPeople.map(\.name)
         let seriesEnrichment = item.kind == "Series"
-            ? store.enrichment(title: item.title, year: details.year ?? item.year, includeSimilar: false)
+            ? store.enrichment(title: matched.title, year: matched.year.map(String.init) ?? details.year ?? item.year, includeSimilar: false)
             : nil
         let seasons = seriesEnrichment.map { IMDbEpisodeMatcher.remap(details.seasons, using: $0.episodes) } ?? details.seasons
         return MediaDetails(
@@ -678,8 +718,7 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var imdbPeopleAvailable = false
     @Published private(set) var pendingIMDbPersonRequest: IMDbPersonLookupRequest?
-    @Published private(set) var publicReferenceStatus = "IMDb, TVmaze, Wikidata, and enabled TMDB references update automatically for loaded titles."
-    @Published private(set) var publicTitleCatalogStatus = "Filimo and HexDL metadata updates automatically for loaded titles."
+    @Published private(set) var publicReferenceStatus = "Open a title to load its IMDb and public reference metadata; results are saved locally."
     @Published private(set) var genreFacets: [IMDbGenreFacet] = []
     @Published private(set) var isLoadingGenreFacets = false
     @Published private(set) var preferredGenres: Set<String> = []
@@ -707,14 +746,9 @@ final class LibraryModel: ObservableObject {
     private var imdbRecommendationsInFlight: Set<String> = []
     private var referenceMetadataLookupsInFlight: Set<String> = []
     private var publicMetadataLookupsInFlight: Set<String> = []
-    private var publicTitleCatalogTask: Task<Void, Never>?
-    private var publicTitleCatalogRefreshRequested = false
-    private var publicTitleCatalogForceRefreshRequested = false
     private var referenceCatalogEnrichmentTask: Task<Void, Never>?
     private var referenceCatalogEnrichmentRequested = false
     private var forceTMDBReferenceRefreshRequested = false
-    private var catalogIMDbEnrichmentTask: Task<Void, Never>?
-    private var catalogIMDbEnrichmentRequested = false
     private var recommendationsNeedRefresh = false
     private var catalogRefreshInProgress = false
     private var detailRefreshesInFlight: Set<String> = []
@@ -770,7 +804,6 @@ final class LibraryModel: ObservableObject {
                     self.imdbDatasetStatus = "IMDb dataset ready · updated \(updated.formatted(date: .abbreviated, time: .shortened))"
                 }
             }
-            if !cached.isEmpty { scheduleCatalogIMDbEnrichment(delayNanoseconds: 250_000_000) }
         }
         if loadRemoteCatalog {
             if SecretVault.read(account: "media-api-key") != nil,
@@ -899,20 +932,59 @@ final class LibraryModel: ObservableObject {
     var hasIMDbData: Bool { IMDbMetadataStore.shared.isAvailable }
     var isTrackingPlayback: Bool { activeWatchSessionID != nil }
     var isCheckingPublicReferences: Bool { referenceCatalogEnrichmentTask != nil }
-    var isCheckingPublicTitlePages: Bool { publicTitleCatalogTask != nil }
 
     func checkPublicReferencesForCatalog(forceTMDB: Bool = false) {
         if forceTMDB { forceTMDBReferenceRefreshRequested = true }
         scheduleCatalogReferenceEnrichment()
     }
 
-    func checkPublicTitlePagesForCatalog() {
-        publicTitleCatalogForceRefreshRequested = true
-        schedulePublicTitleCatalogEnrichment()
+    func tmdbCredentialsDidChange(hasToken: Bool) {
+        forceTMDBReferenceRefreshRequested = hasToken
     }
 
     func publicTitleMetadata(mediaID: String, provider: PublicMetadataProvider) -> PublicTitleMetadata? {
         database.loadPublicTitleMetadata(mediaID: mediaID, provider: provider)
+    }
+
+    func localizedPersianTitle(mediaID: String) -> String? {
+        if let saved = database.loadLocalizedPersianTitle(mediaID: mediaID) { return saved }
+        let sources = [PublicMetadataProvider.filimo, .hexDL].compactMap {
+            database.loadPublicTitleMetadata(mediaID: mediaID, provider: $0)
+        }
+        guard let source = sources.first(where: \.hasPersianTitle) else { return nil }
+        let englishTitle = items.first(where: { $0.id == mediaID })?.title ?? source.originalTitle ?? ""
+        database.saveLocalizedPersianTitle(source.title, englishTitle: englishTitle,
+                                            provider: source.provider, mediaID: mediaID)
+        return source.title
+    }
+
+    func cachedPublicArtwork(mediaID: String) async -> NSImage? {
+        await publicArtwork(mediaID: mediaID, shouldDownload: false)
+    }
+
+    func loadPublicArtwork(mediaID: String) async -> NSImage? {
+        await publicArtwork(mediaID: mediaID, shouldDownload: true)
+    }
+
+    private func publicArtwork(mediaID: String, shouldDownload: Bool) async -> NSImage? {
+        for provider in [PublicMetadataProvider.filimo, .hexDL] {
+            guard let metadata = database.loadPublicTitleMetadata(mediaID: mediaID, provider: provider),
+                  let sourceURL = metadata.posterURL else { continue }
+            let fileURL: URL?
+            if shouldDownload {
+                fileURL = await PublicArtworkFileCache.shared.cache(
+                    mediaID: mediaID, provider: provider, sourceURL: sourceURL
+                )
+            } else {
+                fileURL = await PublicArtworkFileCache.shared.cachedURL(
+                    mediaID: mediaID, provider: provider, sourceURL: sourceURL
+                )
+            }
+            guard let fileURL else { continue }
+            let imageData = await Task.detached(priority: .utility) { try? Data(contentsOf: fileURL) }.value
+            if let imageData, let image = NSImage(data: imageData) { return image }
+        }
+        return nil
     }
 
     func referenceMetadata(mediaID: String) -> ReferenceTitleMetadata? {
@@ -927,8 +999,19 @@ final class LibraryModel: ObservableObject {
         let merged = existing.map { metadata.merging($0) } ?? metadata
         guard database.savePublicTitleMetadata(merged, for: mediaID) else { return false }
         database.recordPublicTitleMetadataAttempt(mediaID: mediaID, provider: metadata.provider)
+        persistPreferredPersianTitle(mediaID: mediaID)
         applyCachedPublicMetadataToCatalog(mediaID: mediaID)
         return true
+    }
+
+    private func persistPreferredPersianTitle(mediaID: String) {
+        let sources = [PublicMetadataProvider.filimo, .hexDL].compactMap {
+            database.loadPublicTitleMetadata(mediaID: mediaID, provider: $0)
+        }
+        guard let source = sources.first(where: \.hasPersianTitle) else { return }
+        let englishTitle = items.first(where: { $0.id == mediaID })?.title ?? source.originalTitle ?? ""
+        database.saveLocalizedPersianTitle(source.title, englishTitle: englishTitle,
+                                           provider: source.provider, mediaID: mediaID)
     }
 
     func refreshPublicTitleMetadata(
@@ -976,11 +1059,18 @@ final class LibraryModel: ObservableObject {
                        !cached.needsAutomaticRefresh() {
                         return (provider, await PublicMetadataDiscoveryService.enrichPageDetails(from: cached))
                     }
-                    return (provider, await PublicMetadataDiscoveryService.discover(
+                    let discovered = await PublicMetadataDiscoveryService.discover(
                         for: item,
                         provider: provider,
                         includePageDetails: includePageDetails
-                    ))
+                    )
+                    if let discovered { return (provider, discovered) }
+                    if includePageDetails,
+                       let cached = cachedMetadataByProvider[provider],
+                       cached.needsPageDetailsRefresh() {
+                        return (provider, await PublicMetadataDiscoveryService.enrichPageDetails(from: cached))
+                    }
+                    return (provider, nil)
                 }
             }
             for await (provider, discovered) in group {
@@ -993,7 +1083,10 @@ final class LibraryModel: ObservableObject {
                 database.recordPublicTitleMetadataAttempt(mediaID: item.id, provider: provider)
             }
         }
-        if updatedCount > 0 { applyCachedPublicMetadataToCatalog(mediaID: item.id) }
+        if updatedCount > 0 {
+            persistPreferredPersianTitle(mediaID: item.id)
+            applyCachedPublicMetadataToCatalog(mediaID: item.id)
+        }
         return (dueProviders.count, updatedCount)
     }
 
@@ -1156,82 +1249,6 @@ final class LibraryModel: ObservableObject {
         }
     }
 
-    func enrichCatalogWithIMDb() async {
-        scheduleCatalogIMDbEnrichment()
-        await catalogIMDbEnrichmentTask?.value
-    }
-
-    private func scheduleCatalogIMDbEnrichment(delayNanoseconds: UInt64 = 0) {
-        guard !items.isEmpty else { return }
-        catalogIMDbEnrichmentRequested = true
-        guard catalogIMDbEnrichmentTask == nil else { return }
-        catalogIMDbEnrichmentTask = Task(priority: .utility) { @MainActor [weak self] in
-            guard let self else { return }
-            var delay = delayNanoseconds
-            repeat {
-                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
-                delay = 0
-                self.catalogIMDbEnrichmentRequested = false
-                await self.performCatalogIMDbEnrichment()
-            } while self.catalogIMDbEnrichmentRequested && !Task.isCancelled
-            self.catalogIMDbEnrichmentTask = nil
-        }
-    }
-
-    private func performCatalogIMDbEnrichment() async {
-        guard !items.isEmpty else { return }
-        let cachePayloads = database.loadCatalogMetadataPayloads(for: Set(items.map(\.id)))
-        let cachedMetadata = await Task.detached(priority: .utility) {
-            Self.decodeCatalogMetadata(cachePayloads)
-        }.value
-        applyCachedCatalogMetadata(cachedMetadata)
-
-        let catalogSnapshot = items
-        let metadata: [String: IMDbTitleMetadata]
-        if IMDbMetadataStore.shared.isAvailable {
-            metadata = await Task.detached(priority: .utility) {
-                IMDbMetadataStore.shared.catalogMetadata(for: catalogSnapshot)
-            }.value
-        } else {
-            metadata = [:]
-        }
-        if !metadata.isEmpty { database.saveIMDbMetadata(metadata) }
-        var refreshedRatedMetadata = false
-        items = items.map { item in
-            var resolved = item
-            if let title = metadata[item.id] {
-                resolved = resolved.applyingIMDb(title)
-            }
-            if metadata[item.id] != nil,
-               let existingRating = personalRatings[item.id],
-               database.updatePersonalRatingSnapshot(resolved) {
-                personalRatings[item.id] = PersonalRating(
-                    rating: existingRating.rating,
-                    item: resolved,
-                    updatedAt: existingRating.updatedAt
-                )
-                refreshedRatedMetadata = true
-            }
-            return resolved
-        }
-        if refreshedRatedMetadata { invalidateRecommendations() }
-        scheduleCatalogReferenceEnrichment()
-        schedulePublicTitleCatalogEnrichment()
-    }
-
-    private func applyCachedCatalogMetadata(_ cachedMetadata: [String: CachedCatalogMetadata]) {
-        guard !cachedMetadata.isEmpty else { return }
-        for (mediaID, cached) in cachedMetadata {
-            if let reference = cached.reference { referenceMetadataByID[mediaID] = reference }
-        }
-        items = items.map { item in
-            guard let cached = cachedMetadata[item.id] else { return item }
-            var resolved = item
-            if let reference = cached.reference { resolved = resolved.applyingReference(reference) }
-            return resolved.applyingPublicTitleMetadata(cached.publicTitles)
-        }
-    }
-
     nonisolated private static func decodeCatalogMetadata(
         _ payloads: CatalogMetadataPayloads
     ) -> [String: CachedCatalogMetadata] {
@@ -1261,61 +1278,6 @@ final class LibraryModel: ObservableObject {
             result[mediaID] = CachedCatalogMetadata(reference: nil, publicTitles: [], publicAttempts: attempts)
         }
         return result
-    }
-
-    private func schedulePublicTitleCatalogEnrichment() {
-        publicTitleCatalogRefreshRequested = true
-        guard publicTitleCatalogTask == nil else { return }
-        publicTitleCatalogRefreshRequested = false
-        publicTitleCatalogTask = Task(priority: .utility) { @MainActor [weak self] in
-            guard let self else { return }
-            var checkedTitles = 0
-            defer {
-                self.publicTitleCatalogTask = nil
-                if checkedTitles > 0 {
-                    self.publicTitleCatalogStatus = "Filimo and HexDL checks are complete for the loaded titles."
-                } else if self.items.isEmpty {
-                    self.publicTitleCatalogStatus = "Load a catalog to check Filimo and HexDL."
-                } else {
-                    self.publicTitleCatalogStatus = "Persian public title metadata is up to date."
-                }
-                if self.publicTitleCatalogRefreshRequested {
-                    self.publicTitleCatalogRefreshRequested = false
-                    self.schedulePublicTitleCatalogEnrichment()
-                }
-            }
-
-            repeat {
-                self.publicTitleCatalogRefreshRequested = false
-                let forceRefresh = self.publicTitleCatalogForceRefreshRequested
-                self.publicTitleCatalogForceRefreshRequested = false
-                let cachePayloads = self.database.loadCatalogMetadataPayloads(for: Set(self.items.map(\.id)))
-                let cachedMetadata = await Task.detached(priority: .utility) {
-                    Self.decodeCatalogMetadata(cachePayloads)
-                }.value
-                let pending = self.items.filter { item in
-                    guard item.isRemote, ["Movie", "Series"].contains(item.kind) else { return false }
-                    return PublicMetadataProvider.allCases.contains { provider in
-                        let cached = cachedMetadata[item.id]?.publicTitles.first { $0.provider == provider }
-                        let attemptedAt = cachedMetadata[item.id]?.publicAttempts[provider.rawValue]
-                        guard PublicTitleMetadataRefreshPolicy.shouldRefresh(
-                            cached: cached,
-                            lastAttempt: attemptedAt,
-                            force: forceRefresh
-                        ) else { return false }
-                        return !self.publicMetadataLookupsInFlight.contains("\(item.id)|\(provider.rawValue)")
-                    }
-                }
-                guard !pending.isEmpty else { break }
-                self.publicTitleCatalogStatus = "Updating Persian metadata from Filimo and HexDL…"
-                for item in pending {
-                    guard !Task.isCancelled else { break }
-                    let result = await self.refreshPublicTitleMetadata(for: item, force: forceRefresh)
-                    if result.attempted > 0 { checkedTitles += 1 }
-                    if result.attempted > 0 { try? await Task.sleep(nanoseconds: 500_000_000) }
-                }
-            } while self.publicTitleCatalogRefreshRequested && !Task.isCancelled
-        }
     }
 
     private func scheduleCatalogReferenceEnrichment() {
@@ -1560,12 +1522,32 @@ final class LibraryModel: ObservableObject {
         guard IMDbMetadataStore.shared.isAvailable,
               imdbEnrichmentsInFlight.insert(item.id).inserted else { return }
         Task { [weak self] in
-            let enriched = await Task.detached(priority: .utility) {
-                IMDbMediaEnricher.enrich(details, for: item)
+            let result = await Task.detached(priority: .utility) { () -> (IMDbTitleMetadata?, MediaDetails) in
+                guard let metadata = IMDbMediaEnricher.match(details, for: item) else { return (nil, details) }
+                return (metadata, IMDbMediaEnricher.enrich(details, for: item, matched: metadata))
             }.value
             guard let self else { return }
             self.imdbEnrichmentsInFlight.remove(item.id)
-            guard enriched.imdbID != nil else { return }
+            guard let metadata = result.0 else { return }
+            let enriched = result.1
+            self.database.saveIMDbMetadata(metadata, for: item.id)
+            if let index = self.items.firstIndex(where: { $0.id == item.id }) {
+                let updatedItem = self.items[index].applyingIMDb(metadata)
+                if updatedItem != self.items[index] {
+                    self.items[index] = updatedItem
+                    if let existingRating = self.personalRatings[item.id],
+                       self.database.updatePersonalRatingSnapshot(updatedItem) {
+                        self.personalRatings[item.id] = PersonalRating(
+                            rating: existingRating.rating,
+                            item: updatedItem,
+                            updatedAt: existingRating.updatedAt
+                        )
+                    }
+                }
+            }
+            if self.selectedItem?.id == item.id {
+                self.selectedItem = self.selectedItem?.applyingIMDb(metadata)
+            }
             self.recentlyRefreshedDetails[item.id] = enriched
             self.detailsRefreshRevision += 1
             self.scheduleReferenceEnrichment(for: item, details: enriched)
@@ -1582,8 +1564,11 @@ final class LibraryModel: ObservableObject {
         if let cached { referenceMetadataByID[item.id] = cached }
         let tmdbToken = SecretVault.read(account: "tmdb-read-access-token")
         let hasTMDBToken = !(tmdbToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let forceTMDB = forceTMDBReferenceRefreshRequested
+        forceTMDBReferenceRefreshRequested = false
         guard ReferenceMetadataService.shouldRefresh(cached, for: item, imdbID: imdbID,
-                                                     hasTMDBToken: hasTMDBToken) else {
+                                                     hasTMDBToken: hasTMDBToken,
+                                                     forceTMDB: forceTMDB) else {
             if let cached, !cached.isEmpty {
                 recentlyRefreshedDetails[item.id] = ReferenceMetadataService.enrich(details, with: cached)
             }
@@ -1594,7 +1579,7 @@ final class LibraryModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             let metadata = await ReferenceMetadataService.fetch(for: item, imdbID: imdbID, existing: cached,
-                                                                tmdbToken: tmdbToken)
+                                                                tmdbToken: tmdbToken, forceTMDB: forceTMDB)
             self.referenceMetadataLookupsInFlight.remove(lookupKey)
             let latest = self.database.loadReferenceMetadata(mediaID: item.id)
             let combined = metadata.merging(latest ?? .empty())
@@ -2039,9 +2024,10 @@ final class LibraryModel: ObservableObject {
         return total > 0 ? total : nil
     }
 
-    func refreshActivePlaybackSource() async -> MediaStreamSource? {
-        guard let active = activeRemotePlayback,
-              let details = await loadDetails(for: active.item, forceRefresh: true) else { return nil }
+    func activePlaybackSources(forceRefresh: Bool) async -> [MediaStreamSource] {
+        guard let active = activeRemotePlayback else { return [] }
+        let refreshed = forceRefresh ? await loadDetails(for: active.item, forceRefresh: true) : nil
+        guard let details = refreshed ?? active.details else { return [] }
         activeRemotePlayback?.details = details
         recentlyRefreshedDetails[active.item.id] = details
         detailsRefreshRevision += 1
@@ -2057,14 +2043,15 @@ final class LibraryModel: ObservableObject {
             candidates = details.sources + details.downloadSources
         }
 
-        guard !candidates.isEmpty else { return nil }
-        let source = candidates.first(where: {
-            $0.title.localizedCaseInsensitiveCompare(active.sourceTitle ?? "") == .orderedSame
-        }) ?? candidates.first!
+        var seen = Set<String>()
+        return candidates.filter { seen.insert($0.url.absoluteString).inserted }
+    }
+
+    func useActivePlaybackSource(_ source: MediaStreamSource) {
+        guard activeRemotePlayback != nil else { return }
         activeRemotePlayback?.sourceTitle = source.title
         playerHeaders = source.headers
         playerURL = source.url
-        return source
     }
 
     var hasActiveRemotePlayback: Bool { activeRemotePlayback != nil }
@@ -2084,7 +2071,6 @@ final class LibraryModel: ObservableObject {
             imdbDatasetStatus = "IMDb dataset ready · updated \(timestamp)"
             imdbChartLists = nil
             imdbPeopleAvailable = summary.hasPeopleData
-            scheduleCatalogIMDbEnrichment()
             genreFacets = []
             recommendations = []
             if section == .genres { await loadGenreFacets() }
@@ -2170,7 +2156,6 @@ final class LibraryModel: ObservableObject {
         }
         database.saveRemoteItems([resolved])
         items = database.loadCatalog()
-        scheduleCatalogIMDbEnrichment()
         selectedItem = items.first(where: { $0.id == resolved.id }) ?? resolved
         similarTitleSearchMessage = nil
     }
@@ -2215,10 +2200,6 @@ final class LibraryModel: ObservableObject {
             accepting: { !matches(in: $0).isEmpty }
         ) else { return nil }
         return matches(in: payload).first?.0
-    }
-
-    private func enrichWithIMDb(_ details: MediaDetails, item: MediaItem) -> MediaDetails {
-        IMDbMediaEnricher.enrich(details, for: item)
     }
 
     private func remapSeasons(_ seasons: [MediaSeason], imdbEpisodes: [IMDbEpisodeMetadata]) -> [MediaSeason] {
@@ -2330,7 +2311,6 @@ final class LibraryModel: ObservableObject {
             if !cached.isEmpty {
                 items = cached
                 connectionStatus = "Live catalog unavailable. Showing \(cached.filter { $0.kind == "Movie" }.count) saved movies and \(cached.filter { $0.kind == "Series" }.count) saved series."
-                scheduleCatalogIMDbEnrichment()
             } else {
                 let failures = [movieResponse.error, seriesResponse.error].compactMap { $0 }
                 connectionStatus = failures.isEmpty
@@ -2356,7 +2336,6 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Live catalog · \(movieCount) movies · \(seriesCount) series"
         }
         section = .home
-        scheduleCatalogIMDbEnrichment()
     }
 
     var canLoadMoreCatalog: Bool {
@@ -2419,7 +2398,6 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Loaded \(added) more titles · \(items.filter { $0.kind == "Movie" }.count) movies · \(items.filter { $0.kind == "Series" }.count) series"
         }
         if added > 0 {
-            scheduleCatalogIMDbEnrichment()
         }
     }
 
@@ -2465,7 +2443,6 @@ final class LibraryModel: ObservableObject {
         guard !uniqueItems.isEmpty else { return false }
         database.saveRemoteItems(uniqueItems)
         items = database.loadCatalog()
-        if IMDbMetadataStore.shared.isAvailable { scheduleCatalogIMDbEnrichment() }
         catalogName = "Denbox API"
         let movieCount = uniqueItems.filter { $0.kind == "Movie" }.count
         let seriesCount = uniqueItems.filter { $0.kind == "Series" }.count
@@ -2888,7 +2865,6 @@ final class LibraryModel: ObservableObject {
         items = database.loadCatalog()
         section = .home
         searchText = ""
-        scheduleCatalogIMDbEnrichment()
     }
 }
 
@@ -3142,6 +3118,7 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 struct DownloadedMedia: Identifiable {
     let id: String
     let title: String
+    let sourceTitle: String
     let fileURL: URL
     let byteCount: Int64
     let segmentCount: Int
@@ -3229,6 +3206,7 @@ final class MediaDatabase {
         CREATE TABLE IF NOT EXISTS downloaded_media (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
+            source_title TEXT NOT NULL DEFAULT '',
             file_path TEXT NOT NULL,
             byte_count INTEGER NOT NULL,
             segment_count INTEGER NOT NULL DEFAULT 1,
@@ -3285,6 +3263,13 @@ final class MediaDatabase {
             imported_at REAL NOT NULL,
             PRIMARY KEY(media_id, provider)
         );
+        CREATE TABLE IF NOT EXISTS localized_media_titles (
+            media_id TEXT PRIMARY KEY,
+            english_title TEXT NOT NULL DEFAULT '',
+            persian_title TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS public_title_metadata_attempts (
             media_id TEXT NOT NULL,
             provider TEXT NOT NULL,
@@ -3307,6 +3292,9 @@ final class MediaDatabase {
         if !columnExists("episode_id", in: "downloaded_media") {
             execute("ALTER TABLE downloaded_media ADD COLUMN episode_id TEXT")
         }
+        if !columnExists("source_title", in: "downloaded_media") {
+            execute("ALTER TABLE downloaded_media ADD COLUMN source_title TEXT NOT NULL DEFAULT ''")
+        }
         if !columnExists("lookup_version", in: "public_title_metadata_attempts") {
             execute("ALTER TABLE public_title_metadata_attempts ADD COLUMN lookup_version INTEGER NOT NULL DEFAULT 1")
         }
@@ -3328,6 +3316,44 @@ final class MediaDatabase {
               let payload = columnText(statement, 0),
               let data = payload.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(PublicTitleMetadata.self, from: data)
+    }
+
+    func loadLocalizedPersianTitle(mediaID: String) -> String? {
+        guard let handle else { return nil }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT persian_title FROM localized_media_titles WHERE media_id=? LIMIT 1",
+                                 -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        bind(mediaID, at: 1, in: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return columnText(statement, 0)
+    }
+
+    func saveLocalizedPersianTitle(
+        _ persianTitle: String,
+        englishTitle: String,
+        provider: PublicMetadataProvider,
+        mediaID: String
+    ) {
+        guard let handle else { return }
+        var statement: OpaquePointer?
+        let sql = """
+        INSERT INTO localized_media_titles(media_id,english_title,persian_title,provider,updated_at)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(media_id) DO UPDATE SET
+            english_title=excluded.english_title,
+            persian_title=excluded.persian_title,
+            provider=excluded.provider,
+            updated_at=excluded.updated_at
+        """
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return }
+        defer { sqlite3_finalize(statement) }
+        bind(mediaID, at: 1, in: statement)
+        bind(englishTitle, at: 2, in: statement)
+        bind(persianTitle, at: 3, in: statement)
+        bind(provider.rawValue, at: 4, in: statement)
+        sqlite3_bind_double(statement, 5, Date().timeIntervalSince1970)
+        sqlite3_step(statement)
     }
 
     func savePublicTitleMetadata(_ metadata: PublicTitleMetadata, for mediaID: String) -> Bool {
@@ -3657,7 +3683,7 @@ final class MediaDatabase {
     func loadDownloadedMedia() -> [DownloadedMedia] {
         guard let handle else { return [] }
         var statement: OpaquePointer?
-        let sql = "SELECT id,title,file_path,byte_count,segment_count,created_at,catalog_media_id,episode_id FROM downloaded_media ORDER BY created_at DESC"
+        let sql = "SELECT id,title,file_path,byte_count,segment_count,created_at,catalog_media_id,episode_id,source_title FROM downloaded_media ORDER BY created_at DESC"
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
         defer { sqlite3_finalize(statement) }
         var result: [DownloadedMedia] = []
@@ -3668,6 +3694,7 @@ final class MediaDatabase {
             result.append(DownloadedMedia(
                 id: columnText(statement, 0) ?? UUID().uuidString,
                 title: columnText(statement, 1) ?? fileURL.deletingPathExtension().lastPathComponent,
+                sourceTitle: columnText(statement, 8) ?? "",
                 fileURL: fileURL,
                 byteCount: sqlite3_column_int64(statement, 3),
                 segmentCount: Int(sqlite3_column_int(statement, 4)),
@@ -3681,18 +3708,19 @@ final class MediaDatabase {
 
     func saveDownloadedMedia(_ item: DownloadedMedia) {
         guard let handle else { return }
-        let sql = "INSERT OR REPLACE INTO downloaded_media(id,title,file_path,byte_count,segment_count,created_at,catalog_media_id,episode_id) VALUES(?,?,?,?,?,?,?,?)"
+        let sql = "INSERT OR REPLACE INTO downloaded_media(id,title,source_title,file_path,byte_count,segment_count,created_at,catalog_media_id,episode_id) VALUES(?,?,?,?,?,?,?,?,?)"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return }
         defer { sqlite3_finalize(statement) }
         bind(item.id, at: 1, in: statement)
         bind(item.title, at: 2, in: statement)
-        bind(item.fileURL.path, at: 3, in: statement)
-        sqlite3_bind_int64(statement, 4, item.byteCount)
-        sqlite3_bind_int(statement, 5, Int32(item.segmentCount))
-        sqlite3_bind_double(statement, 6, item.createdAt.timeIntervalSince1970)
-        bind(item.catalogMediaID, at: 7, in: statement)
-        bind(item.episodeID, at: 8, in: statement)
+        bind(item.sourceTitle, at: 3, in: statement)
+        bind(item.fileURL.path, at: 4, in: statement)
+        sqlite3_bind_int64(statement, 5, item.byteCount)
+        sqlite3_bind_int(statement, 6, Int32(item.segmentCount))
+        sqlite3_bind_double(statement, 7, item.createdAt.timeIntervalSince1970)
+        bind(item.catalogMediaID, at: 8, in: statement)
+        bind(item.episodeID, at: 9, in: statement)
         sqlite3_step(statement)
     }
 
@@ -4306,6 +4334,7 @@ private struct SeasonDownloadSummary {
 final class DownloadEntry: ObservableObject, Identifiable {
     let id: String
     let title: String
+    let sourceTitle: String
     let createdAt: Date
     let catalogMediaID: String?
     let episodeID: String?
@@ -4323,6 +4352,7 @@ final class DownloadEntry: ObservableObject, Identifiable {
     init(title: String, source: MediaStreamSource, catalogMediaID: String?, episodeID: String?) {
         id = UUID().uuidString
         self.title = title
+        sourceTitle = source.title
         self.source = source
         self.catalogMediaID = catalogMediaID
         self.episodeID = episodeID
@@ -4333,6 +4363,7 @@ final class DownloadEntry: ObservableObject, Identifiable {
     init(completed item: DownloadedMedia) {
         id = item.id
         title = item.title
+        sourceTitle = item.sourceTitle
         createdAt = item.createdAt
         catalogMediaID = item.catalogMediaID
         episodeID = item.episodeID
@@ -4376,9 +4407,14 @@ final class DownloadManager: ObservableObject {
     @discardableResult
     func enqueue(source: MediaStreamSource, title: String, catalogMediaID: String? = nil, episodeID: String? = nil) -> Bool {
         if entries.contains(where: {
-            ($0.source?.url == source.url && ($0.status == .queued || $0.status == .downloading))
-                || (catalogMediaID != nil && $0.catalogMediaID == catalogMediaID
-                    && $0.episodeID == episodeID && $0.status == .completed)
+            let sameMediaQuality = catalogMediaID != nil
+                && $0.catalogMediaID == catalogMediaID
+                && $0.episodeID == episodeID
+                && $0.sourceTitle.localizedCaseInsensitiveCompare(source.title) == .orderedSame
+            let activeDuplicate = $0.source?.url == source.url
+                && ($0.status == .queued || $0.status == .downloading)
+            return activeDuplicate || (sameMediaQuality
+                && ($0.status == .queued || $0.status == .downloading || $0.status == .completed))
         }) {
             return false
         }
@@ -4388,14 +4424,18 @@ final class DownloadManager: ObservableObject {
         return true
     }
 
-    fileprivate func enqueueSeason(_ season: MediaSeason, series: MediaItem) -> SeasonDownloadSummary {
+    fileprivate func enqueueSeason(
+        _ season: MediaSeason,
+        series: MediaItem,
+        preferredQuality: String? = nil
+    ) -> SeasonDownloadSummary {
         var summary = SeasonDownloadSummary()
         for episode in season.episodes {
             var seen = Set<String>()
             let sources = (episode.downloadSources + episode.sources).filter {
                 seen.insert($0.url.absoluteString).inserted
-            }
-            guard let source = sources.first(where: { !["m3u8", "mpd"].contains($0.url.pathExtension.lowercased()) }) else {
+            }.filter { !["m3u8", "mpd"].contains($0.url.pathExtension.lowercased()) }
+            guard let source = MediaStreamSourceSelection.preferred(in: sources, selectedTitle: preferredQuality) else {
                 summary.unavailable += 1
                 continue
             }
@@ -4504,6 +4544,7 @@ final class DownloadManager: ObservableObject {
             let saved = DownloadedMedia(
                 id: entry.id,
                 title: entry.title,
+                sourceTitle: source.title,
                 fileURL: destination,
                 byteCount: report.byteCount,
                 segmentCount: report.segmentCount,
@@ -4609,20 +4650,19 @@ struct MainWindow: View {
     @State private var detailPath: [MediaItem] = []
 
     var body: some View {
-        NavigationSplitView {
+        HStack(spacing: 0) {
             Sidebar()
-                .navigationSplitViewColumnWidth(min: 205, ideal: 225, max: 270)
-        } detail: {
-            NavigationStack(path: $detailPath) {
-                mainContent
-                    .navigationDestination(for: MediaItem.self) { item in
-                        MediaDetailPage(item: item)
-                            .environmentObject(model)
-                    }
-            }
-            .background(Color.canvas)
+                .frame(width: 225)
+                .frame(maxHeight: .infinity)
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.08))
+                        .frame(width: 1)
+                }
+
+            detailNavigationStack
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 1020, minHeight: 700)
         .onChange(of: model.playerURL) { url in
             guard url != nil, !model.isPlayerWindowOpen else { return }
@@ -4641,6 +4681,17 @@ struct MainWindow: View {
             SettingsSheet()
                 .environmentObject(model)
         }
+    }
+
+    private var detailNavigationStack: some View {
+        NavigationStack(path: $detailPath) {
+            mainContent
+                .navigationDestination(for: MediaItem.self) { item in
+                    MediaDetailPage(item: item)
+                        .environmentObject(model)
+                }
+        }
+        .background(Color.canvas)
     }
 
     private var mainContent: some View {
@@ -5884,6 +5935,12 @@ private struct GenresPage: View {
                                     in: RoundedRectangle(cornerRadius: 11))
                     }
                 }
+            }
+            if !model.selectedGenreFilters.isEmpty {
+                Button("Clear genre filters", systemImage: "xmark.circle") {
+                    model.clearGenreFilters()
+                }
+                .buttonStyle(.bordered)
             }
         }
         .task { await model.loadGenreFacets() }
@@ -7354,10 +7411,20 @@ private struct DownloadRow: View {
                 .foregroundStyle(entry.status == .failed ? Color.orange : Color.white.opacity(0.75))
                 .frame(width: 34)
             VStack(alignment: .leading, spacing: 6) {
-                Text(entry.title)
-                    .font(.denbox(size: 14, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    Text(entry.title)
+                        .font(.denbox(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    if !entry.sourceTitle.isEmpty {
+                        Text(entry.sourceTitle)
+                            .font(.denbox(size: 9, weight: .medium))
+                            .foregroundStyle(Color.secondaryText)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.white.opacity(0.07), in: Capsule())
+                    }
+                }
                 HStack(spacing: 8) {
                     statusLabel
                         .font(.denbox(size: 11))
@@ -7470,6 +7537,7 @@ private struct MediaDetailPage: View {
     @State private var selectedSeasonID: String?
     @State private var selectedEpisodeID: String?
     @State private var selectedSourceID: String?
+    @State private var selectedSourceTitle: String?
     @State private var isLoadingDetails = false
     @State private var isRefreshingActionLinks = false
     @State private var didLoadDetails = false
@@ -7477,13 +7545,10 @@ private struct MediaDetailPage: View {
     @State private var actionMessage: String?
     @State private var filimoMetadata: PublicTitleMetadata?
     @State private var hexDLMetadata: PublicTitleMetadata?
-    @State private var filimoURLText = ""
-    @State private var hexDLURLText = ""
-    @State private var importProvider: PublicMetadataProvider = .filimo
-    @State private var importURL: URL?
-    @State private var showingPublicMetadataImport = false
-    @State private var publicMetadataStatus: String?
-    @State private var isSearchingPublicMetadata = false
+    @State private var savedPersianTitle: String?
+    @State private var publicArtworkImage: NSImage?
+    @State private var publicArtworkResolved = false
+    @State private var publicArtworkAspectRatio: CGFloat = 1600.0 / 352.0
 
     var body: some View {
         ScrollViewReader { episodeProxy in
@@ -7548,7 +7613,6 @@ private struct MediaDetailPage: View {
                 .padding(.horizontal, 36)
 
                 personalRatingSection
-                publicMetadataSection
 
                 if item.kind == "Series" {
                     seriesEpisodes
@@ -7584,57 +7648,50 @@ private struct MediaDetailPage: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.canvas)
-        .sheet(isPresented: $showingPublicMetadataImport) {
-            if let importURL {
-                PublicTitlePageImportView(provider: importProvider, url: importURL) { metadata in
-                    guard model.savePublicTitleMetadata(metadata, mediaID: item.id) else {
-                        publicMetadataStatus = "The imported details could not be saved to the local database."
-                        return
-                    }
-                    let stored = model.publicTitleMetadata(mediaID: item.id, provider: metadata.provider) ?? metadata
-                    if stored.provider == .filimo {
-                        filimoMetadata = stored
-                        filimoURLText = stored.pageURL.absoluteString
-                    } else {
-                        hexDLMetadata = stored
-                        hexDLURLText = stored.pageURL.absoluteString
-                    }
-                    publicMetadataStatus = "Public page details saved. The image and synopsis will appear on this title."
-                }
-            }
-        }
         .onChange(of: selectedSeasonID) { _ in
             let seasonEpisodes = selectedSeason?.episodes ?? []
             if !seasonEpisodes.contains(where: { $0.id == selectedEpisodeID }) {
                 selectedEpisodeID = seasonEpisodes.first?.id
             }
             selectedSourceID = nil
+            selectedSourceTitle = nil
         }
         .onChange(of: model.detailsRefreshRevision) { _ in
             referenceMetadata = model.referenceMetadata(mediaID: item.id)
             filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
             hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
-            filimoURLText = filimoMetadata?.pageURL.absoluteString ?? filimoURLText
-            hexDLURLText = hexDLMetadata?.pageURL.absoluteString ?? hexDLURLText
+            savedPersianTitle = model.localizedPersianTitle(mediaID: item.id)
+            Task {
+                if let image = await model.cachedPublicArtwork(mediaID: item.id) {
+                    updatePublicArtwork(image)
+                    publicArtworkResolved = true
+                }
+            }
             guard let refreshed = model.recentlyRefreshedDetails[item.id] else { return }
             details = referenceMetadata.map { ReferenceMetadataService.enrich(refreshed, with: $0) } ?? refreshed
             if selectedSeasonID == nil { selectedSeasonID = details?.seasons.first?.id }
             if selectedEpisodeID == nil { selectedEpisodeID = details?.seasons.first?.episodes.first?.id }
-            if selectedSourceID == nil { selectedSourceID = details?.sources.first?.id }
+            if selectedSourceID == nil, selectedSourceTitle == nil,
+               let source = activeSources.first { selectSource(source) }
         }
         .task(id: item.id) {
+            publicArtworkImage = nil
+            publicArtworkResolved = false
+            publicArtworkAspectRatio = 1600.0 / 352.0
             personalRating = model.personalRatings[item.id]?.rating
             filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
             hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
             referenceMetadata = model.referenceMetadata(mediaID: item.id)
-            filimoURLText = filimoMetadata?.pageURL.absoluteString ?? ""
-            hexDLURLText = hexDLMetadata?.pageURL.absoluteString ?? ""
-            guard item.isRemote else { return }
-            publicMetadataStatus = "Searching Filimo and HexDL for public Persian details…"
-            async let publicMetadataRefresh = model.refreshPublicTitleMetadata(
-                for: item,
-                includePageDetails: true
-            )
+            savedPersianTitle = model.localizedPersianTitle(mediaID: item.id)
+            if let image = await model.cachedPublicArtwork(mediaID: item.id) {
+                updatePublicArtwork(image)
+                publicArtworkResolved = true
+            }
+            guard item.isRemote else {
+                publicArtworkResolved = true
+                return
+            }
+            async let publicMetadataRefresh = model.refreshPublicTitleMetadata(for: item)
             isLoadingDetails = true
             detailsError = nil
             if let loaded = await model.loadDetails(for: item) {
@@ -7643,7 +7700,7 @@ private struct MediaDetailPage: View {
                 details = resolvedDetails
                 selectedSeasonID = details?.seasons.first?.id
                 selectedEpisodeID = details?.seasons.first?.episodes.first?.id
-                selectedSourceID = details?.sources.first?.id
+                if let source = activeSources.first { selectSource(source) }
                 if let progress = model.consumePendingEpisodeProgress(for: item.id) {
                     selectEpisode(for: progress, in: resolvedDetails)
                 }
@@ -7653,20 +7710,14 @@ private struct MediaDetailPage: View {
                 didLoadDetails = true
             }
             isLoadingDetails = false
-            let refreshSummary = await publicMetadataRefresh
+            _ = await publicMetadataRefresh
             filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
             hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
-            filimoURLText = filimoMetadata?.pageURL.absoluteString ?? filimoURLText
-            hexDLURLText = hexDLMetadata?.pageURL.absoluteString ?? hexDLURLText
-            if refreshSummary.updated > 0 {
-                publicMetadataStatus = "Persian public details were refreshed and saved locally."
-            } else if refreshSummary.attempted > 0 {
-                publicMetadataStatus = "No exact public title match was found. You can paste a page URL below."
-            } else if filimoMetadata != nil || hexDLMetadata != nil {
-                publicMetadataStatus = "Saved public details are up to date."
-            } else {
-                publicMetadataStatus = "Public pages were searched recently."
+            savedPersianTitle = model.localizedPersianTitle(mediaID: item.id)
+            if let image = await model.loadPublicArtwork(mediaID: item.id) {
+                updatePublicArtwork(image)
             }
+            publicArtworkResolved = true
         }
     }
 
@@ -7675,6 +7726,10 @@ private struct MediaDetailPage: View {
             filimoMetadata?.synopsis, hexDLMetadata?.synopsis, details?.description,
             item.synopsis, referenceMetadata?.synopsis
         ])
+    }
+
+    private var displayedPersianTitle: String? {
+        publicMetadataSources.first(where: \.hasPersianTitle)?.title ?? savedPersianTitle
     }
 
     private var publicMetadataSources: [PublicTitleMetadata] {
@@ -7718,8 +7773,19 @@ private struct MediaDetailPage: View {
     }
 
     private var displayedArtworkURL: URL? {
-        referenceMetadata?.posterURL ?? filimoMetadata?.posterURL ?? hexDLMetadata?.posterURL
-            ?? item.artworkURL ?? details?.backdropURL
+        if !publicArtworkResolved {
+            return filimoMetadata?.posterURL ?? hexDLMetadata?.posterURL
+                ?? item.artworkURL ?? referenceMetadata?.posterURL ?? details?.backdropURL
+        }
+        return item.artworkURL ?? referenceMetadata?.posterURL ?? details?.backdropURL
+    }
+
+    private func updatePublicArtwork(_ image: NSImage) {
+        publicArtworkImage = image
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil), cgImage.height > 0 else { return }
+        let ratio = CGFloat(cgImage.width) / CGFloat(cgImage.height)
+        guard ratio.isFinite, (0.35...6.0).contains(ratio) else { return }
+        publicArtworkAspectRatio = ratio
     }
 
     private var personalRatingSection: some View {
@@ -7765,192 +7831,17 @@ private struct MediaDetailPage: View {
         .padding(.horizontal, 36)
     }
 
-    private var publicMetadataSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Persian details and artwork")
-                    .font(.denbox(size: 21, weight: .bold))
-                Text("Denbox checks public Filimo and HexDL pages automatically for loaded titles and when this page opens. Persian descriptions, artwork, release facts, genres, and visible episode details are saved on this Mac.")
-                    .font(.denbox(size: 11))
-                    .foregroundStyle(Color.secondaryText)
-            }
-
-            Button {
-                searchPublicTitlePages()
-            } label: {
-                Label(DenboxLanguage.localizedMessage(isSearchingPublicMetadata ? "Searching public pages…" : "Search public pages"),
-                      systemImage: isSearchingPublicMetadata ? "hourglass" : "magnifyingglass")
-            }
-            .buttonStyle(.bordered)
-            .disabled(isSearchingPublicMetadata || !item.isRemote)
-
-            publicMetadataImportRow(provider: .filimo, urlText: $filimoURLText, metadata: filimoMetadata)
-            publicMetadataImportRow(provider: .hexDL, urlText: $hexDLURLText, metadata: hexDLMetadata)
-
-            let publicEpisodes = uniquePublicStrings(publicMetadataSources.flatMap(\.episodeSnippets), limit: 150)
-            if !publicEpisodes.isEmpty {
-                DisclosureGroup(String(format: DenboxLanguage.localizedMessage("Public episode details (%@)"), String(publicEpisodes.count))) {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 7) {
-                            ForEach(Array(publicEpisodes.enumerated()), id: \.offset) { _, summary in
-                                Text(summary)
-                                    .font(.denbox(size: 11))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 180)
-                }
-                .font(.denbox(size: 11, weight: .medium))
-            }
-
-            if let publicMetadataStatus {
-                Text(DenboxLanguage.localizedMessage(publicMetadataStatus))
-                    .font(.denbox(size: 11))
-                    .foregroundStyle(Color.secondaryText)
-            }
-            Text("Denbox saves only text shown on the public page. Playback and media downloads still come from Simba.")
-                .font(.denbox(size: 10))
-                .foregroundStyle(Color.secondaryText.opacity(0.85))
-        }
-        .padding(18)
-        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 15))
-        .padding(.horizontal, 36)
-    }
-
-    private func searchPublicTitlePages() {
-        guard !isSearchingPublicMetadata, item.isRemote else { return }
-        isSearchingPublicMetadata = true
-        publicMetadataStatus = "Searching Filimo and HexDL for public Persian details…"
-        Task { @MainActor in
-            let result = await model.refreshPublicTitleMetadata(for: item, force: true, includePageDetails: true)
-            filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
-            hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
-            filimoURLText = filimoMetadata?.pageURL.absoluteString ?? filimoURLText
-            hexDLURLText = hexDLMetadata?.pageURL.absoluteString ?? hexDLURLText
-            if result.updated > 0 {
-                publicMetadataStatus = "Persian public details were refreshed and saved locally."
-            } else if result.attempted > 0 {
-                publicMetadataStatus = "No exact public title match was found. You can paste a page URL below."
-            } else if filimoMetadata != nil || hexDLMetadata != nil {
-                publicMetadataStatus = "Saved public details are up to date."
-            } else {
-                publicMetadataStatus = "Public pages were searched recently."
-            }
-            isSearchingPublicMetadata = false
-        }
-    }
-
-    private func publicMetadataImportRow(
-        provider: PublicMetadataProvider,
-        urlText: Binding<String>,
-        metadata: PublicTitleMetadata?
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Text(provider.rawValue)
-                    .font(.denbox(size: 12, weight: .semibold))
-                if let metadata {
-                    Label("Saved", systemImage: "checkmark.circle.fill")
-                        .font(.denbox(size: 9, weight: .medium))
-                        .foregroundStyle(Color.green.opacity(0.9))
-                    Spacer()
-                    Link("Open page", destination: metadata.pageURL)
-                        .font(.denbox(size: 10))
-                } else {
-                    Spacer()
-                }
-            }
-            HStack(spacing: 8) {
-                TextField(DenboxLanguage.localizedMessage(provider == .filimo ? "https://www.filimo.com/m/…" : "Public title page URL on hexdl.com"),
-                          text: urlText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.denbox(size: 11))
-                Button(DenboxLanguage.localizedMessage(metadata == nil ? "Load details" : "Update")) {
-                    beginPublicMetadataImport(provider: provider, rawURL: urlText.wrappedValue)
-                }
-                .buttonStyle(.bordered)
-                .disabled(URL(string: urlText.wrappedValue).map { !provider.accepts($0) } ?? true)
-            }
-
-            if let metadata {
-                HStack(alignment: .top, spacing: 12) {
-                    if let posterURL = metadata.posterURL {
-                        AsyncImage(url: posterURL) { image in
-                            image.resizable().scaledToFill()
-                        } placeholder: {
-                            RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.07))
-                        }
-                        .frame(width: 54, height: 75)
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
-                    }
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(metadata.title)
-                            .font(.denbox(size: 12, weight: .semibold))
-                        if !metadata.synopsis.isEmpty {
-                            Text(metadata.synopsis)
-                                .font(.denbox(size: 11))
-                                .foregroundStyle(Color.secondaryText)
-                                .lineLimit(4)
-                        }
-                        Text(DenboxLanguage.localizedMessage("Updated: \(metadata.importedAt.formatted(date: .abbreviated, time: .shortened)) · \(metadata.imageURLs.count) images"))
-                            .font(.denbox(size: 9))
-                            .foregroundStyle(Color.secondaryText.opacity(0.8))
-                    }
-                    Spacer(minLength: 0)
-                }
-
-                if !metadata.episodeSnippets.isEmpty {
-                    DisclosureGroup(DenboxLanguage.localizedMessage("Visible episode details (\(metadata.episodeSnippets.count))")) {
-                        VStack(alignment: .leading, spacing: 5) {
-                            ForEach(Array(metadata.episodeSnippets.enumerated()), id: \.offset) { _, snippet in
-                                Text(snippet)
-                                    .font(.denbox(size: 10))
-                                    .foregroundStyle(Color.secondaryText)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        .padding(.top, 5)
-                    }
-                    .font(.denbox(size: 10, weight: .medium))
-                }
-
-                if !metadata.visiblePageText.isEmpty {
-                    DisclosureGroup("Visible page text") {
-                        ScrollView {
-                            Text(metadata.visiblePageText)
-                                .font(.denbox(size: 10))
-                                .foregroundStyle(Color.secondaryText)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(maxHeight: 160)
-                        .padding(.top, 5)
-                    }
-                    .font(.denbox(size: 10, weight: .medium))
-                }
-            }
-        }
-        .padding(12)
-        .background(Color.black.opacity(0.2), in: RoundedRectangle(cornerRadius: 11))
-    }
-
-    private func beginPublicMetadataImport(provider: PublicMetadataProvider, rawURL: String) {
-        guard let url = URL(string: rawURL.trimmingCharacters(in: .whitespacesAndNewlines)), provider.accepts(url) else {
-            publicMetadataStatus = "The link must use HTTPS and point to a public title page on \(provider.rawValue)."
-            return
-        }
-        importProvider = provider
-        importURL = url
-        showingPublicMetadataImport = true
-        publicMetadataStatus = nil
-    }
-
     private var hero: some View {
         GeometryReader { proxy in
             ZStack {
                 HeroArtwork(palette: item.palette)
-                if let url = displayedArtworkURL {
+                if let publicArtworkImage {
+                    Image(nsImage: publicArtworkImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .clipped()
+                } else if let url = displayedArtworkURL {
                     AsyncImage(url: url) { image in
                         image.resizable()
                             .scaledToFill()
@@ -7966,7 +7857,7 @@ private struct MediaDetailPage: View {
             .allowsHitTesting(false)
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 370)
+        .aspectRatio(publicArtworkAspectRatio, contentMode: .fit)
         .overlay(alignment: .bottomLeading) {
             VStack(alignment: .leading, spacing: 12) {
                 Text(LocalizedStringKey(item.kind.uppercased()))
@@ -7977,6 +7868,12 @@ private struct MediaDetailPage: View {
                     .font(.denbox(size: 38, weight: .bold))
                     .foregroundStyle(.white)
                     .lineLimit(2)
+                if let displayedPersianTitle, displayedPersianTitle != item.title {
+                    Text(displayedPersianTitle)
+                        .font(.denbox(size: 23, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.86))
+                        .lineLimit(2)
+                }
                 Text(item.subtitle)
                     .font(.denbox(size: 13, weight: .medium))
                     .foregroundStyle(.white.opacity(0.76))
@@ -8011,9 +7908,9 @@ private struct MediaDetailPage: View {
                         Menu {
                             ForEach(activeSources) { source in
                                 Button {
-                                    selectedSourceID = source.id
+                                    selectSource(source)
                                 } label: {
-                                    if selectedSourceID == source.id {
+                                    if selectedSource?.id == source.id {
                                         Label(source.title, systemImage: "checkmark")
                                     } else {
                                         Text(source.title)
@@ -8382,7 +8279,11 @@ private struct MediaDetailPage: View {
             title: offlineTitle
         )
         return HStack(spacing: 14) {
-            Button { selectedEpisodeID = episode.id; selectedSourceID = nil } label: {
+            Button {
+                selectedEpisodeID = episode.id
+                selectedSourceID = nil
+                selectedSourceTitle = nil
+            } label: {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 9) {
                         Text(episode.episodeLabel)
@@ -8532,8 +8433,24 @@ private struct MediaDetailPage: View {
     }
 
     private var selectedSource: MediaStreamSource? {
-        if let selectedSourceID, let match = activeSources.first(where: { $0.id == selectedSourceID }) { return match }
-        return activeSources.first
+        MediaStreamSourceSelection.preferred(
+            in: activeSources,
+            selectedID: selectedSourceID,
+            selectedTitle: selectedSourceTitle
+        )
+    }
+
+    private func preferredSource(in sources: [MediaStreamSource]) -> MediaStreamSource? {
+        MediaStreamSourceSelection.preferred(
+            in: sources,
+            selectedID: selectedSourceID,
+            selectedTitle: selectedSourceTitle
+        )
+    }
+
+    private func selectSource(_ source: MediaStreamSource) {
+        selectedSourceID = source.id
+        selectedSourceTitle = source.title
     }
 
     private var playbackTitle: String {
@@ -8607,6 +8524,8 @@ private struct MediaDetailPage: View {
         guard let found else { return }
         selectedSeasonID = found.season.id
         selectedEpisodeID = found.episode.id
+        selectedSourceID = nil
+        selectedSourceTitle = nil
     }
 
     private func refreshActionDetails() async -> MediaDetails? {
@@ -8617,7 +8536,6 @@ private struct MediaDetailPage: View {
         referenceMetadata = model.referenceMetadata(mediaID: item.id)
         let enriched = referenceMetadata.map { ReferenceMetadataService.enrich(refreshed, with: $0) } ?? refreshed
         details = enriched
-        selectedSourceID = nil
         if selectedSeasonID == nil { selectedSeasonID = enriched.seasons.first?.id }
         if selectedEpisodeID == nil { selectedEpisodeID = enriched.seasons.first?.episodes.first?.id }
         return enriched
@@ -8632,7 +8550,7 @@ private struct MediaDetailPage: View {
             selectedSeasonID = match.season.id
             selectedEpisodeID = match.episode.id
             let sources = uniqueSources(match.episode.sources + match.episode.downloadSources)
-            guard let source = sources.first else {
+            guard let source = preferredSource(in: sources) else {
                 actionMessage = "No active playback source was found to play this episode."
                 return
             }
@@ -8640,7 +8558,7 @@ private struct MediaDetailPage: View {
             return
         }
         let sources = uniqueSources((resolvedDetails?.sources ?? []) + (resolvedDetails?.downloadSources ?? []))
-        guard let source = sources.first else {
+        guard let source = preferredSource(in: sources) else {
             actionMessage = "No active playback source was found to play this title."
             return
         }
@@ -8649,6 +8567,7 @@ private struct MediaDetailPage: View {
 
     private func playEpisode(_ episode: MediaEpisode) async {
         actionMessage = nil
+        let wasSelectedEpisode = selectedEpisodeID == episode.id
         let resolvedDetails = await refreshActionDetails() ?? details
         guard let resolvedDetails, let match = matchingEpisode(episode, in: resolvedDetails) else {
             actionMessage = "This episode was not found in the refreshed season list."
@@ -8656,8 +8575,12 @@ private struct MediaDetailPage: View {
         }
         selectedSeasonID = match.season.id
         selectedEpisodeID = match.episode.id
+        if !wasSelectedEpisode {
+            selectedSourceID = nil
+            selectedSourceTitle = nil
+        }
         let sources = uniqueSources(match.episode.sources + match.episode.downloadSources)
-        guard let source = sources.first else {
+        guard let source = preferredSource(in: sources) else {
             actionMessage = "No active playback source was found to play this episode."
             return
         }
@@ -8678,7 +8601,7 @@ private struct MediaDetailPage: View {
             return
         }
         selectedSeasonID = season.id
-        let summary = downloadManager.enqueueSeason(season, series: item)
+        let summary = downloadManager.enqueueSeason(season, series: item, preferredQuality: selectedSourceTitle)
         actionMessage = String(format: "Season downloads: %d added · %d unavailable · %d already queued or downloaded",
                                summary.queued, summary.unavailable, summary.alreadyQueuedOrDownloaded)
     }
@@ -8687,6 +8610,7 @@ private struct MediaDetailPage: View {
         actionMessage = nil
         var resolvedTitle = title
         var resolvedEpisodeID = episodeID
+        let requestedTitle = source?.title ?? selectedSourceTitle
         let current = source.map { [$0] } ?? sources
         var downloadable = directDownloadSources(current)
         if downloadable.isEmpty, item.isRemote {
@@ -8704,7 +8628,11 @@ private struct MediaDetailPage: View {
                 downloadable = directDownloadSources(refreshed.downloadSources + refreshed.sources)
             }
         }
-        guard let resolvedSource = downloadable.first else {
+        guard let resolvedSource = MediaStreamSourceSelection.preferred(
+            in: downloadable,
+            selectedID: source?.id ?? selectedSourceID,
+            selectedTitle: requestedTitle
+        ) else {
             actionMessage = "No direct download link is available. Adaptive HLS or DASH links cannot be saved as a single video file."
             return
         }
@@ -8723,37 +8651,47 @@ private struct MediaDetailPage: View {
         episodeID: String? = nil
     ) -> some View {
         let directSources = directDownloadSources(sources)
-        if directSources.count == 1, let source = directSources.first {
+        let selectedDownloadSource = preferredSource(in: directSources)
+        HStack(spacing: 3) {
             Button {
-                Task { await enqueueDownload(source: source, sources: sources, title: title, episodeID: episodeID) }
-            } label: {
-                Label(label, systemImage: "arrow.down.to.line")
-            }
-            .buttonStyle(.bordered)
-            .tint(.white)
-            .disabled(isRefreshingActionLinks)
-        } else if directSources.count > 1 {
-            Menu {
-                ForEach(directSources) { source in
-                    Button(source.title) {
-                        Task { await enqueueDownload(source: source, sources: sources, title: title, episodeID: episodeID) }
-                    }
+                Task {
+                    await enqueueDownload(
+                        source: selectedDownloadSource,
+                        sources: sources,
+                        title: title,
+                        episodeID: episodeID
+                    )
                 }
             } label: {
                 Label(label, systemImage: "arrow.down.to.line")
             }
             .buttonStyle(.bordered)
             .tint(.white)
-            .disabled(isRefreshingActionLinks)
-        } else {
-            Button {
-                Task { await enqueueDownload(source: nil, sources: sources, title: title, episodeID: episodeID) }
-            } label: {
-                Label(label, systemImage: "arrow.down.to.line")
+            .disabled(isRefreshingActionLinks || (!item.isRemote && selectedDownloadSource == nil))
+            .help(selectedDownloadSource?.title ?? DenboxLanguage.localizedMessage("Refresh download links"))
+
+            if directSources.count > 1 {
+                Menu {
+                    ForEach(directSources) { source in
+                        Button {
+                            selectSource(source)
+                            Task { await enqueueDownload(source: source, sources: sources, title: title, episodeID: episodeID) }
+                        } label: {
+                            if selectedDownloadSource?.id == source.id {
+                                Label(source.title, systemImage: "checkmark")
+                            } else {
+                                Text(source.title)
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .frame(width: 23, height: 25)
+                }
+                .menuStyle(.borderlessButton)
+                .help(DenboxLanguage.localizedMessage("Choose download quality"))
+                .disabled(isRefreshingActionLinks)
             }
-            .buttonStyle(.bordered)
-            .tint(.white)
-            .disabled(isRefreshingActionLinks || !item.isRemote)
         }
     }
 }
@@ -8779,6 +8717,11 @@ private struct PlayerWindowHost: View {
 }
 
 private struct LocalPlayerSheet: View {
+    private enum CurrentFileRemovalMode: Equatable {
+        case trash
+        case permanent
+    }
+
     @EnvironmentObject private var model: LibraryModel
     @Environment(\.dismiss) private var dismiss
     @StateObject private var playback = MPVPlaybackController()
@@ -8787,6 +8730,7 @@ private struct LocalPlayerSheet: View {
     @State private var currentHeaders: [String: String]
 
     @State private var didAutoRefreshSource = false
+    @State private var attemptedPlaybackSourceURLs: Set<String> = []
     @State private var isRefreshingSource = false
     @State private var isScrubbing = false
     @State private var scrubPosition = 0.0
@@ -8804,13 +8748,23 @@ private struct LocalPlayerSheet: View {
     @State private var aspectRatio = "no"
     @State private var cropAspect = "no"
     @State private var showPlayerAdjustments = false
+    @State private var showFilterEditor = false
+    @State private var filterKind: MPVFilterKind = .video
+    @State private var filterName = ""
+    @State private var filterExpression = ""
+    @State private var filterEditorMessage: String?
     @State private var rotation = 0
     @State private var loopsCurrentFile = false
     @State private var playbackSpeed = 1.0
+    @State private var playerWindowScale = 1.0
     @State private var controlsHidden = false
-    @State private var isPointerOverControls = false
     @State private var controlsHideTask: Task<Void, Never>?
+    @State private var lastPlayerHoverLocation: CGPoint?
     @State private var showPlaylist = false
+    @State private var playlistMessage: String?
+    @State private var showingFileRemovalConfirmation = false
+    @State private var pendingFileRemovalMode: CurrentFileRemovalMode?
+    @State private var fileActionError: String?
     @State private var showPlaybackInfo = false
     @State private var showingOnlineSubtitles = false
     @State private var pictureInPictureUnavailable = false
@@ -8824,18 +8778,30 @@ private struct LocalPlayerSheet: View {
     var body: some View {
         playerScene
         .onAppear {
+            attemptedPlaybackSourceURLs = [currentURL.absoluteString]
             scrubPosition = model.startPlaybackSession(playerKind: "Denbox Player", localURL: currentURL)
+            playback.updateNowPlayingTitle(currentTitle)
             playback.onProgress = { position, duration, delta in
                 model.recordPlaybackProgress(position: position, duration: duration, watchedDelta: delta)
             }
             playback.onUserActivity = { showPlayerControls() }
             playback.onToggleFullscreen = { playback.toggleFullscreen() }
+            playback.onTogglePictureInPicture = { toggleSystemPictureInPicture() }
+            playback.onFindOnlineSubtitles = { showingOnlineSubtitles = true }
+            playback.onSetWindowScale = { scale in
+                playerWindowScale = scale
+                Task { @MainActor in
+                    await Task.yield()
+                    playback.setWindowScale(scale)
+                }
+            }
             playback.onScreenshotRequested = { includeSubtitles in saveScreenshot(includeSubtitles: includeSubtitles) }
             playback.onCloseRequested = { dismiss() }
             playback.onTogglePlaybackInfo = { showPlaybackInfo.toggle() }
             playback.onToggleControls = {
                 controlsHideTask?.cancel()
                 controlsHidden.toggle()
+                NSCursor.setHiddenUntilMouseMoves(controlsHidden)
                 if !controlsHidden { scheduleControlsHide() }
             }
             playback.setSubtitlePosition(subtitlePosition)
@@ -8847,6 +8813,7 @@ private struct LocalPlayerSheet: View {
             playback.setSubtitleASSOverride(subtitleASSOverride)
             _ = playback.setAudioDevice(audioOutputDeviceID)
             playback.play(currentURL, headers: currentHeaders, startAtSeconds: scrubPosition)
+            scheduleControlsHide()
         }
         .onChange(of: model.playerRequestID) { _ in
             guard let nextURL = model.playerURL else { return }
@@ -8855,6 +8822,7 @@ private struct LocalPlayerSheet: View {
             currentTitle = model.playerTitle
             currentHeaders = model.playerHeaders
             didAutoRefreshSource = false
+            attemptedPlaybackSourceURLs = [nextURL.absoluteString]
             isRefreshingSource = false
             isScrubbing = false
             scrubPosition = model.startPlaybackSession(
@@ -8871,7 +8839,10 @@ private struct LocalPlayerSheet: View {
             if isMiniPlayer { showPlayerControls() }
             else { scheduleControlsHide() }
         }
-        .onChange(of: currentTitle) { playback.updateMiniPlayerTitle($0) }
+        .onChange(of: currentTitle) { title in
+            playback.updateMiniPlayerTitle(title)
+            playback.updateNowPlayingTitle(title)
+        }
         .onChange(of: playback.currentTimeSeconds) { value in
             if !isScrubbing { scrubPosition = value }
         }
@@ -8890,15 +8861,21 @@ private struct LocalPlayerSheet: View {
         .onChange(of: subtitleFont) { playback.setSubtitleFont($0) }
         .onChange(of: subtitleASSOverride) { playback.setSubtitleASSOverride($0) }
         .onChange(of: playback.errorMessage) { error in
-            guard error != nil, !currentURL.isFileURL, !didAutoRefreshSource,
+            guard let error,
+                  error.localizedCaseInsensitiveContains("loading failed")
+                    || error.localizedCaseInsensitiveContains("source could not be opened"),
+                  !currentURL.isFileURL,
                   model.hasActiveRemotePlayback else { return }
-            didAutoRefreshSource = true
-            refreshPlaybackSource()
+            refreshPlaybackSource(forceRefresh: false)
         }
         .onDisappear {
             controlsHideTask?.cancel()
+            NSCursor.setHiddenUntilMouseMoves(false)
             playback.onUserActivity = nil
             playback.onToggleFullscreen = nil
+            playback.onTogglePictureInPicture = nil
+            playback.onFindOnlineSubtitles = nil
+            playback.onSetWindowScale = nil
             playback.onScreenshotRequested = nil
             playback.onCloseRequested = nil
             playback.onTogglePlaybackInfo = nil
@@ -8924,6 +8901,24 @@ private struct LocalPlayerSheet: View {
         ZStack {
             Color.black
             MPVVideoView(controller: playback)
+
+            if playback.isMusicMode {
+                VStack(spacing: 18) {
+                    Image(systemName: "music.note.tv.fill")
+                        .font(.system(size: 44, weight: .light))
+                        .foregroundStyle(.white.opacity(0.78))
+                    Text(currentTitle)
+                        .font(.denbox(size: 22, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.black)
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
 
             if playback.isLoading {
                 ProgressView("Loading media…")
@@ -9043,10 +9038,41 @@ private struct LocalPlayerSheet: View {
         }
         .animation(.easeOut(duration: 0.2), value: controlsHidden)
         .animation(.easeInOut(duration: 0.22), value: playback.isInMiniPlayerMode)
-        .onHover { hovering in if hovering { showPlayerControls() } }
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let location):
+                let moved = PlayerControlsAutoHidePolicy.pointerMoved(
+                    from: lastPlayerHoverLocation,
+                    to: location
+                )
+                lastPlayerHoverLocation = location
+                if moved { showPlayerControls() }
+            case .ended:
+                lastPlayerHoverLocation = nil
+            }
+        }
+        .confirmationDialog("Confirm file action", isPresented: $showingFileRemovalConfirmation,
+                            titleVisibility: .visible) {
+            Button(pendingFileRemovalMode == .permanent ? "Delete Permanently" : "Move to Trash",
+                   role: .destructive) {
+                removeCurrentFile(permanently: pendingFileRemovalMode == .permanent)
+                pendingFileRemovalMode = nil
+            }
+            Button("Cancel", role: .cancel) { pendingFileRemovalMode = nil }
+        } message: {
+            Text(currentURL.lastPathComponent)
+        }
+        .alert("File action failed", isPresented: Binding(
+            get: { fileActionError != nil },
+            set: { if !$0 { fileActionError = nil } }
+        )) {
+            Button("OK", role: .cancel) { fileActionError = nil }
+        } message: {
+            Text(DenboxLanguage.localizedMessage(fileActionError ?? ""))
+        }
         .frame(
-            minWidth: playback.isInMiniPlayerMode ? 420 : 1024,
-            minHeight: playback.isInMiniPlayerMode ? 280 : 640
+            minWidth: playback.isInMiniPlayerMode ? 420 : CGFloat(1024 * playerWindowScale),
+            minHeight: playback.isInMiniPlayerMode ? 280 : CGFloat(640 * playerWindowScale)
         )
         .background(.black)
         .preferredColorScheme(.dark)
@@ -9054,24 +9080,49 @@ private struct LocalPlayerSheet: View {
 
     private func showPlayerControls() {
         controlsHideTask?.cancel()
+        NSCursor.setHiddenUntilMouseMoves(false)
         controlsHidden = false
         scheduleControlsHide()
     }
 
     private func scheduleControlsHide() {
         controlsHideTask?.cancel()
-        guard playback.isPlaying, !isPointerOverControls, !showPlayerAdjustments else { return }
+        guard PlayerControlsAutoHidePolicy.shouldHide(
+            isScrubbing: isScrubbing,
+            hasOpenAdjustments: showPlayerAdjustments
+        ) else { return }
         controlsHideTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard !Task.isCancelled, playback.isPlaying, !isPointerOverControls, !showPlayerAdjustments else { return }
+            try? await Task.sleep(nanoseconds: PlayerControlsAutoHidePolicy.idleDelayNanoseconds)
+            guard !Task.isCancelled,
+                  PlayerControlsAutoHidePolicy.shouldHide(
+                    isScrubbing: isScrubbing,
+                    hasOpenAdjustments: showPlayerAdjustments
+                  ) else { return }
             controlsHidden = true
+            NSCursor.setHiddenUntilMouseMoves(playback.isPointerInsidePlayerWindow())
+        }
+    }
+
+    private func playerScrubbingChanged(_ editing: Bool) {
+        isScrubbing = editing
+        if editing {
+            showPlayerControls()
+        } else {
+            playback.seek(to: scrubPosition)
+            scheduleControlsHide()
         }
     }
 
     private func pointerEnteredControls(_ hovering: Bool) {
-        isPointerOverControls = hovering
         if hovering { showPlayerControls() }
-        else { scheduleControlsHide() }
+    }
+
+    private func toggleSystemPictureInPicture() {
+        if playback.isInSystemPictureInPictureMode {
+            _ = playback.exitSystemPictureInPicture()
+        } else if !playback.enterSystemPictureInPicture(title: currentTitle) {
+            pictureInPictureUnavailable = true
+        }
     }
 
     private var topBar: some View {
@@ -9099,9 +9150,27 @@ private struct LocalPlayerSheet: View {
                 .frame(width: 30, height: 28)
                 .help("Subtitle color")
             playlistControl
+            Menu {
+                Button("Move current file to Trash", role: .destructive) {
+                    pendingFileRemovalMode = .trash
+                    showingFileRemovalConfirmation = true
+                }
+                .disabled(!canRemoveCurrentFile)
+                Button("Delete current file permanently", role: .destructive) {
+                    pendingFileRemovalMode = .permanent
+                    showingFileRemovalConfirmation = true
+                }
+                .disabled(!canRemoveCurrentFile)
+            } label: {
+                Image(systemName: "trash")
+                    .frame(width: 30, height: 30)
+            }
+            .buttonStyle(.plain)
+            .help(DenboxLanguage.localizedMessage("File actions"))
             trackMenu
             subtitleMenu
             aspectMenu
+            filterMenu
             pictureMenu
             Button {
                 rotation = (rotation + 90) % 360
@@ -9114,14 +9183,13 @@ private struct LocalPlayerSheet: View {
             .help("Rotate video")
             Menu {
                 Button(playback.isInSystemPictureInPictureMode ? "Close Picture in Picture" : "Picture in Picture") {
-                    if playback.isInSystemPictureInPictureMode {
-                        _ = playback.exitSystemPictureInPicture()
-                    } else if !playback.enterSystemPictureInPicture(title: currentTitle) {
-                        pictureInPictureUnavailable = true
-                    }
+                    toggleSystemPictureInPicture()
                 }
                 Button("Open mini player") {
                     _ = playback.enterMiniPlayer(title: currentTitle)
+                }
+                Button(playback.isMusicMode ? "Exit Music Mode" : "Music Mode") {
+                    playback.toggleMusicMode()
                 }
             } label: {
                 Image(systemName: "pip")
@@ -9195,8 +9263,7 @@ private struct LocalPlayerSheet: View {
             }
             HStack(spacing: 8) {
                 Slider(value: $scrubPosition, in: 0...max(playback.durationSeconds ?? 1, 1)) { editing in
-                    isScrubbing = editing
-                    if !editing { playback.seek(to: scrubPosition) }
+                    playerScrubbingChanged(editing)
                 }
                 .disabled(playback.durationSeconds == nil)
                 Text(Self.timeLabel(playback.durationSeconds ?? 0))
@@ -9316,8 +9383,7 @@ private struct LocalPlayerSheet: View {
                     .font(.denbox(size: 10))
                     .foregroundStyle(.white.opacity(0.78))
                 Slider(value: $scrubPosition, in: 0...max(playback.durationSeconds ?? 1, 1)) { editing in
-                    isScrubbing = editing
-                    if !editing { playback.seek(to: scrubPosition) }
+                    playerScrubbingChanged(editing)
                 }
                 .disabled(playback.durationSeconds == nil)
                 Text(Self.timeLabel(playback.durationSeconds ?? 0))
@@ -9355,15 +9421,31 @@ private struct LocalPlayerSheet: View {
                     Text("Playlist").font(.denbox(size: 14, weight: .semibold))
                     Spacer()
                     Button { choosePlaylistFiles() } label: {
-                        Label("Add videos", systemImage: "plus")
+                        Label("Add videos or playlist", systemImage: "plus")
                     }
                     .buttonStyle(.bordered)
+                    Button { savePlaylistToFile() } label: {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(playback.playlist.isEmpty)
+                    .help(DenboxLanguage.localizedMessage("Save playlist"))
                     Button { playback.shufflePlaylist() } label: {
                         Image(systemName: "shuffle")
                     }
                     .buttonStyle(.bordered)
                     .disabled(playback.playlist.count < 2)
                     .help(DenboxLanguage.localizedMessage("Shuffle playlist"))
+                    Button { playback.togglePlaylistLoop() } label: {
+                        Image(systemName: "repeat")
+                            .foregroundStyle(playback.isPlaylistLoopEnabled ? Color.accentColor : Color.primary)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(playback.playlist.isEmpty)
+                    .help(DenboxLanguage.localizedMessage(
+                        playback.isPlaylistLoopEnabled ? "Stop looping playlist" : "Loop playlist"
+                    ))
+                    .accessibilityLabel(DenboxLanguage.localizedMessage("Loop playlist"))
                 }
 
                 if playback.playlist.isEmpty {
@@ -9415,6 +9497,13 @@ private struct LocalPlayerSheet: View {
                         }
                     }
                 }
+
+                if let playlistMessage {
+                    Text(DenboxLanguage.localizedMessage(playlistMessage))
+                        .font(.denbox(size: 11))
+                        .foregroundStyle(Color.secondaryText)
+                        .lineLimit(2)
+                }
             }
             .padding(12)
             .frame(width: 430, height: 330)
@@ -9424,15 +9513,50 @@ private struct LocalPlayerSheet: View {
 
     private func choosePlaylistFiles() {
         let panel = NSOpenPanel()
-        panel.title = DenboxLanguage.localizedMessage("Add videos to playlist")
+        panel.title = DenboxLanguage.localizedMessage("Add videos or playlist")
         panel.prompt = DenboxLanguage.localizedMessage("Add")
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie]
+        let playlistTypes = MPVPlaylistDocument.chooserExtensions.compactMap {
+            UTType(filenameExtension: $0)
+        }
+        panel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie] + playlistTypes
         panel.begin { response in
             guard response == .OK else { return }
-            DispatchQueue.main.async { playback.appendLocalFilesToPlaylist(panel.urls) }
+            DispatchQueue.main.async {
+                do {
+                    let urls = try MPVPlaylistDocument.urls(from: panel.urls)
+                    guard !urls.isEmpty else {
+                        playlistMessage = "The playlist is empty."
+                        return
+                    }
+                    playback.appendURLsToPlaylist(urls)
+                    playlistMessage = nil
+                } catch {
+                    playlistMessage = "Could not open playlist."
+                }
+            }
+        }
+    }
+
+    private func savePlaylistToFile() {
+        let panel = NSSavePanel()
+        panel.title = DenboxLanguage.localizedMessage("Save to playlist")
+        panel.prompt = DenboxLanguage.localizedMessage("Save")
+        panel.nameFieldStringValue = "Playlist.m3u8"
+        panel.allowedContentTypes = [UTType(filenameExtension: "m3u8")].compactMap { $0 }
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            DispatchQueue.main.async {
+                do {
+                    try playback.savePlaylist(to: url)
+                    playlistMessage = "Playlist saved."
+                } catch {
+                    playlistMessage = "Could not save playlist."
+                }
+            }
         }
     }
 
@@ -9445,6 +9569,21 @@ private struct LocalPlayerSheet: View {
             Button("Disable subtitles") { playback.selectSubtitle(nil) }
             Button(playback.subtitleVisibility ? "Hide subtitles" : "Show subtitles") {
                 playback.toggleSubtitleVisibility()
+            }
+            .keyboardShortcut("v", modifiers: [])
+            Divider()
+            Section("Subtitle encoding") {
+                ForEach(MPVSubtitleEncoding.options) { encoding in
+                    Button {
+                        _ = playback.setSubtitleEncoding(encoding.codepage)
+                    } label: {
+                        if playback.subtitleEncoding.caseInsensitiveCompare(encoding.codepage) == .orderedSame {
+                            Label(DenboxLanguage.localizedMessage(encoding.title), systemImage: "checkmark")
+                        } else {
+                            Text(DenboxLanguage.localizedMessage(encoding.title))
+                        }
+                    }
+                }
             }
             if !playback.subtitleOptions.isEmpty {
                 Divider()
@@ -9471,14 +9610,17 @@ private struct LocalPlayerSheet: View {
                 subtitleDelaySeconds += 0.5
                 playback.setSubtitleDelay(subtitleDelaySeconds)
             }
+            .keyboardShortcut("x", modifiers: [])
             Button("Advance subtitles by 0.5 seconds") {
                 subtitleDelaySeconds -= 0.5
                 playback.setSubtitleDelay(subtitleDelaySeconds)
             }
+            .keyboardShortcut("z", modifiers: [])
             Button("Reset subtitle timing") {
                 subtitleDelaySeconds = 0
                 playback.setSubtitleDelay(0)
             }
+            .keyboardShortcut("c", modifiers: [])
             Divider()
             Button("Increase subtitle size") {
                 subtitleScale = min(3, subtitleScale * 1.1)
@@ -9498,6 +9640,24 @@ private struct LocalPlayerSheet: View {
             }
             Button("Make subtitle background more transparent") {
                 subtitleBackgroundOpacity = max(0, subtitleBackgroundOpacity - 0.1)
+            }
+            Menu("Keyboard shortcuts") {
+                Section("Subtitles") {
+                    Button("Next subtitle track — J") {}.disabled(true)
+                    Button("Previous subtitle track — Shift+J") {}.disabled(true)
+                    Button("Show or hide subtitles — V") {}.disabled(true)
+                    Button("Cycle subtitle tracks — Control+Command+S") {}.disabled(true)
+                    Button("Seek subtitle — Shift+← / Shift+→") {}.disabled(true)
+                    Button("Online subtitle search — Command+D") {}.disabled(true)
+                }
+                Section("Synchronization") {
+                    Button("Subtitle sync ±0.5 s — Z / X") {}.disabled(true)
+                    Button("Fine subtitle sync ±0.1 s — Option+Z / Option+X") {}.disabled(true)
+                    Button("Reset subtitle sync — C") {}.disabled(true)
+                    Button("Audio sync ±0.5 s — Shift+9 / Shift+0") {}.disabled(true)
+                    Button("Fine audio sync ±0.1 s — Option+Shift+9 / Option+Shift+0") {}.disabled(true)
+                    Button("Reset audio sync — Shift+-") {}.disabled(true)
+                }
             }
         } label: {
             Label("Subtitles", systemImage: "captions.bubble")
@@ -9640,6 +9800,19 @@ private struct LocalPlayerSheet: View {
                         .pickerStyle(.segmented)
                     }
 
+                    GroupBox("Video orientation") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle("Flip vertically", isOn: Binding(
+                                get: { playback.isVerticallyFlipped },
+                                set: { _ = playback.setVerticalFlip($0) }
+                            ))
+                            Toggle("Mirror horizontally", isOn: Binding(
+                                get: { playback.isHorizontallyMirrored },
+                                set: { _ = playback.setHorizontalMirror($0) }
+                            ))
+                        }
+                    }
+
                     Toggle("Deinterlace", isOn: Binding(
                         get: { playback.isDeinterlacing },
                         set: { playback.setDeinterlacing($0) }
@@ -9743,6 +9916,147 @@ private struct LocalPlayerSheet: View {
         }
     }
 
+    private var filterMenu: some View {
+        Button { showFilterEditor.toggle() } label: {
+            Image(systemName: "camera.filters")
+                .frame(width: 30, height: 30)
+        }
+        .buttonStyle(.plain)
+        .help(DenboxLanguage.localizedMessage("Audio and video filters"))
+        .popover(isPresented: $showFilterEditor, arrowEdge: .bottom) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Audio and video filters")
+                        .font(.denbox(size: 15, weight: .semibold))
+
+                    Picker("Filter type", selection: $filterKind) {
+                        ForEach(MPVFilterKind.allCases) { kind in
+                            Text(DenboxLanguage.localizedMessage(kind.title)).tag(kind)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    GroupBox("Built-in presets") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(MPVFilterPresetStore.builtIn.filter { $0.kind == filterKind }) { preset in
+                                Button {
+                                    filterEditorMessage = playback.addFilter(preset)
+                                        ? "Filter added"
+                                        : "Could not add filter. Check that the current media supports it."
+                                } label: {
+                                    Label(DenboxLanguage.localizedMessage(preset.name), systemImage: "plus.circle")
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+
+                    if !playback.savedFilterPresets.isEmpty {
+                        GroupBox("Saved filters") {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(playback.savedFilterPresets.filter { $0.kind == filterKind }) { preset in
+                                    HStack(spacing: 8) {
+                                        Button {
+                                            filterEditorMessage = playback.addFilter(preset)
+                                                ? "Filter added"
+                                                : "Could not add filter. Check that the current media supports it."
+                                        } label: {
+                                            Text(preset.name)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                        .buttonStyle(.plain)
+                                        Button(role: .destructive) {
+                                            playback.deleteFilterPreset(preset)
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .help("Delete filter preset")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    GroupBox("Custom mpv filter") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            TextField("Filter name", text: $filterName)
+                            TextField("MPV filter expression", text: $filterExpression, axis: .vertical)
+                                .font(.system(.body, design: .monospaced))
+                                .lineLimit(1...3)
+                            HStack {
+                                Button("Save preset") {
+                                    guard playback.saveFilterPreset(name: filterName, kind: filterKind, expression: filterExpression) else {
+                                        filterEditorMessage = "Enter a name and a valid filter expression."
+                                        return
+                                    }
+                                    filterEditorMessage = "Filter preset saved"
+                                }
+                                .disabled(filterName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                                          filterExpression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                Spacer()
+                                Button("Add filter") {
+                                    let preset = MPVFilterPreset(
+                                        id: UUID().uuidString,
+                                        name: filterName,
+                                        kind: filterKind,
+                                        expression: filterExpression
+                                    )
+                                    filterEditorMessage = playback.addFilter(preset)
+                                        ? "Filter added"
+                                        : "Could not add filter. Check that the current media supports it."
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(filterExpression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                        }
+                    }
+
+                    if let filterEditorMessage {
+                        Text(DenboxLanguage.localizedMessage(filterEditorMessage))
+                            .font(.denbox(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    GroupBox("Active filters") {
+                        if playback.activeFilters.isEmpty {
+                            Text("No filters applied")
+                                .font(.denbox(size: 11))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            VStack(alignment: .leading, spacing: 7) {
+                                ForEach(playback.activeFilters) { filter in
+                                    HStack(alignment: .top, spacing: 8) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(filter.name).font(.denbox(size: 12, weight: .medium))
+                                            Text(filter.expression)
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(2)
+                                        }
+                                        Spacer(minLength: 0)
+                                        Button(role: .destructive) {
+                                            _ = playback.removeFilter(filter)
+                                        } label: {
+                                            Image(systemName: "xmark.circle")
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .help("Remove filter")
+                                    }
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(14)
+            }
+            .frame(width: 420, height: 590)
+        }
+    }
+
     private func videoAdjustmentBinding(_ property: String) -> Binding<Double> {
         Binding(get: { videoAdjustmentValue(property) }, set: { playback.setVideoAdjustment(property, value: $0) })
     }
@@ -9805,6 +10119,69 @@ private struct LocalPlayerSheet: View {
         }
     }
 
+    private var canRemoveCurrentFile: Bool {
+        guard currentURL.isFileURL,
+              let values = try? currentURL.resourceValues(forKeys: [.isRegularFileKey]) else { return false }
+        return values.isRegularFile == true
+    }
+
+    private func removeCurrentFile(permanently: Bool) {
+        guard canRemoveCurrentFile else {
+            fileActionError = "Current file must be a local file."
+            return
+        }
+
+        let removedURL = currentURL.standardizedFileURL
+        playback.flushWatchProgress()
+        do {
+            if permanently {
+                try FileManager.default.removeItem(at: removedURL)
+            } else {
+                try FileManager.default.trashItem(at: removedURL, resultingItemURL: nil)
+            }
+        } catch {
+            fileActionError = permanently
+                ? "Could not delete current file: \(error.localizedDescription)"
+                : "Could not move current file to Trash: \(error.localizedDescription)"
+            return
+        }
+
+        model.finishPlaybackSession(position: playback.currentTimeSeconds, duration: playback.durationSeconds)
+        guard let next = playback.removeCurrentPlaylistEntryAndAdvance(),
+              let nextURL = Self.playlistURL(from: next.filename) else {
+            playback.stop()
+            dismiss()
+            return
+        }
+
+        currentURL = nextURL
+        currentTitle = next.title
+        currentHeaders = [:]
+        model.playerTitle = next.title
+        didAutoRefreshSource = false
+        attemptedPlaybackSourceURLs = [nextURL.absoluteString]
+        isRefreshingSource = false
+        loopsCurrentFile = false
+        playback.setFileLoop(false)
+        playback.clearABLoop()
+        scrubPosition = model.startPlaybackSession(
+            playerKind: "Denbox Player",
+            localURL: nextURL.isFileURL ? nextURL : nil
+        )
+        playback.setPendingResumePosition(scrubPosition)
+        showPlayerControls()
+    }
+
+    private static func playlistURL(from filename: String) -> URL? {
+        if let url = URL(string: filename),
+           let scheme = url.scheme?.lowercased(),
+           ["file", "http", "https"].contains(scheme) {
+            return url
+        }
+        guard filename.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: filename)
+    }
+
     private func saveScreenshot(includeSubtitles: Bool = true) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
@@ -9824,6 +10201,7 @@ private struct LocalPlayerSheet: View {
         currentTitle = model.playerTitle
         currentHeaders = model.playerHeaders
         didAutoRefreshSource = false
+        attemptedPlaybackSourceURLs = [nextURL.absoluteString]
         isRefreshingSource = false
         loopsCurrentFile = false
         playback.setFileLoop(false)
@@ -9832,15 +10210,27 @@ private struct LocalPlayerSheet: View {
         playback.retry(currentURL, headers: currentHeaders, startAtSeconds: scrubPosition)
     }
 
-    private func refreshPlaybackSource() {
+    private func refreshPlaybackSource(forceRefresh: Bool = true) {
         guard !isRefreshingSource, model.hasActiveRemotePlayback else { return }
         isRefreshingSource = true
+        var attempted = attemptedPlaybackSourceURLs
+        attempted.insert(currentURL.absoluteString)
         Task { @MainActor in
-            let source = await model.refreshActivePlaybackSource()
-            isRefreshingSource = false
-            if let source {
-                playback.retry(source.url, headers: source.headers, startAtSeconds: playback.currentTimeSeconds)
+            if forceRefresh { didAutoRefreshSource = true }
+            var sources = await model.activePlaybackSources(forceRefresh: forceRefresh)
+            var nextSource = PlaybackSourceFallbackPolicy.nextSource(from: sources, excluding: attempted)
+            if nextSource == nil, !forceRefresh, !didAutoRefreshSource {
+                didAutoRefreshSource = true
+                sources = await model.activePlaybackSources(forceRefresh: true)
+                nextSource = PlaybackSourceFallbackPolicy.nextSource(from: sources, excluding: attempted)
             }
+            isRefreshingSource = false
+            guard let source = nextSource else { return }
+            attemptedPlaybackSourceURLs.insert(source.url.absoluteString)
+            model.useActivePlaybackSource(source)
+            currentURL = source.url
+            currentHeaders = source.headers
+            playback.retry(source.url, headers: source.headers, startAtSeconds: playback.currentTimeSeconds)
         }
     }
 
@@ -9866,6 +10256,8 @@ private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(DenboxLanguage.preferenceKey) private var interfaceLanguage = DenboxLanguage.defaultCode
     @AppStorage(DenboxMPVConfiguration.useInputConfigurationKey) private var useMPVInputConfiguration = false
+    @AppStorage(DenboxMPVConfiguration.preferredAudioLanguagesKey) private var preferredAudioLanguages = ""
+    @AppStorage(DenboxMPVConfiguration.preferredSubtitleLanguagesKey) private var preferredSubtitleLanguages = ""
     @State private var showAdvancedPlayerSettings = false
     @State private var mediaAPIKey = SecretVault.read(account: "media-api-key") ?? ""
     @State private var feedKey = SecretVault.read(account: "catalog-feed-key") ?? ""
@@ -9938,6 +10330,18 @@ private struct SettingsSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Toggle("Use mpv input.conf key bindings", isOn: $useMPVInputConfiguration)
                         .font(.denbox(size: 11))
+                    Text("Track language preferences")
+                        .font(.denbox(size: 11, weight: .semibold))
+                    TextField("Preferred audio track languages", text: $preferredAudioLanguages,
+                              prompt: Text("Example: fa,per,fas,en,eng"))
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Preferred subtitle track languages", text: $preferredSubtitleLanguages,
+                              prompt: Text("Example: fa,per,fas,en,eng"))
+                        .textFieldStyle(.roundedBorder)
+                    Text("Enter comma-separated language codes in priority order. Changes apply the next time the player opens.")
+                        .font(.denbox(size: 9))
+                        .foregroundStyle(Color.secondaryText.opacity(0.8))
+                        .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 8) {
                         Button("Open mpv configuration folder") {
                             _ = DenboxMPVConfiguration.reveal(DenboxMPVConfiguration.directoryURL)
@@ -9991,7 +10395,7 @@ private struct SettingsSheet: View {
                     .font(.denbox(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("IMDb supplies ratings and structured people and episode data when available. TVmaze adds series artwork and cast; Persian descriptions from Simba, Filimo, or HexDL stay in front of English summaries. Filimo and HexDL public pages are checked automatically for loaded titles, and matching Persian text and artwork are saved locally.")
+                Text("IMDb supplies ratings and structured people and episode data when available. TVmaze adds series artwork and cast. Denbox saves the original title, Persian title, available cover, and description locally for each movie or series you open.")
                     .font(.denbox(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -10019,7 +10423,7 @@ private struct SettingsSheet: View {
                         tmdbTokenStatus = token.isEmpty
                             ? "TMDB token removed from Keychain."
                             : "TMDB token saved in Keychain."
-                        model.checkPublicReferencesForCatalog(forceTMDB: true)
+                        model.tmdbCredentialsDidChange(hasToken: !token.isEmpty)
                     } label: {
                         Label("Save TMDB token", systemImage: "key.horizontal")
                     }
@@ -10091,23 +10495,6 @@ private struct SettingsSheet: View {
                 Text(DenboxLanguage.localizedMessage(model.publicReferenceStatus))
                     .font(.denbox(size: 10, weight: .medium))
                     .foregroundStyle(Color.secondaryText)
-                HStack(spacing: 10) {
-                    Button {
-                        model.checkPublicTitlePagesForCatalog()
-                    } label: {
-                        Label(model.isCheckingPublicTitlePages
-                              ? "Updating Persian metadata…"
-                              : "Check Filimo and HexDL for loaded titles",
-                              systemImage: model.isCheckingPublicTitlePages ? "hourglass" : "arrow.clockwise")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(model.isCheckingPublicTitlePages || model.items.isEmpty)
-                    Text(DenboxLanguage.localizedMessage(model.publicTitleCatalogStatus))
-                        .font(.denbox(size: 10, weight: .medium))
-                        .foregroundStyle(Color.secondaryText)
-                        .lineLimit(2)
-                    Spacer(minLength: 0)
-                }
                 HStack(spacing: 10) {
                     Button {
                         Task { await model.refreshIMDbDataset() }

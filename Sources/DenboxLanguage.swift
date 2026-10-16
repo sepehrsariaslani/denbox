@@ -109,6 +109,8 @@ enum DenboxLanguage {
             (#"^Watch time: (.+)$"#, "Watch time: %@"),
             (#"^(\d+(?:\.\d+)?) hours$"#, "%@ hours"),
             (#"^Could not save the viewing data export: (.+)$"#, "Could not save the viewing data export: %@"),
+            (#"^Could not move current file to Trash: (.+)$"#, "Could not move current file to Trash: %@"),
+            (#"^Could not delete current file: (.+)$"#, "Could not delete current file: %@"),
             (#"^Could not read viewing data: (.+)$"#, "Could not read viewing data: %@"),
             (#"^Progress records: (\d+)$"#, "Progress records: %@"),
             (#"^History sessions: (\d+)$"#, "History sessions: %@"),

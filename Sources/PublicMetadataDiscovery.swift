@@ -14,16 +14,20 @@ enum PublicMetadataDiscoveryService {
         case .match(let apiMetadata):
             guard includePageDetails else { return apiMetadata }
             return await enrichPageDetails(from: apiMetadata)
-        case .searchedNoMatch: return nil
-        case .unavailable: break
+        case .searchedNoMatch, .unavailable: break
         }
         let session = PublicMetadataDiscoverySession(provider: provider)
-        return await session.discover(item: item, searchURL: searchURL)
+        let discovered = await session.discover(item: item, searchURL: searchURL)
+        session.close()
+        guard let discovered else { return nil }
+        guard includePageDetails else { return discovered }
+        return await enrichPageDetails(from: discovered)
     }
 
     static func enrichPageDetails(from metadata: PublicTitleMetadata) async -> PublicTitleMetadata {
         let session = PublicMetadataDiscoverySession(provider: metadata.provider)
         let pageMetadata = await session.capturePublicTitlePage(at: metadata.pageURL)
+        session.close()
         var merged = pageMetadata?.merging(metadata) ?? metadata
         merged.pageDetailsAttemptedAt = Date()
         if pageMetadata != nil {
@@ -33,12 +37,17 @@ enum PublicMetadataDiscoveryService {
     }
 }
 
-@MainActor
-private enum PublicMetadataAPIClient {
-    enum SearchResult {
+enum PublicMetadataAPIClient {
+    enum SearchResult: Sendable {
         case match(PublicTitleMetadata)
         case searchedNoMatch
         case unavailable
+    }
+
+    struct ParsedSearchPayload: Sendable {
+        let hasExpectedShape: Bool
+        let metadata: PublicTitleMetadata?
+        let parsedOnMainThread: Bool
     }
 
     private struct CandidateRecord {
@@ -46,22 +55,48 @@ private enum PublicMetadataAPIClient {
         let payload: [String: Any]
     }
 
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        configuration.httpMaximumConnectionsPerHost = 3
+        return URLSession(configuration: configuration)
+    }()
+
     static func discover(for item: MediaItem, provider: PublicMetadataProvider) async -> SearchResult {
         var successfulRequests = 0
         for query in queryVariants(for: item) {
             guard let url = searchURL(for: provider, query: query),
-                  let payload = try? await loadJSON(from: url),
-                  hasExpectedSearchShape(payload, provider: provider) else { continue }
+                  let data = try? await loadJSONData(from: url) else { continue }
+            let parsed = await parseSearchPayload(data, item: item, provider: provider)
+            guard parsed.hasExpectedShape else { continue }
             successfulRequests += 1
-            let match: PublicTitleMetadata?
-            switch provider {
-            case .filimo: match = filimoMetadata(from: payload, item: item)
-            case .hexDL: match = hexDLMetadata(from: payload, item: item)
-            }
-            if let match { return .match(match) }
+            if let metadata = parsed.metadata { return .match(metadata) }
         }
         return successfulRequests > 0 ? .searchedNoMatch : .unavailable
     }
+
+    static func parseSearchPayload(
+        _ data: Data,
+        item: MediaItem,
+        provider: PublicMetadataProvider
+    ) async -> ParsedSearchPayload {
+        await Task.detached(priority: .utility) {
+            guard let payload = try? JSONSerialization.jsonObject(with: data),
+                  hasExpectedSearchShape(payload, provider: provider) else {
+                return ParsedSearchPayload(hasExpectedShape: false, metadata: nil, parsedOnMainThread: Self.isMainThread())
+            }
+            let metadata: PublicTitleMetadata?
+            switch provider {
+            case .filimo: metadata = filimoMetadata(from: payload, item: item)
+            case .hexDL: metadata = hexDLMetadata(from: payload, item: item)
+            }
+            return ParsedSearchPayload(hasExpectedShape: true, metadata: metadata, parsedOnMainThread: Self.isMainThread())
+        }.value
+    }
+
+    private static func isMainThread() -> Bool { Thread.isMainThread }
 
     private static func hasExpectedSearchShape(_ payload: Any, provider: PublicMetadataProvider) -> Bool {
         guard let root = payload as? [String: Any] else { return false }
@@ -104,22 +139,16 @@ private enum PublicMetadataAPIClient {
         }
     }
 
-    private static func loadJSON(from url: URL) async throws -> Any {
+    private static func loadJSONData(from url: URL) async throws -> Data {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpCookieStorage = nil
-        configuration.httpShouldSetCookies = false
-        configuration.urlCredentialStorage = nil
-        let session = URLSession(configuration: configuration)
-        defer { session.invalidateAndCancel() }
         let (data, response) = try await session.data(for: request)
         guard data.count <= 2_000_000,
               let response = response as? HTTPURLResponse,
               (200..<300).contains(response.statusCode) else {
             throw PublicMetadataAPIError.invalidResponse
         }
-        return try JSONSerialization.jsonObject(with: data)
+        return data
     }
 
     private static func filimoMetadata(from payload: Any, item: MediaItem) -> PublicTitleMetadata? {
@@ -329,6 +358,7 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
     private let webView: WKWebView
     private let hostingWindow: NSWindow
     private var pendingNavigation: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
+    private var isClosed = false
 
     init(provider: PublicMetadataProvider) {
         self.provider = provider
@@ -338,12 +368,15 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
         configuration.allowsAirPlayForMediaPlayback = false
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        hostingWindow = NSWindow(
+        let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1024, height: 768),
             styleMask: .borderless,
             backing: .buffered,
             defer: false
         )
+        // NSWindow defaults to releasing itself on close; ARC already owns it.
+        window.isReleasedWhenClosed = false
+        hostingWindow = window
         webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1024, height: 768), configuration: configuration)
         super.init()
         hostingWindow.contentView = webView
@@ -353,6 +386,16 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.isHidden = false
+    }
+
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        hostingWindow.contentView = nil
+        hostingWindow.close()
     }
 
     func discover(item: MediaItem, searchURL: URL) async -> PublicTitleMetadata? {
@@ -420,10 +463,80 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
         do {
             try Task.checkCancellation()
             try await navigate(to: url)
+            guard provider == .filimo else { return await captureTitlePage(at: url) }
+
+            var combined: PublicTitleMetadata?
+            for tabID in ["info", "episodes"] {
+                guard await activateFilimoTab(tabID) else { continue }
+                try await Task.sleep(nanoseconds: 450_000_000)
+                if let page = await captureTitlePage(at: url) {
+                    combined = combined.map { page.merging($0) } ?? page
+                }
+
+                guard tabID == "episodes" else { continue }
+                let seasonCount = min(await filimoSeasonButtonCount(), 24)
+                for index in 0..<seasonCount {
+                    try Task.checkCancellation()
+                    guard await selectFilimoSeason(at: index) else { continue }
+                    try await Task.sleep(nanoseconds: 350_000_000)
+                    if let seasonPage = await captureTitlePage(at: url) {
+                        combined = combined.map { seasonPage.merging($0) } ?? seasonPage
+                    }
+                }
+            }
+            if let combined { return combined }
             return await captureTitlePage(at: url)
         } catch {
             return nil
         }
+    }
+
+    private func activateFilimoTab(_ id: String) async -> Bool {
+        guard ["info", "episodes"].contains(id) else { return false }
+        let script = #"""
+        (() => {
+          const tab = document.querySelector('[data-test-id="__TAB_ID__"]');
+          if (!tab) return false;
+          if (tab.getAttribute('aria-selected') !== 'true') tab.click();
+          return true;
+        })()
+        """#.replacingOccurrences(of: "__TAB_ID__", with: id)
+        return (try? await evaluate(script) as? Bool) ?? false
+    }
+
+    private func filimoSeasonButtonCount() async -> Int {
+        let script = #"""
+        (() => {
+          const clean = e => (e?.innerText || '').replace(/\s+/g, ' ').trim();
+          const visible = e => {
+            const r=e.getBoundingClientRect(), s=getComputedStyle(e);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity)>0;
+          };
+          return Array.from(document.querySelectorAll('button'))
+            .filter(e => visible(e) && /^فصل(?:\s|$)/.test(clean(e))).length;
+        })()
+        """#
+        return (try? await evaluate(script) as? Int) ?? 0
+    }
+
+    private func selectFilimoSeason(at index: Int) async -> Bool {
+        guard (0..<24).contains(index) else { return false }
+        let script = #"""
+        (() => {
+          const clean = e => (e?.innerText || '').replace(/\s+/g, ' ').trim();
+          const visible = e => {
+            const r=e.getBoundingClientRect(), s=getComputedStyle(e);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity)>0;
+          };
+          const buttons = Array.from(document.querySelectorAll('button'))
+            .filter(e => visible(e) && /^فصل(?:\s|$)/.test(clean(e)));
+          const button = buttons[__INDEX__];
+          if (!button) return false;
+          button.click();
+          return true;
+        })()
+        """#.replacingOccurrences(of: "__INDEX__", with: String(index))
+        return (try? await evaluate(script) as? Bool) ?? false
     }
 
     private func navigate(to url: URL) async throws {
@@ -636,18 +749,33 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
           const directorLine = visibleLines.find(line => /(?:کارگردان|director)\s*[:：]/i.test(line)) || '';
           const director = directorLine.match(/(?:کارگردان|director)\s*[:：]\s*([^,،؛;|]+?)(?=\s*(?:بازیگران?|تهیه[‌ ]کننده|نویسنده|producer|writer|cast)\s*[:：]|$)/i)?.[1]?.trim() || '';
           const creditLabel = '(?:کارگردان|تهیه[‌ ]کننده|نویسنده|بازیگران?|director|producer|writer|cast|actors?)';
-          const castNames = visibleLines.flatMap(line => {
+          const labeledCastNames = visibleLines.flatMap(line => {
             const match = line.match(/(?:بازیگران?|cast|actors?)\s*[:：]\s*([^.;|]+)/i);
             if (!match) return [];
             const names = match[1].split(new RegExp('\\s*(?=' + creditLabel + '\\s*[:：])', 'i'))[0];
             return names.split(/[,،|]/).map(clean).filter(name => name.length > 1 && name.length < 100);
           });
-          const crewNames = visibleLines.flatMap(line => {
+          const labeledCrewNames = visibleLines.flatMap(line => {
             const expression = new RegExp('(کارگردان|تهیه[‌ ]کننده|نویسنده|director|producer|writer)\\s*[:：]\\s*([^,،؛;|]+?)(?=\\s*(?:' + creditLabel + ')\\s*[:：]|$)', 'ig');
             const names = [];
             for (const match of line.matchAll(expression)) names.push(...match[2].split(/[,،]/).map(clean));
             return names.filter(name => name.length > 1 && name.length < 100);
           });
+          const filimoPeople = Array.from(main.querySelectorAll('a[href^="/crew/"]'))
+            .filter(a => visible(a) && a.getAttribute('aria-hidden') !== 'true' && a.getAttribute('tabindex') !== '-1')
+            .map(a => {
+              const labels = Array.from(a.querySelectorAll('span')).map(span => clean(span.innerText)).filter(Boolean);
+              return {name: labels[0] || clean(a.innerText), role: labels[labels.length - 1] || ''};
+            }).filter(person => person.name.length > 1 && person.name.length < 100);
+          const uniqueNames = names => Array.from(new Map(names.map(name => [name.toLocaleLowerCase(), name])).values());
+          const castNames = uniqueNames([
+            ...filimoPeople.filter(person => /بازیگر|actor|cast/i.test(person.role)).map(person => person.name),
+            ...labeledCastNames
+          ]);
+          const crewNames = uniqueNames([
+            ...filimoPeople.filter(person => /کارگردان|نویسنده|تهیه|director|writer|producer/i.test(person.role)).map(person => person.name),
+            ...labeledCrewNames
+          ]);
           const imageURLs = Array.from(main.querySelectorAll('img')).filter(visible)
             .map(i => i.currentSrc || i.src || '').filter(Boolean);
           const posterURL = meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]') || imageURLs[0] || '';
@@ -662,7 +790,6 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
               .find(candidate => /(?:فصل|season)\s*\d+/i.test(asciiDigits(candidate)));
             return clean([line, season].filter(Boolean).join(' · '));
           }).filter(Boolean);
-          const visibleEpisodeCount = new Set(episodeMatches.map(entry => entry.number)).size;
           const visibleSeasonCount = new Set(visibleLines.flatMap(line => {
             const match = asciiDigits(line).match(/(?:فصل|season)\s*(\d+)/i);
             return match ? [Number(match[1])] : [];
@@ -670,7 +797,7 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
           return JSON.stringify({title,originalTitle,year,country,contentRating,publicRating,ratingSource,
             communityRating,communityVotes,publicBadges,runtime,director,
             genres,seasonCount:seasonCountMatch ? Number(seasonCountMatch[1]) : (visibleSeasonCount || null),
-            episodeCount:episodeCountMatch ? Number(episodeCountMatch[1]) : (visibleEpisodeCount || null),
+            episodeCount:episodeCountMatch ? Number(episodeCountMatch[1]) : null,
             castNames,crewNames,synopsis,visibleText,posterURL,imageURLs,headings,episodeSnippets});
         })()
         """#
@@ -778,6 +905,12 @@ private final class PublicMetadataDiscoverySession: NSObject, WKNavigationDelega
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased(), !host.isEmpty,
               !["localhost", "127.0.0.1", "::1"].contains(host) else { return false }
+        let sensitiveQueryNames: Set<String> = [
+            "token", "access_token", "secret", "signature", "sig", "auth", "authorization", "key", "expires", "policy"
+        ]
+        if URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains(where: {
+            sensitiveQueryNames.contains($0.name.lowercased())
+        }) == true { return false }
         return !["m3u8", "mpd", "mp4", "mkv", "webm", "srt", "vtt"].contains(url.pathExtension.lowercased())
     }
 
