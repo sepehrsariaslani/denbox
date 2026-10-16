@@ -26,7 +26,7 @@ The IMDb importer limits its SQLite page caches, uses disk-backed temporary stor
 
 - The Mac client uses the APK route shapes `first/{key}`, `search/{query}/{key}`, `movie/by/{id}/{key}`, and `season/by/serie/{id}/{key}`. It uses the current HTTPS origin advertised by the APK config endpoint (`ninwinios.info/api`), then falls back to the known HTTPS service host. Catalog feeds remain on their configured HTTPS endpoints. The current cache remains available in `~/Library/Application Support/Simba/library.sqlite` so upgrading the app name does not discard the existing catalog.
 - Opened movie and series detail responses are stored in that same SQLite database. Reopening a title displays its saved details immediately, including when the Mac is offline; entries older than five minutes refresh in the background and update the page when fresh API data arrives.
-- Denbox does not call Frappe routes. API keys stay in macOS Keychain under the existing Simba service identity; they are not stored in this repository or app bundle.
+- Denbox does not call Frappe routes. At runtime, API keys are stored in macOS Keychain under the existing Simba service identity. A private release can optionally bootstrap the builder's available keys into the recipient's Keychain on first launch. The generated bootstrap resource is not part of the source repository, but anyone with the private app bundle can extract its keys; restrict access to trusted recipients.
 - The media API can return plain HTTP streams and redirect them across hosts. For this personal build, ATS allows arbitrary media and network loads so the player can follow those HTTP redirects. API routes in Denbox still use HTTPS. This broad setting lowers transport security for network connections made by the app.
 - Movie and series feeds are paginated in batches of 30. Use **Load more titles** in the Movies or TV Shows sections to continue through the feed. Pages are cached in the existing SQLite library, so titles loaded earlier remain available after restarting Denbox.
 - The shared search field matches loaded titles, subtitles, and alternate names. It shows an in-progress state while remote catalog search runs, and searches started from discovery pages show the resulting catalog matches. My Ratings search stays local.
@@ -57,6 +57,8 @@ cp Resources/TMDB-Logo.png dist/Denbox.app/Contents/Resources/TMDB-Logo.png
 cp Resources/Fonts/*.ttf dist/Denbox.app/Contents/Resources/Fonts/
 cp Resources/fa.lproj/Localizable.strings dist/Denbox.app/Contents/Resources/fa.lproj/Localizable.strings
 cp /Applications/IINA.app/Contents/Frameworks/*.dylib dist/Denbox.app/Contents/Frameworks/
+# Private-release option: seed this Mac's required API keys for first-run Keychain import.
+python3 Scripts/embed-private-api-keys.py dist/Denbox.app
 swiftc -parse-as-library -swift-version 5 -O \
   -target arm64-apple-macosx13.0 \
   -I Sources/MPV -framework SwiftUI -framework AppKit -framework MediaPlayer -framework OpenGL -framework ImageIO -framework Network \
@@ -69,7 +71,7 @@ swiftc -parse-as-library -swift-version 5 -O \
 codesign --force --deep --sign - dist/Denbox.app
 ```
 
-The build links and bundles libmpv and its runtime libraries from the installed IINA app, then runs that engine inside Denbox. IINA must be installed to build this personal bundle; playback does not launch the IINA app. The bundle identifier and existing Keychain/database locations intentionally retain the Simba identity so this rename keeps the current API credentials, catalog cache, and My List. This build targets Apple Silicon and macOS 13 or newer. It is ad-hoc signed and not notarized.
+The build links and bundles libmpv and its runtime libraries from the installed IINA app, then runs that engine inside Denbox. IINA must be installed to build this personal bundle; playback does not launch the IINA app. The bundle identifier and existing Keychain/database locations intentionally retain the Simba identity so this rename keeps the current API credentials, catalog cache, and My List. `Scripts/embed-private-api-keys.py` reads the required media/catalog keys and any available TMDB/OpenSubtitles keys from the builder's Keychain, then creates a binary bootstrap resource inside the app. Denbox imports these values to the recipient's Keychain on first use without displaying or logging them. Anyone with the app bundle can extract the included keys; only use this option for a private release shared with trusted recipients. This build targets Apple Silicon and macOS 13 or newer. It is ad-hoc signed and not notarized.
 
 The current embedded video surface uses AppKit OpenGL APIs, which the macOS SDK marks deprecated; the app still builds, but the renderer should be revisited for long-term macOS support.
 

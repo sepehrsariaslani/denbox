@@ -3083,8 +3083,32 @@ enum DirectMediaAPI {
 
 private enum SecretVault {
     private static let service = "com.sepehr.SimbaMac.media-api"
+    private static let bootstrapMigration: Void = {
+        guard
+            let url = Bundle.main.url(forResource: "DenboxPrivateAPIKeys", withExtension: "plist"),
+            let data = try? Data(contentsOf: url),
+            let values = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: String]
+        else { return }
+
+        let version = values["_version"] ?? "1"
+        let markerAccount = "bundle-bootstrap-\(version)"
+        guard readStored(account: markerAccount) == nil else { return }
+
+        for (account, token) in values where account != "_version" {
+            guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  readStored(account: account) == nil else { continue }
+            save(token, account: account)
+        }
+
+        save("complete", account: markerAccount)
+    }()
 
     static func read(account: String) -> String? {
+        _ = bootstrapMigration
+        return readStored(account: account)
+    }
+
+    private static func readStored(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -3094,8 +3118,10 @@ private enum SecretVault {
         ]
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+              let data = result as? Data,
+              let token = String(data: data, encoding: .utf8),
+              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return token
     }
 
     static func save(_ token: String, account: String) {
