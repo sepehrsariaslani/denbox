@@ -31,7 +31,9 @@ struct IMDbEnrichmentPerformanceTests {
             guard model.recentlyRefreshedDetails[item.id]?.imdbID != nil else {
                 throw PerformanceTestFailure(message: "background IMDb enrichment did not finish within 30 seconds")
             }
-            log(String(format: "IMDb enrichment: %.3fs in background", Date().timeIntervalSince(enrichmentStarted)))
+            let enrichmentSeconds = Date().timeIntervalSince(enrichmentStarted)
+            log(String(format: "IMDb enrichment: %.3fs in background", enrichmentSeconds))
+            try require(enrichmentSeconds < 10, "background IMDb enrichment took more than ten seconds")
         }
         log("PASS detail responsiveness: cached series renders before IMDb enrichment completes")
     }

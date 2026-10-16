@@ -1,0 +1,6 @@
+module MPV [system] {
+    header "client.h"
+    header "render.h"
+    header "render_gl.h"
+    export *
+}

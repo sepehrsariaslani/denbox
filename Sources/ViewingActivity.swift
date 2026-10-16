@@ -5,10 +5,10 @@ struct IMDbGenreFacet: Identifiable, Sendable {
     let titleCount: Int
 
     var id: String { name }
-    var persianName: String { IMDbGenreLocalization.persianName(for: name) }
+    var displayName: String { IMDbGenreLocalization.displayName(for: name) }
 }
 
-struct WatchProgress: Identifiable, Sendable {
+struct WatchProgress: Identifiable, Codable, Sendable {
     let mediaID: String
     let episodeID: String?
     let mediaTitle: String
@@ -37,7 +37,7 @@ struct WatchProgress: Identifiable, Sendable {
     }
 }
 
-struct WatchHistoryEntry: Identifiable, Sendable {
+struct WatchHistoryEntry: Identifiable, Codable, Sendable {
     let id: String
     let mediaID: String
     let episodeID: String?
@@ -56,6 +56,13 @@ struct WatchHistoryEntry: Identifiable, Sendable {
     let playerKind: String
 
     var displayTitle: String { episodeTitle ?? mediaTitle }
+}
+
+struct ViewingDataExport: Codable, Sendable {
+    let schemaVersion: Int
+    let exportedAt: Date
+    let progress: [WatchProgress]
+    let history: [WatchHistoryEntry]
 }
 
 struct ViewingStats: Sendable {
@@ -103,6 +110,11 @@ enum IMDbGenreLocalization {
 
     static func persianName(for genre: String) -> String {
         names[genre] ?? genre
+    }
+
+    static func displayName(for genre: String) -> String {
+        guard DenboxLanguage.selectedCode != DenboxLanguage.englishCode else { return genre }
+        return persianName(for: genre)
     }
 }
 

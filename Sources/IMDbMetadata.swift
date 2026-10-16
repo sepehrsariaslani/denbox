@@ -46,6 +46,78 @@ struct IMDbPersonCredit: Identifiable, Sendable {
     var id: String { "\(title.tconst)-\(category)-\(ordering)" }
 }
 
+struct IMDbFranchiseEntry: Sendable {
+    let title: String
+    let year: Int
+    let kind: String
+    var alternateTitles: [String] = []
+}
+
+struct IMDbFranchiseDefinition: Identifiable, Sendable {
+    let id: String
+    let name: String
+    let summary: String
+    let entries: [IMDbFranchiseEntry]
+}
+
+enum IMDbFranchiseCatalog {
+    static let all: [IMDbFranchiseDefinition] = [
+        .init(id: "mcu", name: "Marvel Cinematic Universe", summary: "Marvel Studios films and series", entries:
+            movies([("Iron Man", 2008), ("The Incredible Hulk", 2008), ("Iron Man 2", 2010), ("Thor", 2011), ("Captain America: The First Avenger", 2011), ("The Avengers", 2012), ("Iron Man 3", 2013), ("Thor: The Dark World", 2013), ("Captain America: The Winter Soldier", 2014), ("Guardians of the Galaxy", 2014), ("Avengers: Age of Ultron", 2015), ("Ant-Man", 2015), ("Captain America: Civil War", 2016), ("Doctor Strange", 2016), ("Guardians of the Galaxy Vol. 2", 2017), ("Spider-Man: Homecoming", 2017), ("Thor: Ragnarok", 2017), ("Black Panther", 2018), ("Avengers: Infinity War", 2018), ("Ant-Man and the Wasp", 2018), ("Captain Marvel", 2019), ("Avengers: Endgame", 2019), ("Spider-Man: Far from Home", 2019), ("Black Widow", 2021), ("Shang-Chi and the Legend of the Ten Rings", 2021), ("Eternals", 2021), ("Spider-Man: No Way Home", 2021), ("Doctor Strange in the Multiverse of Madness", 2022), ("Thor: Love and Thunder", 2022), ("Black Panther: Wakanda Forever", 2022), ("Ant-Man and the Wasp: Quantumania", 2023), ("Guardians of the Galaxy Vol. 3", 2023), ("The Marvels", 2023), ("Deadpool & Wolverine", 2024)]) +
+            series([("WandaVision", 2021), ("Loki", 2021), ("Hawkeye", 2021), ("Moon Knight", 2022), ("Ms. Marvel", 2022), ("She-Hulk: Attorney at Law", 2022), ("Secret Invasion", 2023), ("Echo", 2024), ("Agatha All Along", 2024)])),
+        .init(id: "star-wars", name: "Star Wars", summary: "The Skywalker saga, spin-offs, and series", entries:
+            movies([("Star Wars: Episode IV - A New Hope", 1977), ("The Empire Strikes Back", 1980), ("Return of the Jedi", 1983), ("The Phantom Menace", 1999), ("Attack of the Clones", 2002), ("Revenge of the Sith", 2005), ("The Force Awakens", 2015), ("Rogue One", 2016), ("The Last Jedi", 2017), ("Solo", 2018), ("The Rise of Skywalker", 2019)], alternateTitles: ["Star Wars: Episode IV - A New Hope": ["Star Wars"]]) +
+            series([("The Mandalorian", 2019), ("The Book of Boba Fett", 2021), ("Obi-Wan Kenobi", 2022), ("Andor", 2022), ("Ahsoka", 2023)])),
+        .init(id: "wizarding-world", name: "Wizarding World", summary: "Harry Potter and Fantastic Beasts", entries:
+            movies([("Harry Potter and the Sorcerer's Stone", 2001), ("Harry Potter and the Chamber of Secrets", 2002), ("Harry Potter and the Prisoner of Azkaban", 2004), ("Harry Potter and the Goblet of Fire", 2005), ("Harry Potter and the Order of the Phoenix", 2007), ("Harry Potter and the Half-Blood Prince", 2009), ("Harry Potter and the Deathly Hallows: Part 1", 2010), ("Harry Potter and the Deathly Hallows: Part 2", 2011), ("Fantastic Beasts and Where to Find Them", 2016), ("Fantastic Beasts: The Crimes of Grindelwald", 2018), ("Fantastic Beasts: The Secrets of Dumbledore", 2022)], alternateTitles: ["Harry Potter and the Sorcerer's Stone": ["Harry Potter and the Philosopher's Stone"]])),
+        .init(id: "middle-earth", name: "Middle-earth", summary: "The Lord of the Rings and The Hobbit", entries:
+            movies([("The Lord of the Rings: The Fellowship of the Ring", 2001), ("The Lord of the Rings: The Two Towers", 2002), ("The Lord of the Rings: The Return of the King", 2003), ("The Hobbit: An Unexpected Journey", 2012), ("The Hobbit: The Desolation of Smaug", 2013), ("The Hobbit: The Battle of the Five Armies", 2014)]) +
+            series([("The Lord of the Rings: The Rings of Power", 2022)])),
+        .init(id: "james-bond", name: "James Bond", summary: "The official 007 film series", entries:
+            movies([("Dr. No", 1962), ("From Russia with Love", 1963), ("Goldfinger", 1964), ("Thunderball", 1965), ("You Only Live Twice", 1967), ("On Her Majesty's Secret Service", 1969), ("Diamonds Are Forever", 1971), ("Live and Let Die", 1973), ("The Man with the Golden Gun", 1974), ("The Spy Who Loved Me", 1977), ("Moonraker", 1979), ("For Your Eyes Only", 1981), ("Octopussy", 1983), ("A View to a Kill", 1985), ("The Living Daylights", 1987), ("Licence to Kill", 1989), ("GoldenEye", 1995), ("Tomorrow Never Dies", 1997), ("The World Is Not Enough", 1999), ("Die Another Day", 2002), ("Casino Royale", 2006), ("Quantum of Solace", 2008), ("Skyfall", 2012), ("Spectre", 2015), ("No Time to Die", 2021)])),
+        .init(id: "fast-furious", name: "Fast & Furious", summary: "Street racing and heist action films", entries:
+            movies([("The Fast and the Furious", 2001), ("2 Fast 2 Furious", 2003), ("The Fast and the Furious: Tokyo Drift", 2006), ("Fast & Furious", 2009), ("Fast Five", 2011), ("Fast & Furious 6", 2013), ("Furious 7", 2015), ("The Fate of the Furious", 2017), ("Fast & Furious Presents: Hobbs & Shaw", 2019), ("F9: The Fast Saga", 2021), ("Fast X", 2023)])),
+        .init(id: "mission-impossible", name: "Mission: Impossible", summary: "The IMF action film series", entries:
+            movies([("Mission: Impossible", 1996), ("Mission: Impossible II", 2000), ("Mission: Impossible III", 2006), ("Mission: Impossible - Ghost Protocol", 2011), ("Mission: Impossible - Rogue Nation", 2015), ("Mission: Impossible - Fallout", 2018), ("Mission: Impossible - Dead Reckoning Part One", 2023), ("Mission: Impossible - The Final Reckoning", 2025)])),
+        .init(id: "jurassic", name: "Jurassic", summary: "Jurassic Park and Jurassic World", entries:
+            movies([("Jurassic Park", 1993), ("The Lost World: Jurassic Park", 1997), ("Jurassic Park III", 2001), ("Jurassic World", 2015), ("Jurassic World: Fallen Kingdom", 2018), ("Jurassic World Dominion", 2022), ("Jurassic World Rebirth", 2025)])),
+        .init(id: "spider-man", name: "Spider-Man", summary: "Live-action and animated Spider-Man films", entries:
+            movies([("Spider-Man", 2002), ("Spider-Man 2", 2004), ("Spider-Man 3", 2007), ("The Amazing Spider-Man", 2012), ("The Amazing Spider-Man 2", 2014), ("Spider-Man: Homecoming", 2017), ("Spider-Man: Into the Spider-Verse", 2018), ("Spider-Man: Far from Home", 2019), ("Spider-Man: No Way Home", 2021), ("Spider-Man: Across the Spider-Verse", 2023)])),
+        .init(id: "x-men", name: "X-Men", summary: "X-Men, Wolverine, and Deadpool films", entries:
+            movies([("X-Men", 2000), ("X2", 2003), ("X-Men: The Last Stand", 2006), ("X-Men Origins: Wolverine", 2009), ("X-Men: First Class", 2011), ("The Wolverine", 2013), ("X-Men: Days of Future Past", 2014), ("Deadpool", 2016), ("X-Men: Apocalypse", 2016), ("Logan", 2017), ("Deadpool 2", 2018), ("Dark Phoenix", 2019), ("The New Mutants", 2020), ("Deadpool & Wolverine", 2024)])),
+        .init(id: "dc", name: "DC Films", summary: "DC superhero films", entries:
+            movies([("Man of Steel", 2013), ("Batman v Superman: Dawn of Justice", 2016), ("Suicide Squad", 2016), ("Wonder Woman", 2017), ("Justice League", 2017), ("Aquaman", 2018), ("Shazam!", 2019), ("Birds of Prey", 2020), ("Wonder Woman 1984", 2020), ("The Suicide Squad", 2021), ("Black Adam", 2022), ("Shazam! Fury of the Gods", 2023), ("The Flash", 2023), ("Blue Beetle", 2023), ("Aquaman and the Lost Kingdom", 2023)])),
+        .init(id: "toy-story", name: "Toy Story", summary: "Woody, Buzz, and friends", entries:
+            movies([("Toy Story", 1995), ("Toy Story 2", 1999), ("Toy Story 3", 2010), ("Toy Story 4", 2019)])),
+        .init(id: "shrek", name: "Shrek", summary: "Shrek and Puss in Boots", entries:
+            movies([("Shrek", 2001), ("Shrek 2", 2004), ("Shrek the Third", 2007), ("Shrek Forever After", 2010), ("Puss in Boots", 2011), ("Puss in Boots: The Last Wish", 2022)])),
+        .init(id: "pirates", name: "Pirates of the Caribbean", summary: "The Pirates of the Caribbean films", entries:
+            movies([("Pirates of the Caribbean: The Curse of the Black Pearl", 2003), ("Pirates of the Caribbean: Dead Man's Chest", 2006), ("Pirates of the Caribbean: At World's End", 2007), ("Pirates of the Caribbean: On Stranger Tides", 2011), ("Pirates of the Caribbean: Dead Men Tell No Tales", 2017)])),
+        .init(id: "transformers", name: "Transformers", summary: "Autobots, Decepticons, and their origins", entries:
+            movies([("Transformers", 2007), ("Transformers: Revenge of the Fallen", 2009), ("Transformers: Dark of the Moon", 2011), ("Transformers: Age of Extinction", 2014), ("Transformers: The Last Knight", 2017), ("Bumblebee", 2018), ("Transformers: Rise of the Beasts", 2023)])),
+        .init(id: "hunger-games", name: "The Hunger Games", summary: "The Hunger Games films", entries:
+            movies([("The Hunger Games", 2012), ("The Hunger Games: Catching Fire", 2013), ("The Hunger Games: Mockingjay - Part 1", 2014), ("The Hunger Games: Mockingjay - Part 2", 2015), ("The Hunger Games: The Ballad of Songbirds & Snakes", 2023)])),
+        .init(id: "twilight", name: "The Twilight Saga", summary: "The Twilight films", entries:
+            movies([("Twilight", 2008), ("The Twilight Saga: New Moon", 2009), ("The Twilight Saga: Eclipse", 2010), ("The Twilight Saga: Breaking Dawn - Part 1", 2011), ("The Twilight Saga: Breaking Dawn - Part 2", 2012)])),
+        .init(id: "john-wick", name: "John Wick", summary: "The John Wick action series", entries:
+            movies([("John Wick", 2014), ("John Wick: Chapter 2", 2017), ("John Wick: Chapter 3 - Parabellum", 2019), ("John Wick: Chapter 4", 2023)])),
+        .init(id: "the-matrix", name: "The Matrix", summary: "The Matrix science-fiction films", entries:
+            movies([("The Matrix", 1999), ("The Matrix Reloaded", 2003), ("The Matrix Revolutions", 2003), ("The Matrix Resurrections", 2021)])),
+        .init(id: "rocky-creed", name: "Rocky & Creed", summary: "Rocky Balboa and Adonis Creed", entries:
+            movies([("Rocky", 1976), ("Rocky II", 1979), ("Rocky III", 1982), ("Rocky IV", 1985), ("Rocky V", 1990), ("Rocky Balboa", 2006), ("Creed", 2015), ("Creed II", 2018), ("Creed III", 2023)]))
+    ]
+
+    private static func movies(_ values: [(String, Int)], alternateTitles: [String: [String]] = [:]) -> [IMDbFranchiseEntry] {
+        values.map {
+            IMDbFranchiseEntry(title: $0.0, year: $0.1, kind: "Movie", alternateTitles: alternateTitles[$0.0] ?? [])
+        }
+    }
+
+    private static func series(_ values: [(String, Int)]) -> [IMDbFranchiseEntry] {
+        values.map { IMDbFranchiseEntry(title: $0.0, year: $0.1, kind: "Series") }
+    }
+}
+
 struct IMDbChartLists: Sendable {
     let topMovies: [IMDbTitleMetadata]
     let topSeries: [IMDbTitleMetadata]
@@ -200,6 +272,49 @@ final class IMDbMetadataStore: @unchecked Sendable {
         return sqlite3_step(statement) == SQLITE_ROW && text(statement, 0) == "1"
     }
 
+    func franchiseTitles(for franchiseID: String) -> [IMDbTitleMetadata] {
+        guard let franchise = IMDbFranchiseCatalog.all.first(where: { $0.id == franchiseID }) else { return [] }
+        let indexesReady = ensureSearchIndexes()
+        guard let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+
+        var resolved: [IMDbTitleMetadata] = []
+        var seen = Set<String>()
+        for entry in franchise.entries {
+            let predicate = entry.kind == "Movie" ? "title_type='movie'" : "title_type IN ('tvSeries','tvMiniSeries')"
+            let columns = "tconst,primary_title,start_year,genres,rating,votes,normalized_primary,normalized_original,title_type"
+            let sql = exactTitleLookupSQL(columns: columns, predicate: predicate, kind: entry.kind, indexesReady: indexesReady)
+            var candidates: [(title: IMDbTitleMetadata, primary: String, original: String, score: Double)] = []
+            let aliases = ([entry.title] + entry.alternateTitles).uniqued()
+
+            for alias in aliases {
+                let normalized = imdbNormalize(alias)
+                guard !normalized.isEmpty else { continue }
+                candidates.append(contentsOf: queryTitleRows(db: db, sql: sql, normalized: normalized, year: entry.year))
+            }
+
+            let exact = candidates.filter { candidate in
+                let normalizedPrimary = imdbNormalize(candidate.primary)
+                let normalizedOriginal = imdbNormalize(candidate.original)
+                return aliases.contains { alias in
+                    let normalizedAlias = imdbNormalize(alias)
+                    return normalizedAlias == normalizedPrimary || normalizedAlias == normalizedOriginal
+                }
+            }
+            let best = exact.sorted { lhs, rhs in
+                let leftDistance = lhs.title.year.map { abs($0 - entry.year) } ?? Int.max
+                let rightDistance = rhs.title.year.map { abs($0 - entry.year) } ?? Int.max
+                if leftDistance != rightDistance { return leftDistance < rightDistance }
+                return (lhs.title.votes ?? 0) > (rhs.title.votes ?? 0)
+            }.first?.title
+
+            if let best, seen.insert(best.tconst).inserted {
+                resolved.append(best)
+            }
+        }
+        return resolved
+    }
+
     func searchPeople(_ query: String, limit: Int = 80) -> [IMDbPersonMetadata] {
         let terms = query.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map { imdbNormalize(String($0)) }.filter { $0.count >= 2 }
@@ -352,14 +467,18 @@ final class IMDbMetadataStore: @unchecked Sendable {
 
     func matchTitle(title: String, year: String?, kind: String) -> IMDbTitleMetadata? {
         let normalized = imdbNormalize(title)
+        let indexesReady = ensureSearchIndexes()
         guard !normalized.isEmpty, let db = openReadOnly() else { return nil }
         defer { sqlite3_close(db) }
         let predicate = kind == "Movie" ? "title_type='movie'" : "title_type IN ('tvSeries','tvMiniSeries')"
         let columns = "tconst,primary_title,start_year,genres,rating,votes,normalized_primary,normalized_original,title_type"
-        let exactSQL = "SELECT \(columns) FROM titles WHERE \(predicate) AND (normalized_primary=? OR normalized_original=?)"
+        let exactSQL = exactTitleLookupSQL(columns: columns, predicate: predicate, kind: kind, indexesReady: indexesReady)
         var exact = queryTitleRows(db: db, sql: exactSQL, normalized: normalized, year: year.flatMap(Int.init))
         if exact.isEmpty, let yearValue = Int(year ?? "") {
-            let fuzzySQL = "SELECT \(columns) FROM titles WHERE \(predicate) AND start_year BETWEEN ? AND ? AND rating IS NOT NULL ORDER BY votes DESC LIMIT 4000"
+            let yearIndex = indexesReady
+                ? (kind == "Movie" ? " INDEXED BY idx_movie_start_year" : " INDEXED BY idx_series_start_year")
+                : ""
+            let fuzzySQL = "SELECT \(columns) FROM titles\(yearIndex) WHERE \(predicate) AND start_year BETWEEN ? AND ? AND rating IS NOT NULL ORDER BY votes DESC LIMIT 4000"
             exact = queryTitleRows(db: db, sql: fuzzySQL, normalized: normalized, year: yearValue)
         }
         guard !exact.isEmpty else { return nil }
@@ -381,6 +500,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
     }
 
     func catalogMetadata(for items: [MediaItem]) -> [String: IMDbTitleMetadata] {
+        let indexesReady = ensureSearchIndexes()
         guard let db = openReadOnly() else { return [:] }
         defer { sqlite3_close(db) }
         var result: [String: IMDbTitleMetadata] = [:]
@@ -388,7 +508,8 @@ final class IMDbMetadataStore: @unchecked Sendable {
             let normalized = imdbNormalize(item.title)
             guard !normalized.isEmpty else { continue }
             let predicate = item.kind == "Movie" ? "title_type='movie'" : "title_type IN ('tvSeries','tvMiniSeries')"
-            let sql = "SELECT tconst,primary_title,start_year,genres,rating,votes,normalized_primary,normalized_original,title_type FROM titles WHERE \(predicate) AND (normalized_primary=? OR normalized_original=?)"
+            let columns = "tconst,primary_title,start_year,genres,rating,votes,normalized_primary,normalized_original,title_type"
+            let sql = exactTitleLookupSQL(columns: columns, predicate: predicate, kind: item.kind, indexesReady: indexesReady)
             let candidates = queryTitleRows(db: db, sql: sql, normalized: normalized, year: Int(item.year))
                 .filter { $0.primary == normalized || $0.original == normalized }
             let sorted = candidates.sorted { lhs, rhs in
@@ -401,6 +522,25 @@ final class IMDbMetadataStore: @unchecked Sendable {
             if let match = sorted.first?.title { result[item.id] = match }
         }
         return result
+    }
+
+    private func exactTitleLookupSQL(columns: String, predicate: String, kind: String, indexesReady: Bool) -> String {
+        let primaryIndex = indexesReady ? " INDEXED BY idx_titles_normalized" : ""
+        let originalIndex: String
+        if indexesReady {
+            originalIndex = kind == "Movie"
+                ? " INDEXED BY idx_movie_normalized_original"
+                : " INDEXED BY idx_series_normalized_original"
+        } else {
+            originalIndex = ""
+        }
+        return """
+        SELECT \(columns) FROM titles\(primaryIndex)
+        WHERE \(predicate) AND normalized_primary=?
+        UNION ALL
+        SELECT \(columns) FROM titles\(originalIndex)
+        WHERE \(predicate) AND normalized_original=?
+        """
     }
 
     func principalCast(for tconst: String, limit: Int = 20) -> [String] {
@@ -556,12 +696,20 @@ final class IMDbMetadataStore: @unchecked Sendable {
         }
         sqlite3_busy_timeout(db, 20_000)
         let result = sqlite3_exec(db, """
+            CREATE INDEX IF NOT EXISTS idx_titles_normalized
+                ON titles(title_type,normalized_primary,normalized_original);
             CREATE INDEX IF NOT EXISTS idx_series_normalized_original
                 ON titles(normalized_original)
                 WHERE title_type IN ('tvSeries','tvMiniSeries');
             CREATE INDEX IF NOT EXISTS idx_series_start_year
                 ON titles(start_year)
                 WHERE title_type IN ('tvSeries','tvMiniSeries');
+            CREATE INDEX IF NOT EXISTS idx_movie_normalized_original
+                ON titles(normalized_original)
+                WHERE title_type='movie';
+            CREATE INDEX IF NOT EXISTS idx_movie_start_year
+                ON titles(start_year,votes DESC)
+                WHERE title_type='movie' AND rating IS NOT NULL;
             """, nil, nil, nil)
         sqlite3_close(db)
         hasSearchIndexes = result == SQLITE_OK
@@ -913,6 +1061,8 @@ final class IMDbMetadataStore: @unchecked Sendable {
         CREATE INDEX idx_titles_normalized ON titles(title_type,normalized_primary,normalized_original);
         CREATE INDEX idx_series_normalized_original ON titles(normalized_original) WHERE title_type IN ('tvSeries','tvMiniSeries');
         CREATE INDEX idx_series_start_year ON titles(start_year) WHERE title_type IN ('tvSeries','tvMiniSeries');
+        CREATE INDEX idx_movie_normalized_original ON titles(normalized_original) WHERE title_type='movie';
+        CREATE INDEX idx_movie_start_year ON titles(start_year,votes DESC) WHERE title_type='movie' AND rating IS NOT NULL;
         CREATE INDEX idx_episode_parent ON titles(parent_tconst,season_number,episode_number);
         CREATE INDEX idx_genres ON titles(title_type,genres);
         CREATE INDEX idx_title_chart ON titles(title_type,votes DESC,rating DESC);
@@ -1077,6 +1227,13 @@ enum IMDbTitleNormalizer {
 
 private func imdbNormalize(_ value: String) -> String {
     IMDbTitleNormalizer.normalize(value)
+}
+
+private extension Array where Element: Hashable {
+    func uniqued() -> [Element] {
+        var seen = Set<Element>()
+        return filter { seen.insert($0).inserted }
+    }
 }
 
 private func titleSimilarity(_ lhs: String, _ rhs: String) -> Double {

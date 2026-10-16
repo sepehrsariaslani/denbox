@@ -20,16 +20,26 @@ struct IMDbGenreIndexPerformanceTests {
         try require(firstPage.allSatisfy { $0.tconst != "tt-source" && $0.genres.contains("Drama") },
                     "genre-index migration returned the source series or unrelated genres")
 
+        let seriesMatch = store.matchTitle(title: "Drama Series 49999", year: "2020", kind: "Series")
+        try require(seriesMatch?.tconst == "tt0049999",
+                    "indexed primary-title lookup selected \(seriesMatch?.tconst ?? "no series") instead of tt0049999")
+        let movieMatch = store.matchTitle(title: "Original Movie", year: "2022", kind: "Movie")
+        try require(movieMatch?.tconst == "tt-movie", "indexed original-title lookup missed a movie")
+
         let queryStarted = Date()
         var resultCount = 0
-        for _ in 0..<20 { resultCount += store.similarSeries(for: "tt-source").count }
+        for _ in 0..<20 {
+            resultCount += store.similarSeries(for: "tt-source").count
+            if store.matchTitle(title: "Drama Series 49999", year: "2020", kind: "Series") != nil { resultCount += 1 }
+            if store.matchTitle(title: "Original Movie", year: "2022", kind: "Movie") != nil { resultCount += 1 }
+        }
         let indexedQuerySeconds = Date().timeIntervalSince(queryStarted)
-        try require(resultCount == 200, "indexed recommendation queries returned an inconsistent result count")
+        try require(resultCount == 240, "indexed recommendation and title queries returned an inconsistent result count")
         try require(indexedQuerySeconds < 2, "twenty indexed recommendation queries took over two seconds")
 
         print(String(format: "Legacy genre-index migration: %.3fs for 50,000 series", migrationSeconds))
-        print(String(format: "Indexed recommendations: %.3fs for 20 queries", indexedQuerySeconds))
-        print("PASS IMDb genre index: legacy migration and indexed similar-title lookup")
+        print(String(format: "Indexed recommendations and exact title lookups: %.3fs for 60 queries", indexedQuerySeconds))
+        print("PASS IMDb indexes: legacy migration, similar-title lookup, and exact series/movie title lookup")
     }
 
     private static func createLegacyDatabase(at url: URL, seriesCount: Int) throws {
@@ -68,8 +78,8 @@ struct IMDbGenreIndexPerformanceTests {
             bind("tvSeries", to: insert, at: 2)
             bind(title, to: insert, at: 3)
             bind(title, to: insert, at: 4)
-            bind(title.lowercased(), to: insert, at: 5)
-            bind(title.lowercased(), to: insert, at: 6)
+            bind(normalize(title), to: insert, at: 5)
+            bind(normalize(title), to: insert, at: 6)
             sqlite3_bind_int(insert, 7, 2020)
             bind(genres, to: insert, at: 8)
             sqlite3_bind_double(insert, 9, isSource ? 8.2 : 7.0 + Double(index % 20) / 10.0)
@@ -78,6 +88,12 @@ struct IMDbGenreIndexPerformanceTests {
                 throw GenreIndexTestFailure(message: "could not insert a temporary IMDb series")
             }
         }
+        try execute("""
+            INSERT INTO titles(
+              tconst,title_type,primary_title,original_title,normalized_primary,normalized_original,
+              start_year,genres,rating,votes
+            ) VALUES('tt-movie','movie','Primary Movie','Original Movie','primarymovie','originalmovie',2022,'Drama',7.5,5000);
+            """, in: db)
         try execute("COMMIT;", in: db)
     }
 
@@ -92,6 +108,10 @@ struct IMDbGenreIndexPerformanceTests {
 
     private static func bind(_ value: String, to statement: OpaquePointer, at index: Int32) {
         _ = value.withCString { sqlite3_bind_text(statement, index, $0, -1, sqliteTransient) }
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
     private static let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)

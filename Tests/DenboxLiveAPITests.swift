@@ -1,4 +1,5 @@
 import Foundation
+import MPV
 
 @main
 struct DenboxLiveAPITests {
@@ -13,7 +14,10 @@ struct DenboxLiveAPITests {
             .appendingPathComponent("DenboxLiveCatalogTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: testDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: testDirectory) }
-        let model = LibraryModel(databaseURL: testDirectory.appendingPathComponent("library.sqlite"))
+        let model = LibraryModel(
+            loadRemoteCatalog: false,
+            databaseURL: testDirectory.appendingPathComponent("library.sqlite")
+        )
         try await Task.sleep(nanoseconds: 250_000_000)
         await model.refreshCatalog()
         for _ in 0..<300 where model.isConnecting
@@ -45,9 +49,17 @@ struct DenboxLiveAPITests {
 
         let movieLinkCount = max(movieDetails.sources.count, movieDetails.downloadSources.count)
         let episodeLinkCount = max(episode.sources.count, episode.downloadSources.count)
+        let moviePlaybackSource = movieDetails.sources.first ?? movieDetails.downloadSources.first!
+        let episodePlaybackSource = episode.sources.first ?? episode.downloadSources.first!
         if CommandLine.arguments.contains("--catalog-only") {
             print("PASS live catalog: \(initialMovieCount) movies, \(initialSeriesCount) series")
             print("PASS live details: movie links=\(movieLinkCount), episode links=\(episodeLinkCount)")
+            return
+        }
+        if CommandLine.arguments.contains("--mpv-probe-only") {
+            try probeMPV(moviePlaybackSource, label: "movie")
+            try probeMPV(episodePlaybackSource, label: "episode")
+            print("PASS embedded mpv: movie and episode sources opened with their API headers")
             return
         }
         let directSource = movieDetails.downloadSources.first ?? movieDetails.sources[0]
@@ -58,8 +70,15 @@ struct DenboxLiveAPITests {
                     "live media server did not honor arbitrary HTTP byte ranges")
         let livePartCount = min(8, max(2, Int((firstRange.totalBytes + 4_194_303) / 4_194_304)))
 
-        let moviePlaybackSource = movieDetails.sources.first ?? movieDetails.downloadSources.first!
-        let episodePlaybackSource = episode.sources.first ?? episode.downloadSources.first!
+        if CommandLine.arguments.contains("--mpv-probe") {
+            try probeMPV(moviePlaybackSource, label: "movie")
+            try probeMPV(episodePlaybackSource, label: "episode")
+            print("PASS embedded mpv: movie and episode sources opened with their API headers")
+        }
+        if CommandLine.arguments.contains("--playback-probe-only") {
+            print("PASS live playback sources: movie links=\(movieLinkCount), episode links=\(episodeLinkCount)")
+            return
+        }
         let moviePlayback = await probeMediaResponse(moviePlaybackSource)
         let episodePlayback = await probeMediaResponse(episodePlaybackSource)
         print("Live movie stream: .\(moviePlaybackSource.url.pathExtension.lowercased()) · \(moviePlayback)")
@@ -131,6 +150,62 @@ struct DenboxLiveAPITests {
             let failure = error as NSError
             return "request-error \(failure.domain)/\(failure.code)"
         }
+    }
+
+    private static func probeMPV(_ source: MediaStreamSource, label: String) throws {
+        guard let handle = mpv_create() else {
+            throw TestFailure(message: "libmpv could not create a playback context for the \(label)")
+        }
+        defer { mpv_terminate_destroy(handle) }
+
+        let options = [
+            ("config", "no"),
+            ("vo", "null"),
+            ("ao", "null"),
+            ("terminal", "no"),
+            ("msg-level", "all=no")
+        ]
+        for (name, value) in options {
+            _ = name.withCString { key in value.withCString { mpv_set_option_string(handle, key, $0) } }
+        }
+        guard mpv_initialize(handle) >= 0 else {
+            throw TestFailure(message: "libmpv could not initialize for the \(label)")
+        }
+
+        let headers = source.headers.sorted {
+            $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending
+        }.map { "\($0.key): \($0.value)" }.joined(separator: ",")
+        _ = "http-header-fields".withCString { key in headers.withCString { mpv_set_property_string(handle, key, $0) } }
+
+        let arguments = ["loadfile", source.url.absoluteString, "replace"]
+        let owned = arguments.map { strdup($0) }
+        defer { owned.forEach { if let pointer = $0 { free(pointer) } } }
+        var pointers: [UnsafePointer<CChar>?] = owned.map { pointer in
+            guard let pointer else { return nil }
+            return UnsafePointer<CChar>(pointer)
+        }
+        pointers.append(nil)
+        let commandResult = pointers.withUnsafeMutableBufferPointer {
+            mpv_command(handle, $0.baseAddress)
+        }
+        guard commandResult >= 0 else {
+            throw TestFailure(message: "libmpv rejected the \(label) source command")
+        }
+
+        let deadline = Date().addingTimeInterval(20)
+        var didLoad = false
+        while Date() < deadline && !didLoad {
+            guard let event = mpv_wait_event(handle, 0.25) else { continue }
+            if event.pointee.event_id == MPV_EVENT_FILE_LOADED {
+                didLoad = true
+            } else if event.pointee.event_id == MPV_EVENT_END_FILE,
+                      let details = event.pointee.data?.assumingMemoryBound(to: mpv_event_end_file.self).pointee,
+                      details.reason == MPV_END_FILE_REASON_ERROR.rawValue {
+                let reason = mpv_error_string(Int32(details.error)).map(String.init(cString:)) ?? "unknown error"
+                throw TestFailure(message: "libmpv could not open the \(label) source (\(reason))")
+            }
+        }
+        try require(didLoad, "libmpv did not finish opening the \(label) source within 20 seconds")
     }
 
     private static func probeRange(
