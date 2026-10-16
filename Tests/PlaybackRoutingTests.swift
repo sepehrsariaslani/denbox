@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 @main
 struct PlaybackRoutingTests {
@@ -62,6 +63,34 @@ struct PlaybackRoutingTests {
         )
         try require(fullscreenHandled && fullscreenRequested, "Control-Command-F did not request full screen")
         playback.onToggleFullscreen = nil
+
+        let playerWindow = NSWindow(
+            contentRect: NSRect(x: 80, y: 90, width: 1280, height: 800),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        playerWindow.isReleasedWhenClosed = false
+        playback.setPlayerWindow(playerWindow)
+        let originalFrame = playerWindow.frame
+        let originalLevel = playerWindow.level
+        let originalCollectionBehavior = playerWindow.collectionBehavior
+        let originalTitle = playerWindow.title
+        try require(playback.enterMiniPlayer(title: "Mini player test"), "the floating mini player did not start")
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        try require(playback.isInMiniPlayerMode, "mini player state was not published")
+        try require(playerWindow.level == .floating, "the mini player did not stay above other windows")
+        try require(playerWindow.title == "Mini player test", "the mini player title was not updated")
+        try require(playerWindow.frame.width < originalFrame.width, "the player window did not shrink into mini mode")
+        playback.exitMiniPlayer()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        try require(!playback.isInMiniPlayerMode, "mini player mode did not exit")
+        try require(playerWindow.level == originalLevel, "the original window level was not restored")
+        try require(playerWindow.collectionBehavior == originalCollectionBehavior, "the original window space behavior was not restored")
+        try require(playerWindow.title == originalTitle, "the original player title was not restored")
+        try require(playerWindow.frame == originalFrame, "the original player window size and position were not restored")
+        playerWindow.close()
+        playback.setPlayerWindow(nil)
 
         playback.markABLoop()
         try require(playback.abLoopState == 1, "the A point was not stored")

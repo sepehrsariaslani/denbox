@@ -39,6 +39,16 @@ private struct MPVHandleBox: @unchecked Sendable {
     let handle: OpaquePointer
 }
 
+private struct MPVPlayerWindowState {
+    let frame: NSRect
+    let title: String
+    let level: NSWindow.Level
+    let collectionBehavior: NSWindow.CollectionBehavior
+    let minSize: NSSize
+    let maxSize: NSSize
+    let isMovableByWindowBackground: Bool
+}
+
 @MainActor
 final class MPVPlaybackController: ObservableObject {
     @Published private(set) var isLoading = false
@@ -46,6 +56,8 @@ final class MPVPlaybackController: ObservableObject {
     @Published private(set) var isBuffering = false
     @Published private(set) var cacheBufferingPercent = 0.0
     @Published private(set) var didReachEnd = false
+    @Published private(set) var isInMiniPlayerMode = false
+    @Published private(set) var isInSystemPictureInPictureMode = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var currentTimeSeconds = 0.0
     @Published private(set) var durationSeconds: Double?
@@ -86,6 +98,21 @@ final class MPVPlaybackController: ObservableObject {
     private var renderContext: OpaquePointer?
     private weak var glContext: NSOpenGLContext?
     private weak var playerWindow: NSWindow?
+    private weak var renderView: MPVRenderView?
+    private var regularPlayerWindowState: MPVPlayerWindowState?
+    private var systemPIPController: NSObject?
+    private var systemPIPContentController: NSViewController?
+    private var systemPIPDelegate: DenboxSystemPictureInPictureDelegate?
+    private var systemPIPOriginalSuperview: NSView?
+    private var systemPIPOriginalWindow: NSWindow?
+    private var systemPIPOriginalConstraints: [NSLayoutConstraint] = []
+    private var systemPIPOriginalFrame = NSRect.zero
+    private var systemPIPOriginalSubviewIndex = 0
+    private var systemPIPOriginalAutoresizingMask: NSView.AutoresizingMask = []
+    private var systemPIPOriginalTranslatesAutoresizingMask = true
+    private var systemPIPWindowWasMiniaturized = false
+    private var didMiniaturizePlayerWindowForPIP = false
+    private var systemPIPClosePrepared = false
     private var pollTimer: Timer?
     private var loadedURL: URL?
     private var loadedHeaders: [String: String] = [:]
@@ -103,6 +130,14 @@ final class MPVPlaybackController: ObservableObject {
     var onCloseRequested: (() -> Void)?
     var onTogglePlaybackInfo: (() -> Void)?
     var onToggleControls: (() -> Void)?
+    var onPictureInPictureUnavailable: (() -> Void)?
+
+    private static let systemPIPFrameworkLoaded: Bool = {
+        guard let framework = Bundle(path: "/System/Library/PrivateFrameworks/PIP.framework") else {
+            return false
+        }
+        return framework.isLoaded || framework.load()
+    }()
 
     init() {
         guard let handle = mpv_create() else {
@@ -163,6 +198,7 @@ final class MPVPlaybackController: ObservableObject {
     func shutdown() {
         guard !shutdownRequested else { return }
         shutdownRequested = true
+        _ = exitSystemPictureInPicture()
         pollTimer?.invalidate()
         pollTimer = nil
         detachRenderer()
@@ -220,8 +256,220 @@ final class MPVPlaybackController: ObservableObject {
     }
 
     func setPlayerWindow(_ window: NSWindow?) {
+        if isInSystemPictureInPictureMode, window !== systemPIPOriginalWindow { return }
         playerWindow = window
         window?.collectionBehavior.insert(.fullScreenPrimary)
+    }
+
+    func registerRenderView(_ view: MPVRenderView?) {
+        renderView = view
+    }
+
+    @discardableResult
+    func enterSystemPictureInPicture(title: String) -> Bool {
+        guard !shutdownRequested,
+              !isInSystemPictureInPictureMode,
+              !isInMiniPlayerMode,
+              Self.systemPIPFrameworkLoaded,
+              let pipClass = NSClassFromString("PIPViewController") as? NSObject.Type,
+              let view = renderView,
+              let parent = view.superview,
+              let window = playerWindow ?? view.window else {
+            return false
+        }
+
+        let pipController = pipClass.init()
+        let presentSelector = NSSelectorFromString("presentViewControllerAsPictureInPicture:")
+        let dismissSelector = NSSelectorFromString("dismissViewController:")
+        guard pipController.responds(to: presentSelector),
+              pipController.responds(to: dismissSelector) else {
+            return false
+        }
+
+        systemPIPOriginalSuperview = parent
+        systemPIPOriginalWindow = window
+        systemPIPOriginalFrame = view.frame
+        systemPIPOriginalSubviewIndex = parent.subviews.firstIndex(where: { $0 === view }) ?? parent.subviews.count
+        systemPIPOriginalAutoresizingMask = view.autoresizingMask
+        systemPIPOriginalTranslatesAutoresizingMask = view.translatesAutoresizingMaskIntoConstraints
+        systemPIPOriginalConstraints = parent.constraints.filter { constraint in
+            (constraint.firstItem as? NSView) === view || (constraint.secondItem as? NSView) === view
+        }
+        systemPIPWindowWasMiniaturized = window.isMiniaturized
+        didMiniaturizePlayerWindowForPIP = false
+        systemPIPClosePrepared = false
+
+        let contentController = NSViewController()
+        contentController.view = view
+        let delegate = DenboxSystemPictureInPictureDelegate(owner: self)
+        pipController.setValue(title, forKey: "title")
+        pipController.setValue(NSNumber(value: isPlaying), forKey: "playing")
+        pipController.setValue(delegate, forKey: "delegate")
+        systemPIPController = pipController
+        systemPIPContentController = contentController
+        systemPIPDelegate = delegate
+        isInSystemPictureInPictureMode = true
+        _ = pipController.perform(presentSelector, with: contentController)
+
+        // IINA leaves the system PiP window visible and tucks away the full
+        // player window after the existing video view has moved into PiP.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak view, weak window] in
+            guard let self, let view, let window, self.isInSystemPictureInPictureMode else { return }
+            guard view.window !== window else {
+                _ = self.systemPIPController?.perform(dismissSelector, with: contentController)
+                self.finishSystemPictureInPicture()
+                self.onPictureInPictureUnavailable?()
+                return
+            }
+            if !self.systemPIPWindowWasMiniaturized,
+               !window.styleMask.contains(.fullScreen),
+               !window.isMiniaturized {
+                self.didMiniaturizePlayerWindowForPIP = true
+                window.miniaturize(nil)
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    func exitSystemPictureInPicture() -> Bool {
+        guard isInSystemPictureInPictureMode,
+              let pipController = systemPIPController,
+              let contentController = systemPIPContentController else { return false }
+        prepareSystemPictureInPictureClose(using: pipController)
+        _ = pipController.perform(NSSelectorFromString("dismissViewController:"), with: contentController)
+        return true
+    }
+
+    func prepareSystemPictureInPictureClose(using pipController: AnyObject) {
+        guard !systemPIPClosePrepared,
+              let pipController = pipController as? NSObject,
+              let window = systemPIPOriginalWindow else { return }
+        systemPIPClosePrepared = true
+        let replacementRect = systemPIPOriginalSuperview?.convert(systemPIPOriginalFrame, to: nil) ?? .zero
+        pipController.setValue(NSValue(rect: replacementRect), forKey: "replacementRect")
+        _ = pipController.perform(NSSelectorFromString("setReplacementWindow:"), with: window)
+        NSApp.activate(ignoringOtherApps: true)
+        if didMiniaturizePlayerWindowForPIP || window.isMiniaturized {
+            window.deminiaturize(nil)
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func finishSystemPictureInPicture() {
+        guard isInSystemPictureInPictureMode else { return }
+        isInSystemPictureInPictureMode = false
+        if let view = renderView, let parent = systemPIPOriginalSuperview {
+            view.removeFromSuperview()
+            let sibling = parent.subviews.indices.contains(systemPIPOriginalSubviewIndex)
+                ? parent.subviews[systemPIPOriginalSubviewIndex] : nil
+            if let sibling {
+                parent.addSubview(view, positioned: .below, relativeTo: sibling)
+            } else {
+                parent.addSubview(view)
+            }
+            view.frame = systemPIPOriginalFrame
+            view.autoresizingMask = systemPIPOriginalAutoresizingMask
+            view.translatesAutoresizingMaskIntoConstraints = systemPIPOriginalTranslatesAutoresizingMask
+            for constraint in systemPIPOriginalConstraints where !constraint.isActive {
+                constraint.isActive = true
+            }
+            view.openGLContext?.update()
+            view.needsDisplay = true
+        }
+        if didMiniaturizePlayerWindowForPIP, let window = systemPIPOriginalWindow, window.isMiniaturized {
+            window.deminiaturize(nil)
+            window.makeKeyAndOrderFront(nil)
+        }
+        systemPIPController = nil
+        systemPIPContentController = nil
+        systemPIPDelegate = nil
+        systemPIPOriginalSuperview = nil
+        systemPIPOriginalWindow = nil
+        systemPIPOriginalConstraints = []
+        didMiniaturizePlayerWindowForPIP = false
+        systemPIPClosePrepared = false
+    }
+
+    fileprivate func setPlaybackPausedByPictureInPicture(_ paused: Bool) {
+        setProperty("pause", value: paused ? "yes" : "no")
+        isPlaying = !paused
+        updateSystemPictureInPicturePlayingState()
+    }
+
+    private func updateSystemPictureInPicturePlayingState() {
+        systemPIPController?.setValue(NSNumber(value: isPlaying), forKey: "playing")
+    }
+
+    @discardableResult
+    func enterMiniPlayer(title: String) -> Bool {
+        guard !isInMiniPlayerMode, !isInSystemPictureInPictureMode, let window = playerWindow else { return false }
+        regularPlayerWindowState = MPVPlayerWindowState(
+            frame: window.frame,
+            title: window.title,
+            level: window.level,
+            collectionBehavior: window.collectionBehavior,
+            minSize: window.minSize,
+            maxSize: window.maxSize,
+            isMovableByWindowBackground: window.isMovableByWindowBackground
+        )
+        isInMiniPlayerMode = true
+
+        // Keep the existing libmpv view and playback session in the same
+        // window. Only the AppKit presentation changes, so entering the mini
+        // player does not reload the stream or hand it to another app.
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.isInMiniPlayerMode else { return }
+            window.minSize = NSSize(width: 420, height: 280)
+            window.maxSize = NSSize(width: 900, height: 620)
+            window.level = .floating
+            window.collectionBehavior.insert(.canJoinAllSpaces)
+            window.isMovableByWindowBackground = true
+            window.title = title
+            window.setContentSize(NSSize(width: 560, height: 350))
+
+            if let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame {
+                let frame = window.frame
+                let origin = NSPoint(
+                    x: max(visibleFrame.minX + 16, visibleFrame.maxX - frame.width - 16),
+                    y: max(visibleFrame.minY + 16, visibleFrame.maxY - frame.height - 16)
+                )
+                window.setFrameOrigin(origin)
+            }
+            window.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    func updateMiniPlayerTitle(_ title: String) {
+        if isInSystemPictureInPictureMode {
+            systemPIPController?.setValue(title, forKey: "title")
+            return
+        }
+        guard isInMiniPlayerMode else { return }
+        playerWindow?.title = title
+    }
+
+    func exitMiniPlayer() {
+        guard isInMiniPlayerMode else { return }
+        isInMiniPlayerMode = false
+        guard let state = regularPlayerWindowState else { return }
+        regularPlayerWindowState = nil
+        guard let window = playerWindow else { return }
+
+        // SwiftUI updates the content's minimum size after the published mode
+        // change. Restore the original AppKit constraints and frame afterward.
+        DispatchQueue.main.async { [weak window] in
+            guard let window else { return }
+            window.minSize = state.minSize
+            window.maxSize = state.maxSize
+            window.level = state.level
+            window.collectionBehavior = state.collectionBehavior
+            window.isMovableByWindowBackground = state.isMovableByWindowBackground
+            window.title = state.title
+            window.setFrame(state.frame, display: true, animate: true)
+            window.makeKeyAndOrderFront(nil)
+        }
     }
 
     func toggleFullscreen() {
@@ -278,6 +526,10 @@ final class MPVPlaybackController: ObservableObject {
             return
         }
         if loadedURL == url, loadedHeaders == headers {
+            if startAtSeconds.isFinite, startAtSeconds > 0,
+               abs(currentTimeSeconds - startAtSeconds) > 1 {
+                seek(to: startAtSeconds)
+            }
             setProperty("pause", value: "no")
             isPlaying = true
             return
@@ -325,6 +577,7 @@ final class MPVPlaybackController: ObservableObject {
     }
 
     func stop() {
+        _ = exitSystemPictureInPicture()
         flushPendingWatchTime()
         isPlaying = false
         lastWatchTick = nil
@@ -344,6 +597,7 @@ final class MPVPlaybackController: ObservableObject {
     func togglePlayPause() {
         setProperty("pause", value: isPlaying ? "yes" : "no")
         isPlaying.toggle()
+        updateSystemPictureInPicturePlayingState()
     }
 
     func seek(to seconds: Double) {
@@ -827,6 +1081,7 @@ final class MPVPlaybackController: ObservableObject {
         // Count viewing time only while mpv's playback core is actually advancing media.
         isPlaying = !isLoading && errorMessage == nil
             && !paused && !idle && !waitingForCache && !seeking && !coreIdle
+        updateSystemPictureInPicturePlayingState()
 
         guard isPlaying else {
             flushPendingWatchTime()
@@ -1013,6 +1268,47 @@ final class MPVPlaybackController: ObservableObject {
     }
 }
 
+@MainActor
+private final class DenboxSystemPictureInPictureDelegate: NSObject {
+    weak var owner: MPVPlaybackController?
+
+    init(owner: MPVPlaybackController) {
+        self.owner = owner
+        super.init()
+    }
+
+    @objc(pipWillClose:)
+    func pipWillClose(_ controller: AnyObject) {
+        owner?.prepareSystemPictureInPictureClose(using: controller)
+    }
+
+    @objc(pipShouldClose:)
+    func pipShouldClose(_ controller: AnyObject) -> Bool {
+        owner?.prepareSystemPictureInPictureClose(using: controller)
+        return true
+    }
+
+    @objc(pipDidClose:)
+    func pipDidClose(_ controller: AnyObject) {
+        owner?.finishSystemPictureInPicture()
+    }
+
+    @objc(pipActionPlay:)
+    func pipActionPlay(_ controller: AnyObject) {
+        owner?.setPlaybackPausedByPictureInPicture(false)
+    }
+
+    @objc(pipActionPause:)
+    func pipActionPause(_ controller: AnyObject) {
+        owner?.setPlaybackPausedByPictureInPicture(true)
+    }
+
+    @objc(pipActionStop:)
+    func pipActionStop(_ controller: AnyObject) {
+        owner?.setPlaybackPausedByPictureInPicture(true)
+    }
+}
+
 private let openGLFramework = dlopen("/System/Library/Frameworks/OpenGL.framework/OpenGL", RTLD_LAZY | RTLD_LOCAL)
 
 private let mpvOpenGLGetProcAddress: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> UnsafeMutableRawPointer? = { _, name in
@@ -1024,11 +1320,14 @@ struct MPVVideoView: NSViewRepresentable {
     @ObservedObject var controller: MPVPlaybackController
 
     func makeNSView(context: Context) -> MPVRenderView {
-        MPVRenderView(frame: .zero, controller: controller)!
+        let view = MPVRenderView(frame: .zero, controller: controller)!
+        controller.registerRenderView(view)
+        return view
     }
 
     func updateNSView(_ view: MPVRenderView, context: Context) {
         view.controller = controller
+        controller.registerRenderView(view)
         view.needsDisplay = true
     }
 
@@ -1170,6 +1469,7 @@ final class MPVRenderView: NSOpenGLView {
         inputWindow = nil
         previousMouseMoveSetting = nil
         controller.setPlayerWindow(nil)
+        controller.registerRenderView(nil)
         openGLContext?.makeCurrentContext()
         controller.detachRenderer()
     }

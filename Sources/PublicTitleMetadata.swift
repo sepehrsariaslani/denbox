@@ -84,6 +84,50 @@ enum PersianMetadataText {
     }
 }
 
+enum PublicMetadataGenreParser {
+    private static let canonicalNames: [String: String] = [
+        "action": "Action", "اکشن": "Action",
+        "adventure": "Adventure", "ماجراجویی": "Adventure",
+        "animation": "Animation", "انیمیشن": "Animation",
+        "biography": "Biography", "زندگی نامه": "Biography", "زندگی‌نامه": "Biography",
+        "comedy": "Comedy", "کمدی": "Comedy",
+        "crime": "Crime", "جنایی": "Crime",
+        "documentary": "Documentary", "مستند": "Documentary",
+        "drama": "Drama", "درام": "Drama",
+        "family": "Family", "خانوادگی": "Family",
+        "fantasy": "Fantasy", "فانتزی": "Fantasy",
+        "film-noir": "Film-Noir", "noir": "Film-Noir", "نوآر": "Film-Noir",
+        "game-show": "Game-Show", "مسابقه": "Game-Show",
+        "history": "History", "تاریخی": "History",
+        "horror": "Horror", "ترسناک": "Horror",
+        "music": "Music", "موسیقی": "Music",
+        "musical": "Musical", "موزیکال": "Musical",
+        "mystery": "Mystery", "معمایی": "Mystery",
+        "news": "News", "خبر": "News",
+        "reality-tv": "Reality-TV", "واقع نما": "Reality-TV", "واقع‌نما": "Reality-TV",
+        "romance": "Romance", "عاشقانه": "Romance",
+        "sci-fi": "Sci-Fi", "science fiction": "Sci-Fi", "علمی-تخیلی": "Sci-Fi",
+        "علمی تخیلی": "Sci-Fi", "علمی‌تخیلی": "Sci-Fi",
+        "short": "Short", "کوتاه": "Short",
+        "sport": "Sport", "ورزشی": "Sport",
+        "talk-show": "Talk-Show", "گفت و گو": "Talk-Show", "گفت‌وگو": "Talk-Show",
+        "thriller": "Thriller", "هیجان انگیز": "Thriller", "هیجان‌انگیز": "Thriller",
+        "war": "War", "جنگی": "War",
+        "western": "Western", "وسترن": "Western",
+        "adult": "Adult", "بزرگسالان": "Adult"
+    ]
+
+    static func canonicalName(_ value: String) -> String {
+        let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .replacingOccurrences(of: "ي", with: "ی")
+            .replacingOccurrences(of: "ك", with: "ک")
+            .replacingOccurrences(of: "ـ", with: "")
+            .lowercased()
+        return canonicalNames[key] ?? value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 struct PublicMetadataCandidate: Sendable {
     let index: Int
     let text: String
@@ -185,6 +229,9 @@ enum PublicMetadataTitleMatcher {
 }
 
 struct PublicTitleMetadata: Codable, Sendable, Identifiable {
+    static let currentEnrichmentVersion = 2
+    static let currentPageDetailsVersion = 2
+
     let provider: PublicMetadataProvider
     let pageURL: URL
     var title: String
@@ -195,6 +242,25 @@ struct PublicTitleMetadata: Codable, Sendable, Identifiable {
     let episodeSnippets: [String]
     let imageURLs: [URL]
     let importedAt: Date
+    var originalTitle: String? = nil
+    var year: String? = nil
+    var country: String? = nil
+    var contentRating: String? = nil
+    var publicRating: String? = nil
+    var ratingSource: String? = nil
+    var communityRating: String? = nil
+    var communityVotes: String? = nil
+    var runtime: String? = nil
+    var director: String? = nil
+    var genres: [String]? = nil
+    var seasonCount: Int? = nil
+    var episodeCount: Int? = nil
+    var castNames: [String]? = nil
+    var crewNames: [String]? = nil
+    var publicBadges: [String]? = nil
+    var enrichmentVersion: Int? = currentEnrichmentVersion
+    var pageDetailsVersion: Int? = nil
+    var pageDetailsAttemptedAt: Date? = nil
 
     var id: String { "\(provider.rawValue):\(pageURL.absoluteString)" }
 
@@ -203,6 +269,13 @@ struct PublicTitleMetadata: Codable, Sendable, Identifiable {
     func needsAutomaticRefresh(now: Date = Date()) -> Bool {
         let age = now.timeIntervalSince(importedAt)
         return age > 30 * 24 * 60 * 60 || !hasPersianSynopsis || posterURL == nil
+            || enrichmentVersion != Self.currentEnrichmentVersion
+    }
+
+    func needsPageDetailsRefresh(now: Date = Date()) -> Bool {
+        guard pageDetailsVersion != Self.currentPageDetailsVersion else { return false }
+        guard let pageDetailsAttemptedAt else { return true }
+        return now.timeIntervalSince(pageDetailsAttemptedAt) >= PublicTitleMetadataRefreshPolicy.retryInterval
     }
 
     func merging(_ fallback: PublicTitleMetadata) -> PublicTitleMetadata {
@@ -226,8 +299,41 @@ struct PublicTitleMetadata: Codable, Sendable, Identifiable {
             visibleHeadings: Self.mergeStrings(visibleHeadings + fallback.visibleHeadings, limit: 100),
             episodeSnippets: Self.mergeStrings(episodeSnippets + fallback.episodeSnippets, limit: 150),
             imageURLs: Self.mergeURLs(imageURLs + fallback.imageURLs, limit: 40),
-            importedAt: max(importedAt, fallback.importedAt)
+            importedAt: max(importedAt, fallback.importedAt),
+            originalTitle: Self.nonEmpty(originalTitle) ?? fallback.originalTitle,
+            year: Self.nonEmpty(year) ?? fallback.year,
+            country: Self.nonEmpty(country) ?? fallback.country,
+            contentRating: Self.nonEmpty(contentRating) ?? fallback.contentRating,
+            publicRating: Self.nonEmpty(publicRating) ?? fallback.publicRating,
+            ratingSource: Self.nonEmpty(ratingSource) ?? fallback.ratingSource,
+            communityRating: Self.nonEmpty(communityRating) ?? fallback.communityRating,
+            communityVotes: Self.nonEmpty(communityVotes) ?? fallback.communityVotes,
+            runtime: Self.nonEmpty(runtime) ?? fallback.runtime,
+            director: Self.nonEmpty(director) ?? fallback.director,
+            genres: Self.mergeOptionalStrings(genres, fallback.genres, limit: 12),
+            seasonCount: seasonCount ?? fallback.seasonCount,
+            episodeCount: episodeCount ?? fallback.episodeCount,
+            castNames: Self.mergeOptionalStrings(castNames, fallback.castNames, limit: 40),
+            crewNames: Self.mergeOptionalStrings(crewNames, fallback.crewNames, limit: 30),
+            publicBadges: Self.mergeOptionalStrings(publicBadges, fallback.publicBadges, limit: 20),
+            enrichmentVersion: max(enrichmentVersion ?? 0, fallback.enrichmentVersion ?? 0) == 0
+                ? nil : max(enrichmentVersion ?? 0, fallback.enrichmentVersion ?? 0),
+            pageDetailsVersion: pageDetailsVersion ?? fallback.pageDetailsVersion,
+            pageDetailsAttemptedAt: [pageDetailsAttemptedAt, fallback.pageDetailsAttemptedAt]
+                .compactMap { $0 }.max()
         )
+    }
+
+    private static func mergeOptionalStrings(_ first: [String]?, _ second: [String]?, limit: Int) -> [String]? {
+        var seen = Set<String>()
+        let values = Array(((first ?? []) + (second ?? [])).filter { seen.insert($0).inserted }.prefix(limit))
+        return values.isEmpty ? nil : values
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func mergeStrings(_ values: [String], limit: Int) -> [String] {
@@ -251,12 +357,34 @@ struct PublicTitleMetadata: Codable, Sendable, Identifiable {
             visibleHeadings: visibleHeadings,
             episodeSnippets: episodeSnippets,
             imageURLs: imageURLs,
-            importedAt: importedAt
+            importedAt: importedAt,
+            originalTitle: originalTitle,
+            year: year,
+            country: country,
+            contentRating: contentRating,
+            publicRating: publicRating,
+            ratingSource: ratingSource,
+            communityRating: communityRating,
+            communityVotes: communityVotes,
+            runtime: runtime,
+            director: director,
+            genres: genres,
+            seasonCount: seasonCount,
+            episodeCount: episodeCount,
+            castNames: castNames,
+            crewNames: crewNames,
+            publicBadges: publicBadges,
+            enrichmentVersion: enrichmentVersion,
+            pageDetailsVersion: pageDetailsVersion,
+            pageDetailsAttemptedAt: pageDetailsAttemptedAt
         )
     }
 }
 
 enum PublicTitleMetadataRefreshPolicy {
+    // Version the provider search strategy so attempts made by an older, failing
+    // WebKit-only lookup do not suppress the first run of the direct public APIs.
+    static let lookupVersion = 3
     static let retryInterval: TimeInterval = 24 * 60 * 60
 
     static func shouldRefresh(

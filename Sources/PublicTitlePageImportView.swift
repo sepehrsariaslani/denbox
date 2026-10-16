@@ -111,7 +111,7 @@ struct PublicTitlePageImportView: View {
                     }
 
                     if !capture.episodeSnippets.isEmpty {
-                        DisclosureGroup(DenboxLanguage.localizedMessage("Visible episodes on this page (\(capture.episodeSnippets.count))")) {
+                        DisclosureGroup(DenboxLanguage.localizedMessage("Visible episode details on this page (\(capture.episodeSnippets.count))")) {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 6) {
                                     ForEach(Array(capture.episodeSnippets.enumerated()), id: \.offset) { _, snippet in

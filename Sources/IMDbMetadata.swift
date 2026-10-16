@@ -24,6 +24,11 @@ struct IMDbTitleMetadata: Identifiable, Sendable {
     var imdbURL: URL? { URL(string: "https://www.imdb.com/title/\(tconst)/") }
 }
 
+struct IMDbStartupSummary: Sendable {
+    let lastUpdated: Date?
+    let hasPeopleData: Bool
+}
+
 struct IMDbPersonMetadata: Identifiable, Sendable {
     let nconst: String
     let name: String
@@ -177,6 +182,8 @@ final class IMDbMetadataStore: @unchecked Sendable {
     private let fileManager = FileManager.default
     private let searchIndexLock = NSLock()
     private var hasSearchIndexes = false
+    private let catalogMatchIndexLock = NSLock()
+    private var hasCatalogMatchIndexes = false
     private let discoveryIndexLock = NSLock()
     private var hasDiscoveryIndex = false
     private let seriesGenreIndexLock = NSLock()
@@ -226,6 +233,28 @@ final class IMDbMetadataStore: @unchecked Sendable {
         guard sqlite3_step(statement) == SQLITE_ROW,
               let raw = text(statement, 0), let seconds = Double(raw) else { return nil }
         return Date(timeIntervalSince1970: seconds)
+    }
+
+    func startupSummary() -> IMDbStartupSummary {
+        guard let db = openReadOnly() else { return IMDbStartupSummary(lastUpdated: nil, hasPeopleData: false) }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        let sql = "SELECT key,value FROM metadata WHERE key IN ('updated_at','people_ready')"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            return IMDbStartupSummary(lastUpdated: nil, hasPeopleData: false)
+        }
+        defer { sqlite3_finalize(statement) }
+        var updatedAt: Date?
+        var hasPeopleData = false
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let key = text(statement, 0), let value = text(statement, 1) else { continue }
+            if key == "updated_at", let seconds = Double(value) {
+                updatedAt = Date(timeIntervalSince1970: seconds)
+            } else if key == "people_ready" {
+                hasPeopleData = value == "1"
+            }
+        }
+        return IMDbStartupSummary(lastUpdated: updatedAt, hasPeopleData: hasPeopleData)
     }
 
     func refresh(progress: @escaping @Sendable (String) -> Void) async throws {
@@ -309,7 +338,8 @@ final class IMDbMetadataStore: @unchecked Sendable {
             let columns = "tconst,primary_title,start_year,genres,rating,votes,normalized_primary,normalized_original,title_type"
             let sql = exactTitleLookupSQL(columns: columns, predicate: predicate, kind: entry.kind, indexesReady: indexesReady)
             var candidates: [(title: IMDbTitleMetadata, primary: String, original: String, score: Double)] = []
-            let aliases = ([entry.title] + entry.alternateTitles).uniqued()
+            var seenAliases = Set<String>()
+            let aliases = ([entry.title] + entry.alternateTitles).filter { seenAliases.insert($0).inserted }
 
             for alias in aliases {
                 let normalized = imdbNormalize(alias)
@@ -624,7 +654,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
     }
 
     func catalogMetadata(for items: [MediaItem]) -> [String: IMDbTitleMetadata] {
-        let indexesReady = ensureSearchIndexes()
+        let indexesReady = ensureCatalogMatchIndexes()
         guard let db = openReadOnly() else { return [:] }
         defer { sqlite3_close(db) }
         var result: [String: IMDbTitleMetadata] = [:]
@@ -832,6 +862,33 @@ final class IMDbMetadataStore: @unchecked Sendable {
         defer { searchIndexLock.unlock() }
         if hasSearchIndexes { return true }
         guard isAvailable else { return false }
+        guard ensureCatalogMatchIndexes() else { return false }
+
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db else {
+            if let db { sqlite3_close(db) }
+            return false
+        }
+        sqlite3_busy_timeout(db, 20_000)
+        let result = sqlite3_exec(db, """
+            CREATE INDEX IF NOT EXISTS idx_series_start_year
+                ON titles(start_year)
+                WHERE title_type IN ('tvSeries','tvMiniSeries');
+            CREATE INDEX IF NOT EXISTS idx_movie_start_year
+                ON titles(start_year,votes DESC)
+                WHERE title_type='movie' AND rating IS NOT NULL;
+            """, nil, nil, nil)
+        sqlite3_close(db)
+        hasSearchIndexes = result == SQLITE_OK
+        return hasSearchIndexes
+    }
+
+    private func ensureCatalogMatchIndexes() -> Bool {
+        catalogMatchIndexLock.lock()
+        defer { catalogMatchIndexLock.unlock() }
+        if hasCatalogMatchIndexes { return true }
+        guard isAvailable else { return false }
 
         var db: OpaquePointer?
         guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
@@ -846,19 +903,13 @@ final class IMDbMetadataStore: @unchecked Sendable {
             CREATE INDEX IF NOT EXISTS idx_series_normalized_original
                 ON titles(normalized_original)
                 WHERE title_type IN ('tvSeries','tvMiniSeries');
-            CREATE INDEX IF NOT EXISTS idx_series_start_year
-                ON titles(start_year)
-                WHERE title_type IN ('tvSeries','tvMiniSeries');
             CREATE INDEX IF NOT EXISTS idx_movie_normalized_original
                 ON titles(normalized_original)
                 WHERE title_type='movie';
-            CREATE INDEX IF NOT EXISTS idx_movie_start_year
-                ON titles(start_year,votes DESC)
-                WHERE title_type='movie' AND rating IS NOT NULL;
             """, nil, nil, nil)
         sqlite3_close(db)
-        hasSearchIndexes = result == SQLITE_OK
-        return hasSearchIndexes
+        hasCatalogMatchIndexes = result == SQLITE_OK
+        return hasCatalogMatchIndexes
     }
 
     private func ensureDiscoveryIndex() -> Bool {
@@ -1451,13 +1502,6 @@ enum IMDbTitleNormalizer {
 
 private func imdbNormalize(_ value: String) -> String {
     IMDbTitleNormalizer.normalize(value)
-}
-
-private extension Array where Element: Hashable {
-    func uniqued() -> [Element] {
-        var seen = Set<Element>()
-        return filter { seen.insert($0).inserted }
-    }
 }
 
 private func titleSimilarity(_ lhs: String, _ rhs: String) -> Double {

@@ -50,6 +50,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {
     case movies = "Movies"
     case shows = "TV Shows"
     case imdbCharts = "IMDb Charts"
+    case releaseCalendar = "Release Calendar"
     case imdbPeople = "IMDb People"
     case imdbFranchises = "IMDb Franchises"
     case watchlist = "My List"
@@ -69,6 +70,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {
         case .movies: "film"
         case .shows: "tv"
         case .imdbCharts: "chart.bar.xaxis"
+        case .releaseCalendar: "calendar"
         case .imdbPeople: "person.2"
         case .imdbFranchises: "rectangle.stack"
         case .watchlist: "bookmark"
@@ -299,14 +301,20 @@ extension MediaItem {
         }?.synopsis
         let resolvedSynopsis = publicSynopsis ?? synopsis.nilIfEmpty ?? fallbackSynopsis ?? synopsis
         let resolvedArtwork = ordered.compactMap(\.posterURL).first ?? artworkURL
-        guard resolvedSynopsis != synopsis || resolvedArtwork != artworkURL else { return self }
+        let resolvedYear = year.nilIfEmpty ?? ordered.compactMap { $0.year?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty }.first ?? year
+        var seenPublicGenres = Set<String>()
+        let publicGenres = Array(ordered.flatMap { $0.genres ?? [] }
+            .filter { seenPublicGenres.insert($0).inserted }.prefix(12))
+        let resolvedGenres = genres.isEmpty ? publicGenres : genres
+        guard resolvedSynopsis != synopsis || resolvedArtwork != artworkURL
+                || resolvedYear != year || resolvedGenres != genres else { return self }
         return MediaItem(
             id: id,
             apiID: apiID,
             title: title,
             subtitle: subtitle,
             synopsis: resolvedSynopsis,
-            year: year,
+            year: resolvedYear,
             kind: kind,
             symbol: symbol,
             palette: palette,
@@ -314,7 +322,7 @@ extension MediaItem {
             isRemote: isRemote,
             matchingTitles: matchingTitles,
             imdbID: imdbID,
-            genres: genres,
+            genres: resolvedGenres,
             imdbRating: imdbRating,
             imdbVotes: imdbVotes
         )
@@ -650,6 +658,8 @@ final class LibraryModel: ObservableObject {
     @Published var isPlayerWindowOpen = false
     @Published var playerTitle = "Now Playing"
     @Published var playerHeaders: [String: String] = [:]
+    @Published private(set) var playerRequestID = UUID()
+    @Published private(set) var isResumingPlayback = false
     @Published var showingSettings = false
     @Published var catalogName = "Local library"
     @Published var selectedGenreFilters: Set<String> = []
@@ -702,6 +712,8 @@ final class LibraryModel: ObservableObject {
     private var referenceCatalogEnrichmentTask: Task<Void, Never>?
     private var referenceCatalogEnrichmentRequested = false
     private var forceTMDBReferenceRefreshRequested = false
+    private var catalogIMDbEnrichmentTask: Task<Void, Never>?
+    private var catalogIMDbEnrichmentRequested = false
     private var recommendationsNeedRefresh = false
     private var catalogRefreshInProgress = false
     private var detailRefreshesInFlight: Set<String> = []
@@ -720,28 +732,20 @@ final class LibraryModel: ObservableObject {
     private var nextMoviePage = 0
     private var nextSeriesPage = 0
 
-    init(loadRemoteCatalog: Bool = true, refreshStaleDetailsInBackground: Bool = true, databaseURL: URL? = nil) {
+    init(
+        loadRemoteCatalog: Bool = true,
+        refreshStaleDetailsInBackground: Bool = true,
+        databaseURL: URL? = nil,
+        startBackgroundCatalogEnrichment: Bool = true
+    ) {
         self.refreshStaleDetailsInBackground = refreshStaleDetailsInBackground
         let database = MediaDatabase(databaseURL: databaseURL)
         self.database = database
         self.downloadManager = DownloadManager(database: database)
         database.closeUnfinishedWatchSessions()
-        if let updated = IMDbMetadataStore.shared.lastUpdated {
-            imdbDatasetStatus = "IMDb dataset ready · updated \(updated.formatted(date: .abbreviated, time: .shortened))"
-        }
-        imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
         selectedGenreFilters = database.loadGenrePreferences(category: "filter")
         preferredGenres = database.loadGenrePreferences(category: "preferred")
-        let cached = database.loadCatalog().map { item in
-            var enriched = item
-            if let reference = database.loadReferenceMetadata(mediaID: item.id) {
-                enriched = enriched.applyingReference(reference)
-            }
-            let publicMetadata = PublicMetadataProvider.allCases.compactMap {
-                database.loadPublicTitleMetadata(mediaID: item.id, provider: $0)
-            }
-            return enriched.applyingPublicTitleMetadata(publicMetadata)
-        }
+        let cached = database.loadCatalog()
         if !cached.isEmpty {
             items = cached
             catalogName = "Denbox Library"
@@ -752,7 +756,19 @@ final class LibraryModel: ObservableObject {
         savedIDs = database.loadSavedIDs()
         personalRatings = database.loadPersonalRatings()
         refreshViewingData()
-        Task { await enrichCatalogWithIMDb() }
+        if startBackgroundCatalogEnrichment {
+            Task { @MainActor [weak self] in
+                let summary = await Task.detached(priority: .utility) {
+                    IMDbMetadataStore.shared.startupSummary()
+                }.value
+                guard let self else { return }
+                self.imdbPeopleAvailable = summary.hasPeopleData
+                if let updated = summary.lastUpdated {
+                    self.imdbDatasetStatus = "IMDb dataset ready · updated \(updated.formatted(date: .abbreviated, time: .shortened))"
+                }
+            }
+            if !cached.isEmpty { scheduleCatalogIMDbEnrichment(delayNanoseconds: 250_000_000) }
+        }
         if loadRemoteCatalog {
             if SecretVault.read(account: "media-api-key") != nil,
                SecretVault.read(account: "catalog-feed-key") != nil {
@@ -772,7 +788,7 @@ final class LibraryModel: ObservableObject {
             base = items.filter { $0.kind == "Movie" }
         case .shows:
             base = items.filter { $0.kind == "Series" }
-        case .imdbCharts, .imdbPeople, .imdbFranchises, .forYou, .genres, .continueWatching, .watchHistory, .viewingStats:
+        case .imdbCharts, .releaseCalendar, .imdbPeople, .imdbFranchises, .forYou, .genres, .continueWatching, .watchHistory, .viewingStats:
             base = []
         case .watchlist:
             base = items.filter { savedIDs.contains($0.id) }
@@ -877,20 +893,30 @@ final class LibraryModel: ObservableObject {
         return true
     }
 
-    func refreshPublicTitleMetadata(for item: MediaItem, force: Bool = false) async -> (attempted: Int, updated: Int) {
+    func refreshPublicTitleMetadata(
+        for item: MediaItem,
+        force: Bool = false,
+        includePageDetails: Bool = false
+    ) async -> (attempted: Int, updated: Int) {
         guard item.isRemote, ["Movie", "Series"].contains(item.kind) else { return (0, 0) }
         let providers = PublicMetadataProvider.allCases
         let dueProviders = providers.filter { provider in
             let cached = database.loadPublicTitleMetadata(mediaID: item.id, provider: provider)
             let attemptedAt = database.publicTitleMetadataLastAttempt(mediaID: item.id, provider: provider)
-            guard PublicTitleMetadataRefreshPolicy.shouldRefresh(
+            let lookupDue = PublicTitleMetadataRefreshPolicy.shouldRefresh(
                 cached: cached,
                 lastAttempt: attemptedAt,
                 force: force
-            ) else { return false }
+            )
+            let pageDetailsDue = includePageDetails && (cached?.needsPageDetailsRefresh() ?? false)
+            guard lookupDue || pageDetailsDue else { return false }
             return !publicMetadataLookupsInFlight.contains("\(item.id)|\(provider.rawValue)")
         }
         guard !dueProviders.isEmpty else { return (0, 0) }
+
+        let cachedMetadataByProvider = Dictionary(uniqueKeysWithValues: dueProviders.compactMap { provider in
+            database.loadPublicTitleMetadata(mediaID: item.id, provider: provider).map { (provider, $0) }
+        })
 
         for provider in dueProviders {
             publicMetadataLookupsInFlight.insert("\(item.id)|\(provider.rawValue)")
@@ -905,7 +931,18 @@ final class LibraryModel: ObservableObject {
         await withTaskGroup(of: (PublicMetadataProvider, PublicTitleMetadata?).self) { group in
             for provider in dueProviders {
                 group.addTask {
-                    (provider, await PublicMetadataDiscoveryService.discover(for: item, provider: provider))
+                    if includePageDetails,
+                       let cached = cachedMetadataByProvider[provider],
+                       cached.needsPageDetailsRefresh(),
+                       !force,
+                       !cached.needsAutomaticRefresh() {
+                        return (provider, await PublicMetadataDiscoveryService.enrichPageDetails(from: cached))
+                    }
+                    return (provider, await PublicMetadataDiscoveryService.discover(
+                        for: item,
+                        provider: provider,
+                        includePageDetails: includePageDetails
+                    ))
                 }
             }
             for await (provider, discovered) in group {
@@ -1080,33 +1117,51 @@ final class LibraryModel: ObservableObject {
     }
 
     func enrichCatalogWithIMDb() async {
+        scheduleCatalogIMDbEnrichment()
+        await catalogIMDbEnrichmentTask?.value
+    }
+
+    private func scheduleCatalogIMDbEnrichment(delayNanoseconds: UInt64 = 0) {
         guard !items.isEmpty else { return }
-        let catalog = items
+        catalogIMDbEnrichmentRequested = true
+        guard catalogIMDbEnrichmentTask == nil else { return }
+        catalogIMDbEnrichmentTask = Task(priority: .utility) { @MainActor [weak self] in
+            guard let self else { return }
+            var delay = delayNanoseconds
+            repeat {
+                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                delay = 0
+                self.catalogIMDbEnrichmentRequested = false
+                await self.performCatalogIMDbEnrichment()
+            } while self.catalogIMDbEnrichmentRequested && !Task.isCancelled
+            self.catalogIMDbEnrichmentTask = nil
+        }
+    }
+
+    private func performCatalogIMDbEnrichment() async {
+        guard !items.isEmpty else { return }
+        let cachePayloads = database.loadCatalogMetadataPayloads(for: Set(items.map(\.id)))
+        let cachedMetadata = await Task.detached(priority: .utility) {
+            Self.decodeCatalogMetadata(cachePayloads)
+        }.value
+        applyCachedCatalogMetadata(cachedMetadata)
+
+        let catalogSnapshot = items
         let metadata: [String: IMDbTitleMetadata]
         if IMDbMetadataStore.shared.isAvailable {
             metadata = await Task.detached(priority: .utility) {
-                IMDbMetadataStore.shared.catalogMetadata(for: catalog)
+                IMDbMetadataStore.shared.catalogMetadata(for: catalogSnapshot)
             }.value
         } else {
             metadata = [:]
         }
         if !metadata.isEmpty { database.saveIMDbMetadata(metadata) }
-        var enriched: [MediaItem] = []
-        enriched.reserveCapacity(catalog.count)
         var refreshedRatedMetadata = false
-        for item in catalog {
+        items = items.map { item in
             var resolved = item
             if let title = metadata[item.id] {
                 resolved = resolved.applyingIMDb(title)
             }
-            if let reference = database.loadReferenceMetadata(mediaID: item.id) {
-                referenceMetadataByID[item.id] = reference
-                resolved = resolved.applyingReference(reference)
-            }
-            let publicMetadata = PublicMetadataProvider.allCases.compactMap {
-                database.loadPublicTitleMetadata(mediaID: item.id, provider: $0)
-            }
-            resolved = resolved.applyingPublicTitleMetadata(publicMetadata)
             if metadata[item.id] != nil,
                let existingRating = personalRatings[item.id],
                database.updatePersonalRatingSnapshot(resolved) {
@@ -1117,19 +1172,62 @@ final class LibraryModel: ObservableObject {
                 )
                 refreshedRatedMetadata = true
             }
-            enriched.append(resolved)
+            return resolved
         }
-        items = enriched
         if refreshedRatedMetadata { invalidateRecommendations() }
         scheduleCatalogReferenceEnrichment()
         schedulePublicTitleCatalogEnrichment()
+    }
+
+    private func applyCachedCatalogMetadata(_ cachedMetadata: [String: CachedCatalogMetadata]) {
+        guard !cachedMetadata.isEmpty else { return }
+        for (mediaID, cached) in cachedMetadata {
+            if let reference = cached.reference { referenceMetadataByID[mediaID] = reference }
+        }
+        items = items.map { item in
+            guard let cached = cachedMetadata[item.id] else { return item }
+            var resolved = item
+            if let reference = cached.reference { resolved = resolved.applyingReference(reference) }
+            return resolved.applyingPublicTitleMetadata(cached.publicTitles)
+        }
+    }
+
+    nonisolated private static func decodeCatalogMetadata(
+        _ payloads: CatalogMetadataPayloads
+    ) -> [String: CachedCatalogMetadata] {
+        let decoder = JSONDecoder()
+        var result: [String: CachedCatalogMetadata] = [:]
+        for (mediaID, data) in payloads.references {
+            result[mediaID] = CachedCatalogMetadata(
+                reference: try? decoder.decode(ReferenceTitleMetadata.self, from: data),
+                publicTitles: [],
+                publicAttempts: payloads.publicAttempts[mediaID] ?? [:]
+            )
+        }
+        for (mediaID, values) in payloads.publicTitles {
+            let publicTitles = values.compactMap { try? decoder.decode(PublicTitleMetadata.self, from: $0) }
+            let cached = result[mediaID] ?? CachedCatalogMetadata(
+                reference: nil,
+                publicTitles: [],
+                publicAttempts: payloads.publicAttempts[mediaID] ?? [:]
+            )
+            result[mediaID] = CachedCatalogMetadata(
+                reference: cached.reference,
+                publicTitles: publicTitles,
+                publicAttempts: cached.publicAttempts
+            )
+        }
+        for (mediaID, attempts) in payloads.publicAttempts where result[mediaID] == nil {
+            result[mediaID] = CachedCatalogMetadata(reference: nil, publicTitles: [], publicAttempts: attempts)
+        }
+        return result
     }
 
     private func schedulePublicTitleCatalogEnrichment() {
         publicTitleCatalogRefreshRequested = true
         guard publicTitleCatalogTask == nil else { return }
         publicTitleCatalogRefreshRequested = false
-        publicTitleCatalogTask = Task { @MainActor [weak self] in
+        publicTitleCatalogTask = Task(priority: .utility) { @MainActor [weak self] in
             guard let self else { return }
             var checkedTitles = 0
             defer {
@@ -1151,11 +1249,15 @@ final class LibraryModel: ObservableObject {
                 self.publicTitleCatalogRefreshRequested = false
                 let forceRefresh = self.publicTitleCatalogForceRefreshRequested
                 self.publicTitleCatalogForceRefreshRequested = false
+                let cachePayloads = self.database.loadCatalogMetadataPayloads(for: Set(self.items.map(\.id)))
+                let cachedMetadata = await Task.detached(priority: .utility) {
+                    Self.decodeCatalogMetadata(cachePayloads)
+                }.value
                 let pending = self.items.filter { item in
                     guard item.isRemote, ["Movie", "Series"].contains(item.kind) else { return false }
                     return PublicMetadataProvider.allCases.contains { provider in
-                        let cached = self.database.loadPublicTitleMetadata(mediaID: item.id, provider: provider)
-                        let attemptedAt = self.database.publicTitleMetadataLastAttempt(mediaID: item.id, provider: provider)
+                        let cached = cachedMetadata[item.id]?.publicTitles.first { $0.provider == provider }
+                        let attemptedAt = cachedMetadata[item.id]?.publicAttempts[provider.rawValue]
                         guard PublicTitleMetadataRefreshPolicy.shouldRefresh(
                             cached: cached,
                             lastAttempt: attemptedAt,
@@ -1180,7 +1282,7 @@ final class LibraryModel: ObservableObject {
         referenceCatalogEnrichmentRequested = true
         guard referenceCatalogEnrichmentTask == nil else { return }
         referenceCatalogEnrichmentRequested = false
-        referenceCatalogEnrichmentTask = Task { @MainActor [weak self] in
+        referenceCatalogEnrichmentTask = Task(priority: .utility) { @MainActor [weak self] in
             guard let self else { return }
             let forceTMDB = self.forceTMDBReferenceRefreshRequested
             self.forceTMDBReferenceRefreshRequested = false
@@ -1203,10 +1305,14 @@ final class LibraryModel: ObservableObject {
             }
 
             while !Task.isCancelled {
+                let cachePayloads = self.database.loadCatalogMetadataPayloads(for: Set(self.items.map(\.id)))
+                let cachedMetadata = await Task.detached(priority: .utility) {
+                    Self.decodeCatalogMetadata(cachePayloads)
+                }.value
                 let pending = self.items.compactMap { item -> (MediaItem, ReferenceTitleMetadata?, String)? in
                     guard item.kind == "Movie" || item.kind == "Series" else { return nil }
                     let imdbID = item.imdbID
-                    let cached = self.database.loadReferenceMetadata(mediaID: item.id)
+                    let cached = cachedMetadata[item.id]?.reference
                     guard ReferenceMetadataService.shouldRefresh(cached, for: item, imdbID: imdbID,
                                                                   hasTMDBToken: hasTMDBToken,
                                                                   forceTMDB: forceTMDB) else { return nil }
@@ -1374,30 +1480,31 @@ final class LibraryModel: ObservableObject {
     }
 
     private func fetchDetails(for item: MediaItem, apiKey: String, reportFailure: Bool) async -> MediaDetails? {
-        var fallback: (details: MediaDetails, payload: Any)?
-        let response = try? await DirectMediaAPI.getJSON(
+        let response = try? await DirectMediaAPI.getJSONData(
             firstAcceptableFrom: DirectMediaAPI.detailsURLs(for: item, apiKey: apiKey),
             timeout: 12
-        ) { payload in
-            let details = Self.parseDetails(payload, for: item)
-            if details.hasPlayableResources { return true }
-            if fallback == nil, details.hasUsefulContent { fallback = (details, payload) }
-            return false
+        ) { data in
+            let details = await Self.parseDetailsData(data, for: item)
+            return DirectMediaAPI.JSONDataEvaluation(
+                value: details,
+                isPreferred: details?.hasPlayableResources == true,
+                useAsFallback: details?.hasUsefulContent == true
+            )
         }
         if let response {
-            let details = Self.parseDetails(response, for: item)
+            let details = response.value
             if details.hasPlayableResources {
-                cacheDetailsPayload(response, for: item)
+                cacheDetailsPayload(response.data, for: item)
                 scheduleIMDbEnrichment(for: item, details: details)
                 scheduleReferenceEnrichment(for: item, details: details)
                 return details
             }
-        }
-        if let fallback {
-            cacheDetailsPayload(fallback.payload, for: item)
-            scheduleIMDbEnrichment(for: item, details: fallback.details)
-            scheduleReferenceEnrichment(for: item, details: fallback.details)
-            return fallback.details
+            if details.hasUsefulContent {
+                cacheDetailsPayload(response.data, for: item)
+                scheduleIMDbEnrichment(for: item, details: details)
+                scheduleReferenceEnrichment(for: item, details: details)
+                return details
+            }
         }
         if reportFailure && !Task.isCancelled {
             connectionStatus = "Details could not be loaded. Check the API key and connection."
@@ -1405,9 +1512,7 @@ final class LibraryModel: ObservableObject {
         return nil
     }
 
-    private func cacheDetailsPayload(_ payload: Any, for item: MediaItem) {
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return }
+    private func cacheDetailsPayload(_ data: Data, for item: MediaItem) {
         database.saveDetailsPayload(data, for: item.id, fetchedAt: Date())
     }
 
@@ -1529,6 +1634,7 @@ final class LibraryModel: ObservableObject {
         playerTitle = title
         playerHeaders = source.headers
         playerURL = source.url
+        playerRequestID = UUID()
     }
 
     var nextEpisodeTitle: String? { nextPlayableEpisode?.episode.title }
@@ -1759,6 +1865,11 @@ final class LibraryModel: ObservableObject {
     }
 
     func resume(_ progress: WatchProgress) async {
+        guard !isResumingPlayback else { return }
+        isResumingPlayback = true
+        viewingUpdateMessage = nil
+        defer { isResumingPlayback = false }
+
         if progress.mediaID.hasPrefix("local:") {
             let path = String(progress.mediaID.dropFirst("local:".count))
             let url = URL(fileURLWithPath: path)
@@ -1798,7 +1909,9 @@ final class LibraryModel: ObservableObject {
             playLocalVideo(offline, title: cachedTitle, item: item, episode: episode, details: details)
             return
         }
-        if item.isRemote, let refreshed = await loadDetails(for: item, forceRefresh: true) {
+        let needsFreshDetails = sources.isEmpty || (item.kind == "Series" && episode == nil)
+        if item.isRemote, needsFreshDetails,
+           let refreshed = await loadDetails(for: item, forceRefresh: true) {
             let refreshedEpisode = matchingEpisode(in: refreshed)
             let refreshedSources = item.kind == "Series"
                 ? ((refreshedEpisode?.sources ?? []) + (refreshedEpisode?.downloadSources ?? []))
@@ -1921,14 +2034,17 @@ final class LibraryModel: ObservableObject {
             try await IMDbMetadataStore.shared.refresh { [weak self] message in
                 Task { @MainActor in self?.imdbDatasetStatus = message }
             }
-            let timestamp = IMDbMetadataStore.shared.lastUpdated?.formatted(date: .abbreviated, time: .shortened) ?? "now"
+            let summary = await Task.detached(priority: .utility) {
+                IMDbMetadataStore.shared.startupSummary()
+            }.value
+            let timestamp = summary.lastUpdated?.formatted(date: .abbreviated, time: .shortened) ?? "now"
             imdbDatasetStatus = "IMDb dataset ready · updated \(timestamp)"
             imdbChartLists = nil
-            imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
-            await enrichCatalogWithIMDb()
+            imdbPeopleAvailable = summary.hasPeopleData
+            scheduleCatalogIMDbEnrichment()
             genreFacets = []
             recommendations = []
-            await loadGenreFacets()
+            if section == .genres { await loadGenreFacets() }
             if section == .forYou { await refreshDiscoveryData() }
             if section == .imdbCharts { await loadIMDbCharts() }
         } catch {
@@ -1946,7 +2062,12 @@ final class LibraryModel: ObservableObject {
     }
 
     func refreshIMDbPeopleAvailability() {
-        imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
+        Task { @MainActor [weak self] in
+            let available = await Task.detached(priority: .utility) {
+                IMDbMetadataStore.shared.hasPeopleData()
+            }.value
+            self?.imdbPeopleAvailable = available
+        }
     }
 
     func loadIMDbArtwork(for metadata: IMDbTitleMetadata) async -> Data? {
@@ -2006,7 +2127,7 @@ final class LibraryModel: ObservableObject {
         }
         database.saveRemoteItems([resolved])
         items = database.loadCatalog()
-        await enrichCatalogWithIMDb()
+        scheduleCatalogIMDbEnrichment()
         selectedItem = items.first(where: { $0.id == resolved.id }) ?? resolved
         similarTitleSearchMessage = nil
     }
@@ -2166,7 +2287,7 @@ final class LibraryModel: ObservableObject {
             if !cached.isEmpty {
                 items = cached
                 connectionStatus = "Live catalog unavailable. Showing \(cached.filter { $0.kind == "Movie" }.count) saved movies and \(cached.filter { $0.kind == "Series" }.count) saved series."
-                await enrichCatalogWithIMDb()
+                scheduleCatalogIMDbEnrichment()
             } else {
                 let failures = [movieResponse.error, seriesResponse.error].compactMap { $0 }
                 connectionStatus = failures.isEmpty
@@ -2192,7 +2313,7 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Live catalog · \(movieCount) movies · \(seriesCount) series"
         }
         section = .home
-        await enrichCatalogWithIMDb()
+        scheduleCatalogIMDbEnrichment()
     }
 
     var canLoadMoreCatalog: Bool {
@@ -2202,7 +2323,7 @@ final class LibraryModel: ObservableObject {
         case .home: hasMoreMovies || hasMoreSeries
         case .movies: hasMoreMovies
         case .shows: hasMoreSeries
-        case .watchlist, .myRatings, .downloads, .imdbCharts, .imdbPeople, .imdbFranchises,
+        case .watchlist, .myRatings, .downloads, .imdbCharts, .releaseCalendar, .imdbPeople, .imdbFranchises,
              .forYou, .genres, .continueWatching, .watchHistory, .viewingStats: false
         }
     }
@@ -2255,7 +2376,7 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Loaded \(added) more titles · \(items.filter { $0.kind == "Movie" }.count) movies · \(items.filter { $0.kind == "Series" }.count) series"
         }
         if added > 0 {
-            await enrichCatalogWithIMDb()
+            scheduleCatalogIMDbEnrichment()
         }
     }
 
@@ -2267,7 +2388,7 @@ final class LibraryModel: ObservableObject {
         else { hasMoreSeries = !reachedEnd }
         if !newItems.isEmpty {
             database.saveRemoteItems(newItems)
-            items = database.loadCatalog()
+            items.append(contentsOf: newItems)
         }
         return newItems.count
     }
@@ -2301,9 +2422,7 @@ final class LibraryModel: ObservableObject {
         guard !uniqueItems.isEmpty else { return false }
         database.saveRemoteItems(uniqueItems)
         items = database.loadCatalog()
-        Task {
-            if IMDbMetadataStore.shared.isAvailable { await enrichCatalogWithIMDb() }
-        }
+        if IMDbMetadataStore.shared.isAvailable { scheduleCatalogIMDbEnrichment() }
         catalogName = "Denbox API"
         let movieCount = uniqueItems.filter { $0.kind == "Movie" }.count
         let seriesCount = uniqueItems.filter { $0.kind == "Series" }.count
@@ -2434,7 +2553,7 @@ final class LibraryModel: ObservableObject {
         return result
     }
 
-    private nonisolated static func string(_ value: Any?) -> String? {
+    nonisolated private static func string(_ value: Any?) -> String? {
         guard let value, !(value is NSNull) else { return nil }
         if let string = value as? String {
             let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2442,6 +2561,15 @@ final class LibraryModel: ObservableObject {
         }
         if let number = value as? NSNumber { return number.stringValue }
         return nil
+    }
+
+    nonisolated static func parseDetailsData(_ data: Data, for item: MediaItem) async -> MediaDetails? {
+        await Task.detached(priority: .userInitiated) {
+            guard let payload = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                return nil
+            }
+            return Self.parseDetails(payload, for: item)
+        }.value
     }
 
     nonisolated static func parseDetails(_ payload: Any, for item: MediaItem) -> MediaDetails {
@@ -2476,14 +2604,7 @@ final class LibraryModel: ObservableObject {
         )
     }
 
-    nonisolated static func parseDetailsData(_ data: Data, for item: MediaItem) async -> MediaDetails? {
-        await Task.detached(priority: .userInitiated) {
-            guard let payload = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else { return nil }
-            return Self.parseDetails(payload, for: item)
-        }.value
-    }
-
-    private nonisolated static func detailObject(_ payload: Any, isSeries: Bool) -> [String: Any] {
+    nonisolated private static func detailObject(_ payload: Any, isSeries: Bool) -> [String: Any] {
         if let object = payload as? [String: Any] {
             for key in ["data", "result", "message", "details", "movie", "serie", "series", "poster", "item"] {
                 if let nested = object[key] as? [String: Any] {
@@ -2501,7 +2622,7 @@ final class LibraryModel: ObservableObject {
         return [:]
     }
 
-    private nonisolated static func stringList(_ value: Any?) -> [String] {
+    nonisolated private static func stringList(_ value: Any?) -> [String] {
         guard let value, !(value is NSNull) else { return [] }
         if let value = string(value) { return [value] }
         guard let rows = value as? [Any] else { return [] }
@@ -2512,7 +2633,7 @@ final class LibraryModel: ObservableObject {
         }
     }
 
-    private nonisolated static func parseSeasons(from detail: [String: Any]) -> [MediaSeason] {
+    nonisolated private static func parseSeasons(from detail: [String: Any]) -> [MediaSeason] {
         let rawSeasons = detail["seasons"] ?? detail["episodes"] ?? detail["sources"]
         guard let rows = rawSeasons as? [Any] else { return [] }
         let hasSeasonWrappers = rows.contains { value in
@@ -2574,7 +2695,7 @@ final class LibraryModel: ObservableObject {
         return result
     }
 
-    private nonisolated static func streamSources(from value: Any, includeDownloadFields: Bool = false) -> [MediaStreamSource] {
+    nonisolated private static func streamSources(from value: Any, includeDownloadFields: Bool = false) -> [MediaStreamSource] {
         let playableExtensions: Set<String> = ["m3u8", "mp4", "m4v", "mkv", "mov", "webm", "mpd", "mpeg", "mpg", "ts", "avi", "flv"]
         let excludedExtensions: Set<String> = ["srt", "vtt", "ass", "ssa", "sub", "jpg", "jpeg", "png", "webp", "gif", "zip", "rar", "pdf"]
         let sourceContainers: Set<String> = includeDownloadFields
@@ -2644,7 +2765,7 @@ final class LibraryModel: ObservableObject {
         return result
     }
 
-    private nonisolated static func integer(_ value: Any?) -> Int? {
+    nonisolated private static func integer(_ value: Any?) -> Int? {
         guard let value else { return nil }
         if let number = value as? NSNumber { return number.intValue }
         if let string = value as? String { return Int(string) }
@@ -2683,6 +2804,7 @@ final class LibraryModel: ObservableObject {
         playerTitle = title
         playerHeaders = [:]
         playerURL = url
+        playerRequestID = UUID()
     }
 
     func importCatalog() {
@@ -2723,9 +2845,7 @@ final class LibraryModel: ObservableObject {
         items = database.loadCatalog()
         section = .home
         searchText = ""
-        Task {
-            await enrichCatalogWithIMDb()
-        }
+        scheduleCatalogIMDbEnrichment()
     }
 }
 
@@ -2759,6 +2879,12 @@ enum DirectMediaAPI {
         let data: Data?
         let statusCode: Int?
         let error: String?
+    }
+
+    struct JSONDataEvaluation<Value: Sendable>: Sendable {
+        let value: Value?
+        let isPreferred: Bool
+        let useAsFallback: Bool
     }
 
     static func feedURL(filter: Int, page: Int, routeKey: String) -> URL? {
@@ -2873,6 +2999,47 @@ enum DirectMediaAPI {
         return payload
     }
 
+    @MainActor
+    static func getJSONData<Value: Sendable>(
+        firstAcceptableFrom urls: [URL],
+        timeout: TimeInterval,
+        evaluating: @escaping @Sendable (Data) async -> JSONDataEvaluation<Value>
+    ) async throws -> (data: Data, value: Value) {
+        guard !urls.isEmpty else { throw DirectMediaAPIError.invalidURL }
+        var lastError = "No route returned usable JSON."
+        let payload: (Data, Value)? = await withTaskGroup(of: RouteResponse.self, returning: (Data, Value)?.self) { group in
+            for url in urls {
+                group.addTask { await fetchJSON(url: url, timeout: timeout) }
+            }
+            var fallback: (Data, Value)?
+            while let response = await group.next() {
+                guard let data = response.data else {
+                    lastError = response.error ?? lastError
+                    continue
+                }
+                guard let statusCode = response.statusCode, (200..<300).contains(statusCode) else {
+                    lastError = response.statusCode.map { "HTTP \($0)" } ?? lastError
+                    continue
+                }
+                let evaluation = await evaluating(data)
+                guard let value = evaluation.value else {
+                    lastError = "The server returned invalid JSON."
+                    continue
+                }
+                if evaluation.isPreferred {
+                    group.cancelAll()
+                    return (data, value)
+                }
+                if evaluation.useAsFallback, fallback == nil {
+                    fallback = (data, value)
+                }
+            }
+            return fallback
+        }
+        guard let payload else { throw DirectMediaAPIError.server(lastError) }
+        return (payload.0, payload.1)
+    }
+
     private static func fetchJSON(url: URL, timeout: TimeInterval) async -> RouteResponse {
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -2938,6 +3105,18 @@ struct DownloadedMedia: Identifiable {
     let createdAt: Date
     let catalogMediaID: String?
     let episodeID: String?
+}
+
+struct CatalogMetadataPayloads: Sendable {
+    var references: [String: Data] = [:]
+    var publicTitles: [String: [Data]] = [:]
+    var publicAttempts: [String: [String: Date]] = [:]
+}
+
+private struct CachedCatalogMetadata: Sendable {
+    let reference: ReferenceTitleMetadata?
+    let publicTitles: [PublicTitleMetadata]
+    let publicAttempts: [String: Date]
 }
 
 final class MediaDatabase {
@@ -3065,6 +3244,7 @@ final class MediaDatabase {
             media_id TEXT NOT NULL,
             provider TEXT NOT NULL,
             attempted_at REAL NOT NULL,
+            lookup_version INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY(media_id, provider)
         );
         CREATE TABLE IF NOT EXISTS reference_metadata_cache (
@@ -3081,6 +3261,9 @@ final class MediaDatabase {
         }
         if !columnExists("episode_id", in: "downloaded_media") {
             execute("ALTER TABLE downloaded_media ADD COLUMN episode_id TEXT")
+        }
+        if !columnExists("lookup_version", in: "public_title_metadata_attempts") {
+            execute("ALTER TABLE public_title_metadata_attempts ADD COLUMN lookup_version INTEGER NOT NULL DEFAULT 1")
         }
     }
 
@@ -3120,24 +3303,26 @@ final class MediaDatabase {
     func publicTitleMetadataLastAttempt(mediaID: String, provider: PublicMetadataProvider) -> Date? {
         guard let handle else { return nil }
         var statement: OpaquePointer?
-        let sql = "SELECT attempted_at FROM public_title_metadata_attempts WHERE media_id=? AND provider=? LIMIT 1"
+        let sql = "SELECT attempted_at,lookup_version FROM public_title_metadata_attempts WHERE media_id=? AND provider=? LIMIT 1"
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
         defer { sqlite3_finalize(statement) }
         bind(mediaID, at: 1, in: statement)
         bind(provider.rawValue, at: 2, in: statement)
-        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              sqlite3_column_int(statement, 1) == Int32(PublicTitleMetadataRefreshPolicy.lookupVersion) else { return nil }
         return Date(timeIntervalSince1970: sqlite3_column_double(statement, 0))
     }
 
     func recordPublicTitleMetadataAttempt(mediaID: String, provider: PublicMetadataProvider, at date: Date = Date()) {
         guard let handle else { return }
         var statement: OpaquePointer?
-        let sql = "INSERT OR REPLACE INTO public_title_metadata_attempts(media_id,provider,attempted_at) VALUES(?,?,?)"
+        let sql = "INSERT OR REPLACE INTO public_title_metadata_attempts(media_id,provider,attempted_at,lookup_version) VALUES(?,?,?,?)"
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return }
         defer { sqlite3_finalize(statement) }
         bind(mediaID, at: 1, in: statement)
         bind(provider.rawValue, at: 2, in: statement)
         sqlite3_bind_double(statement, 3, date.timeIntervalSince1970)
+        sqlite3_bind_int(statement, 4, Int32(PublicTitleMetadataRefreshPolicy.lookupVersion))
         sqlite3_step(statement)
     }
 
@@ -3152,6 +3337,69 @@ final class MediaDatabase {
               let payload = columnText(statement, 0),
               let data = payload.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(ReferenceTitleMetadata.self, from: data)
+    }
+
+    func loadCatalogMetadataPayloads(for mediaIDs: Set<String>) -> CatalogMetadataPayloads {
+        guard let handle, !mediaIDs.isEmpty else { return CatalogMetadataPayloads() }
+        var result = CatalogMetadataPayloads()
+        let ids = mediaIDs.sorted()
+        let chunkSize = 500
+
+        for lowerBound in stride(from: 0, to: ids.count, by: chunkSize) {
+            let chunk = Array(ids[lowerBound..<min(lowerBound + chunkSize, ids.count)])
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+
+            var referenceStatement: OpaquePointer?
+            let referenceSQL = "SELECT media_id,payload FROM reference_metadata_cache WHERE media_id IN (\(placeholders))"
+            if sqlite3_prepare_v2(handle, referenceSQL, -1, &referenceStatement, nil) == SQLITE_OK,
+               let referenceStatement {
+                defer { sqlite3_finalize(referenceStatement) }
+                for (index, mediaID) in chunk.enumerated() {
+                    bind(mediaID, at: Int32(index + 1), in: referenceStatement)
+                }
+                while sqlite3_step(referenceStatement) == SQLITE_ROW {
+                    guard let mediaID = columnText(referenceStatement, 0),
+                          let payload = columnText(referenceStatement, 1),
+                          let data = payload.data(using: .utf8) else { continue }
+                    result.references[mediaID] = data
+                }
+            }
+
+            var publicStatement: OpaquePointer?
+            let publicSQL = "SELECT media_id,payload FROM public_title_metadata WHERE media_id IN (\(placeholders))"
+            if sqlite3_prepare_v2(handle, publicSQL, -1, &publicStatement, nil) == SQLITE_OK,
+               let publicStatement {
+                defer { sqlite3_finalize(publicStatement) }
+                for (index, mediaID) in chunk.enumerated() {
+                    bind(mediaID, at: Int32(index + 1), in: publicStatement)
+                }
+                while sqlite3_step(publicStatement) == SQLITE_ROW {
+                    guard let mediaID = columnText(publicStatement, 0),
+                          let payload = columnText(publicStatement, 1),
+                          let data = payload.data(using: .utf8) else { continue }
+                    result.publicTitles[mediaID, default: []].append(data)
+                }
+            }
+
+            var attemptStatement: OpaquePointer?
+            let attemptSQL = "SELECT media_id,provider,attempted_at FROM public_title_metadata_attempts WHERE lookup_version=? AND media_id IN (\(placeholders))"
+            if sqlite3_prepare_v2(handle, attemptSQL, -1, &attemptStatement, nil) == SQLITE_OK,
+               let attemptStatement {
+                defer { sqlite3_finalize(attemptStatement) }
+                sqlite3_bind_int(attemptStatement, 1, Int32(PublicTitleMetadataRefreshPolicy.lookupVersion))
+                for (index, mediaID) in chunk.enumerated() {
+                    bind(mediaID, at: Int32(index + 2), in: attemptStatement)
+                }
+                while sqlite3_step(attemptStatement) == SQLITE_ROW {
+                    guard let mediaID = columnText(attemptStatement, 0),
+                          let provider = columnText(attemptStatement, 1) else { continue }
+                    result.publicAttempts[mediaID, default: [:]][provider] = Date(
+                        timeIntervalSince1970: sqlite3_column_double(attemptStatement, 2)
+                    )
+                }
+            }
+        }
+        return result
     }
 
     func saveReferenceMetadata(_ metadata: ReferenceTitleMetadata, mediaID: String) {
@@ -4121,16 +4369,14 @@ final class DownloadManager: ObservableObject {
 
     func cancel(_ entry: DownloadEntry) {
         guard entry.status == .queued || entry.status == .downloading else { return }
-        if entry.status == .queued {
-            entry.status = .cancelled
-        } else {
-            entry.task?.cancel()
-        }
+        entry.status = .cancelled
+        entry.task?.cancel()
     }
 
     func retry(_ entry: DownloadEntry) {
         guard entry.status == .failed || entry.status == .cancelled,
-              entry.source != nil else { return }
+              entry.source != nil,
+              entry.task == nil else { return }
         entry.status = .queued
         entry.errorMessage = nil
         entry.progress = 0
@@ -4182,6 +4428,10 @@ final class DownloadManager: ObservableObject {
                         totalSegments: totalSegments
                     )
                 }
+            }
+            if Task.isCancelled {
+                try? FileManager.default.removeItem(at: destination)
+                throw CancellationError()
             }
             entry.status = .completed
             entry.progress = 1
@@ -4387,6 +4637,8 @@ struct MainWindow: View {
                         DownloadsView()
                     } else if model.section == .imdbCharts {
                         IMDbChartsPage()
+                    } else if model.section == .releaseCalendar {
+                        ReleaseCalendarPage()
                     } else if model.visibleItems.isEmpty {
                         EmptyLibraryState(
                             isWatchlist: model.section == .watchlist,
@@ -4409,10 +4661,12 @@ struct MainWindow: View {
                 .padding(.horizontal, 34)
                 .padding(.top, 20)
                 .padding(.bottom, 48)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .scrollIndicators(.hidden)
         }
         .background(Color.canvas)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var topBar: some View {
@@ -4483,6 +4737,7 @@ struct MainWindow: View {
         case .watchHistory: "\(model.watchHistory.count) recent sessions stored on this Mac"
         case .viewingStats: "Your viewing time, completed titles, and favorite genres"
         case .imdbCharts: "Top rated titles, most-voted lists, and live box office"
+        case .releaseCalendar: "Persian calendar of movie releases and TV episode air dates"
         case .imdbPeople: "Search IMDb actors, directors, writers, and their filmographies"
         case .imdbFranchises: "Browse curated franchises using the local IMDb title index"
         default: "\(model.visibleItems.count) titles · From \(model.catalogName)"
@@ -4672,6 +4927,7 @@ private struct HeroFeature: View {
             .padding(.vertical, 30)
         }
         .frame(height: 310)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
         .overlay(alignment: .bottomTrailing) {
             Text(LocalizedStringKey(item.isRemote ? "FROM YOUR CATALOG" : "SAMPLE ARTWORK"))
@@ -5742,11 +5998,19 @@ private struct WatchProgressCard: View {
             Button {
                 Task { await model.resume(progress) }
             } label: {
-                Label("Resume", systemImage: "play.fill")
+                if model.isResumingPlayback {
+                    HStack(spacing: 7) {
+                        ProgressView().controlSize(.small)
+                        Text(DenboxLanguage.localizedMessage("Opening playback…"))
+                    }
+                } else {
+                    Label("Resume", systemImage: "play.fill")
+                }
             }
             .buttonStyle(.borderedProminent)
             .tint(.white)
             .foregroundStyle(.black)
+            .disabled(model.isResumingPlayback)
             Button("Mark as watched", systemImage: "checkmark") {
                 model.setWatched(progress, watched: true)
             }
@@ -5795,8 +6059,20 @@ private struct WatchHistoryPage: View {
                                     .foregroundStyle(Color.secondaryText.opacity(0.85))
                             }
                             Spacer(minLength: 4)
-                            Button("Resume") { Task { await model.resume(entry) } }
-                                .buttonStyle(.bordered)
+                            Button {
+                                Task { await model.resume(entry) }
+                            } label: {
+                                if model.isResumingPlayback {
+                                    HStack(spacing: 6) {
+                                        ProgressView().controlSize(.small)
+                                        Text(DenboxLanguage.localizedMessage("Opening playback…"))
+                                    }
+                                } else {
+                                    Label("Resume", systemImage: "play.fill")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(model.isResumingPlayback)
                         }
                         .padding(11)
                         .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 11))
@@ -5978,12 +6254,74 @@ private func watchTimeLabel(_ seconds: Double) -> String {
     return String(format: "%d:%02d", minutes, remaining)
 }
 
+@MainActor
+private final class DiscoveryFeedsModel: ObservableObject {
+    @Published private(set) var popularTitles: [TrendingTitle] = []
+    @Published private(set) var boxOfficeEntries: [BoxOfficeRecord] = []
+    @Published private(set) var releaseEvents: [DiscoveryCalendarEvent] = []
+    @Published private(set) var popularError: String?
+    @Published private(set) var boxOfficeError: String?
+    @Published private(set) var calendarMessages: [String] = []
+    @Published private(set) var isLoadingPopular = false
+    @Published private(set) var isLoadingBoxOffice = false
+    @Published private(set) var isLoadingCalendar = false
+    @Published private(set) var needsTMDBToken = false
+    private var loadedPopularKind: String?
+    private var loadedCalendarMonth: String?
+
+    func loadPopular(kind: IMDbTrendingKind, accessToken: String?, force: Bool = false) async {
+        guard force || loadedPopularKind != kind.rawValue else { return }
+        isLoadingPopular = true
+        popularError = nil
+        needsTMDBToken = false
+        defer { isLoadingPopular = false }
+        do {
+            popularTitles = try await DiscoveryFeedService.shared.popularToday(kind: kind.mediaKind, accessToken: accessToken, force: force)
+            loadedPopularKind = kind.rawValue
+        } catch {
+            popularTitles = []
+            popularError = error.localizedDescription
+            if let feedError = error as? DiscoveryFeedError {
+                needsTMDBToken = feedError == .noTMDBToken
+            }
+        }
+    }
+
+    func loadBoxOffice(force: Bool = false) async {
+        guard force || boxOfficeEntries.isEmpty else { return }
+        isLoadingBoxOffice = true
+        boxOfficeError = nil
+        defer { isLoadingBoxOffice = false }
+        do {
+            boxOfficeEntries = try await DiscoveryFeedService.shared.boxOffice(force: force)
+        } catch {
+            boxOfficeError = error.localizedDescription
+        }
+    }
+
+    func loadCalendar(cacheKey: String, startDate: Date, endDate: Date,
+                      releaseMonths: [String], force: Bool = false) async {
+        let key = cacheKey
+        guard force || loadedCalendarMonth != key else { return }
+        isLoadingCalendar = true
+        calendarMessages = []
+        if loadedCalendarMonth != key { releaseEvents = [] }
+        defer { isLoadingCalendar = false }
+        let result = await DiscoveryFeedService.shared.releaseCalendar(cacheKey: key, startDate: startDate,
+                                                                        endDate: endDate, releaseMonths: releaseMonths,
+                                                                        force: force)
+        releaseEvents = result.events
+        calendarMessages = result.sourceMessages
+        loadedCalendarMonth = key
+    }
+}
+
 private enum IMDbChartTab: String, CaseIterable, Identifiable {
     case topMovies = "Top 250 Movies"
     case topSeries = "Top 250 Series"
     case mostVotedMovies = "Most Voted Movies"
     case mostVotedSeries = "Most Voted Series"
-    case trending = "Trending"
+    case trending = "Popular Today"
     case boxOffice = "Box Office"
 
     var id: String { rawValue }
@@ -5994,7 +6332,7 @@ private enum IMDbChartTab: String, CaseIterable, Identifiable {
         case .topSeries: "Top 250 Series"
         case .mostVotedMovies: "Most Voted Movies"
         case .mostVotedSeries: "Most Voted Series"
-        case .trending: "Trending"
+        case .trending: "Popular Today"
         case .boxOffice: "Box Office"
         }
     }
@@ -6020,16 +6358,12 @@ private enum IMDbTrendingKind: String, CaseIterable, Identifiable {
         }
     }
 
-    var url: URL {
-        switch self {
-        case .movies: URL(string: "https://www.imdb.com/chart/moviemeter/")!
-        case .series: URL(string: "https://www.imdb.com/chart/tvmeter/")!
-        }
-    }
+    var mediaKind: String { self == .series ? "Series" : "Movie" }
 }
 
 private struct IMDbChartsPage: View {
     @EnvironmentObject private var model: LibraryModel
+    @StateObject private var feeds = DiscoveryFeedsModel()
     @State private var selectedTab: IMDbChartTab = .topMovies
     @State private var trendingKind: IMDbTrendingKind = .movies
     private let columns = [GridItem(.adaptive(minimum: 155), spacing: 16, alignment: .top)]
@@ -6040,7 +6374,7 @@ private struct IMDbChartsPage: View {
                 Text(selectedTab.displayName)
                     .font(.denbox(size: 23, weight: .bold))
                 Text(selectedTab == .trending
-                     ? "Live IMDb popularity charts for movies and TV shows."
+                     ? "Today's popular titles are shown inside Denbox from TMDB's daily trending feed."
                      : "Ranked from the local IMDb ratings and votes dataset. Pick a title to find it in Simba.")
                     .font(.denbox(size: 11))
                     .foregroundStyle(Color.secondaryText)
@@ -6091,7 +6425,13 @@ private struct IMDbChartsPage: View {
                 emptyDatasetState
             }
         }
-        .task { await model.loadIMDbCharts() }
+        .task(id: "\(selectedTab.rawValue)-\(trendingKind.rawValue)") {
+            await model.loadIMDbCharts()
+            if selectedTab == .boxOffice { await feeds.loadBoxOffice() }
+            if selectedTab == .trending {
+                await feeds.loadPopular(kind: trendingKind, accessToken: SecretVault.read(account: "tmdb-read-access-token"))
+            }
+        }
     }
 
     private func titles(for lists: IMDbChartLists) -> [IMDbTitleMetadata] {
@@ -6131,22 +6471,48 @@ private struct IMDbChartsPage: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Top Lifetime Grosses · Worldwide")
                         .font(.denbox(size: 17, weight: .semibold))
-                    Text("Live chart from Box Office Mojo by IMDbPro")
+                    Text("Worldwide lifetime gross, loaded inside Denbox from Box Office Mojo")
                         .font(.denbox(size: 10))
                         .foregroundStyle(Color.secondaryText)
                 }
                 Spacer()
-                Link("Open website", destination: BoxOfficeMojoBrowser.chartURL)
-                    .font(.denbox(size: 11, weight: .medium))
+                Button {
+                    Task { await feeds.loadBoxOffice(force: true) }
+                } label: {
+                    Label("Refresh chart", systemImage: "arrow.clockwise")
+                        .font(.denbox(size: 11, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .disabled(feeds.isLoadingBoxOffice)
             }
-            BoxOfficeMojoBrowser()
-                .frame(minHeight: 780)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            Text("Box office data is live from Box Office Mojo; it is not included in IMDb's downloadable datasets.")
+            if feeds.isLoadingBoxOffice && feeds.boxOfficeEntries.isEmpty {
+                feedProgress("Loading Box Office Mojo rankings…")
+            } else if let error = feeds.boxOfficeError, feeds.boxOfficeEntries.isEmpty {
+                feedError(error, retry: { Task { await feeds.loadBoxOffice(force: true) } })
+            } else {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 22) {
+                    ForEach(feeds.boxOfficeEntries) { entry in
+                        Button {
+                            Task { await model.openCatalogTitle(matching: entry.title) }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 5) {
+                                IMDbTitleCard(metadata: entry.title, rank: entry.rank, width: 155, artworkHeight: 210)
+                                Text("Worldwide gross")
+                                    .font(.denbox(size: 9))
+                                    .foregroundStyle(Color.secondaryText)
+                                Text(entry.worldwideGross)
+                                    .font(.denbox(size: 11, weight: .semibold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help("Find this title in the Simba catalog")
+                    }
+                }
+            }
+            Text("Source: Box Office Mojo by IMDbPro · worldwide lifetime gross. Choose a poster to search for the title in Simba.")
                 .font(.denbox(size: 9))
                 .foregroundStyle(Color.secondaryText.opacity(0.85))
-            Link("Information courtesy of Box Office Mojo", destination: URL(string: "https://www.boxofficemojo.com")!)
-                .font(.denbox(size: 9))
         }
     }
 
@@ -6156,13 +6522,22 @@ private struct IMDbChartsPage: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(trendingKind.chartTitle)
                         .font(.denbox(size: 17, weight: .semibold))
-                    Text("Live popularity ranking from IMDb, updated by IMDb's chart.")
+                    Text("Daily trending list from TMDB; titles open through the Simba catalog.")
                         .font(.denbox(size: 10))
                         .foregroundStyle(Color.secondaryText)
                 }
                 Spacer()
-                Link("Open IMDb", destination: trendingKind.url)
-                    .font(.denbox(size: 11, weight: .medium))
+                Button {
+                    Task {
+                        await feeds.loadPopular(kind: trendingKind,
+                                                accessToken: SecretVault.read(account: "tmdb-read-access-token"), force: true)
+                    }
+                } label: {
+                    Label("Refresh chart", systemImage: "arrow.clockwise")
+                        .font(.denbox(size: 11, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .disabled(feeds.isLoadingPopular)
             }
             Picker("Trending category", selection: $trendingKind) {
                 ForEach(IMDbTrendingKind.allCases) { kind in
@@ -6172,15 +6547,69 @@ private struct IMDbChartsPage: View {
             .pickerStyle(.segmented)
             .frame(maxWidth: 360)
 
-            IMDbTrendingBrowser(url: trendingKind.url)
-                .id(trendingKind.id)
-                .frame(minHeight: 780)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            Text("IMDb popularity charts use user interest signals and reflect current trends.")
+            if feeds.isLoadingPopular && feeds.popularTitles.isEmpty {
+                feedProgress("Loading today's popular titles…")
+            } else if let error = feeds.popularError, feeds.popularTitles.isEmpty {
+                VStack(spacing: 12) {
+                    Text(DenboxLanguage.localizedMessage(error))
+                        .font(.denbox(size: 12))
+                        .foregroundStyle(Color.secondaryText)
+                        .multilineTextAlignment(.center)
+                    if feeds.needsTMDBToken {
+                        Button("Open Settings") { model.showingSettings = true }
+                            .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Refresh chart") {
+                            Task {
+                                await feeds.loadPopular(kind: trendingKind,
+                                                        accessToken: SecretVault.read(account: "tmdb-read-access-token"), force: true)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 180)
+                .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
+            } else {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 22) {
+                    ForEach(Array(feeds.popularTitles.enumerated()), id: \.element.id) { index, entry in
+                        Button {
+                            Task { await model.openCatalogTitle(matching: entry.metadata) }
+                        } label: {
+                            IMDbTitleCard(metadata: entry.metadata, rank: index + 1, width: 155,
+                                          artworkHeight: 210, fallbackArtworkURL: entry.posterURL)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Find this title in the Simba catalog")
+                    }
+                }
+            }
+            Text("Daily popularity from TMDB, not IMDb. TMDB scores are shown for context; this feed is separate from IMDb ratings.")
                 .font(.denbox(size: 9))
                 .foregroundStyle(Color.secondaryText.opacity(0.85))
-            imdbAttribution
+            Link("TMDB attribution", destination: URL(string: "https://www.themoviedb.org")!)
+                .font(.denbox(size: 9))
         }
+    }
+
+    private func feedProgress(_ message: LocalizedStringKey) -> some View {
+        HStack(spacing: 9) {
+            ProgressView().controlSize(.small)
+            Text(message).font(.denbox(size: 12)).foregroundStyle(Color.secondaryText)
+        }
+        .frame(maxWidth: .infinity, minHeight: 180, alignment: .center)
+    }
+
+    private func feedError(_ message: String, retry: @escaping () -> Void) -> some View {
+        VStack(spacing: 12) {
+            Text(DenboxLanguage.localizedMessage(message))
+                .font(.denbox(size: 12))
+                .foregroundStyle(Color.secondaryText)
+                .multilineTextAlignment(.center)
+            Button("Refresh chart", action: retry).buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity, minHeight: 180)
+        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var imdbAttribution: some View {
@@ -6193,12 +6622,315 @@ private struct IMDbChartsPage: View {
     }
 }
 
+private struct ReleaseCalendarPage: View {
+    @EnvironmentObject private var model: LibraryModel
+    @StateObject private var feeds = DiscoveryFeedsModel()
+    @State private var monthAnchor = Date()
+    @State private var selectedDate = Date()
+    private let weekdayKeys = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    private let calendarColumns = Array(repeating: GridItem(.flexible(), spacing: 5), count: 7)
+
+    private var persianCalendar: Calendar {
+        var value = Calendar(identifier: .persian)
+        value.locale = Locale(identifier: "fa_IR")
+        value.timeZone = .current
+        value.firstWeekday = 7
+        return value
+    }
+
+    private var monthEnd: Date {
+        let dayCount = persianCalendar.range(of: .day, in: .month, for: monthStart)?.count ?? 30
+        return persianCalendar.date(byAdding: .day, value: dayCount - 1, to: monthStart) ?? monthStart
+    }
+
+    private var apiReleaseMonths: [String] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return [monthStart, monthEnd].reduce(into: [String]()) { result, date in
+            let components = calendar.dateComponents([.year, .month], from: date)
+            let key = "\(components.year ?? 0)-\(components.month ?? 0)"
+            if !result.contains(key) { result.append(key) }
+        }
+    }
+
+    private var persianMonthKey: String {
+        let components = persianCalendar.dateComponents([.year, .month], from: monthAnchor)
+        return "\(components.year ?? 0)-\(components.month ?? 0)"
+    }
+
+    private var monthStart: Date {
+        let components = persianCalendar.dateComponents([.era, .year, .month], from: monthAnchor)
+        return persianCalendar.date(from: components) ?? monthAnchor
+    }
+
+    private var monthTitle: String {
+        let formatter = DateFormatter()
+        formatter.calendar = persianCalendar
+        formatter.locale = Locale(identifier: "fa_IR")
+        formatter.timeZone = .current
+        formatter.dateFormat = "LLLL yyyy"
+        return formatter.string(from: monthStart)
+    }
+
+    private var selectedDateTitle: String {
+        let formatter = DateFormatter()
+        formatter.calendar = persianCalendar
+        formatter.locale = Locale(identifier: "fa_IR")
+        formatter.timeZone = .current
+        formatter.dateFormat = "EEEE، d MMMM yyyy"
+        return formatter.string(from: selectedDate)
+    }
+
+    private var monthCells: [Date?] {
+        let days = persianCalendar.range(of: .day, in: .month, for: monthStart)?.count ?? 30
+        let weekday = persianCalendar.component(.weekday, from: monthStart)
+        let blankCount = (weekday - persianCalendar.firstWeekday + 7) % 7
+        let blanks = Array<Date?>(repeating: nil, count: blankCount)
+        let dates: [Date?] = (1...days).map { day in
+            persianCalendar.date(byAdding: .day, value: day - 1, to: monthStart)
+        }
+        return blanks + dates
+    }
+
+    private var eventsForSelectedDate: [DiscoveryCalendarEvent] {
+        feeds.releaseEvents.filter { persianCalendar.isDate($0.date, inSameDayAs: selectedDate) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Release Schedule")
+                        .font(.denbox(size: 21, weight: .bold))
+                    Text("Movie release dates and known TV episode air dates in the Persian calendar.")
+                        .font(.denbox(size: 11))
+                        .foregroundStyle(Color.secondaryText)
+                }
+                Spacer()
+                Button("Today") { setMonth(to: Date()) }
+                    .buttonStyle(.bordered)
+                Button {
+                    Task { await reloadCalendar() }
+                } label: {
+                    Label("Refresh calendar", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(feeds.isLoadingCalendar)
+            }
+
+            HStack {
+                Button {
+                    shiftMonth(-1)
+                } label: {
+                    Label("Previous month", systemImage: "chevron.left")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.bordered)
+                .help("Previous month")
+                Text(monthTitle)
+                    .font(.denbox(size: 18, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+                Button {
+                    shiftMonth(1)
+                } label: {
+                    Label("Next month", systemImage: "chevron.right")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.bordered)
+                .help("Next month")
+            }
+
+            LazyVGrid(columns: calendarColumns, spacing: 7) {
+                ForEach(weekdayKeys, id: \.self) { day in
+                    Text(DenboxLanguage.localizedMessage(day))
+                        .font(.denbox(size: 10, weight: .medium))
+                        .foregroundStyle(Color.secondaryText)
+                        .frame(maxWidth: .infinity, minHeight: 20)
+                }
+                ForEach(Array(monthCells.enumerated()), id: \.offset) { _, date in
+                    if let date {
+                        calendarDayButton(date)
+                    } else {
+                        Color.clear.frame(height: 55)
+                    }
+                }
+            }
+            .padding(14)
+            .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 15))
+
+            HStack(spacing: 14) {
+                Label("Movie release", systemImage: "film")
+                    .foregroundStyle(Color.orange)
+                Label("TV episode", systemImage: "tv")
+                    .foregroundStyle(Color.cyan)
+            }
+            .font(.denbox(size: 10))
+
+            HStack {
+                Text(selectedDateTitle)
+                    .font(.denbox(size: 17, weight: .semibold))
+                Spacer()
+                if !eventsForSelectedDate.isEmpty {
+                    Text(DenboxLanguage.localizedMessage("\(eventsForSelectedDate.count) events"))
+                        .font(.denbox(size: 10))
+                        .foregroundStyle(Color.secondaryText)
+                }
+            }
+
+            if feeds.isLoadingCalendar && feeds.releaseEvents.isEmpty {
+                HStack(spacing: 9) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading release schedule…")
+                        .font(.denbox(size: 12))
+                        .foregroundStyle(Color.secondaryText)
+                }
+                .frame(maxWidth: .infinity, minHeight: 100)
+            } else if !feeds.calendarMessages.isEmpty {
+                Text(feeds.calendarMessages.map { DenboxLanguage.localizedMessage($0) }.joined(separator: " "))
+                    .font(.denbox(size: 10))
+                    .foregroundStyle(Color.orange.opacity(0.9))
+            }
+
+            if eventsForSelectedDate.isEmpty {
+                Text("No movie releases or scheduled TV episodes for this day.")
+                    .font(.denbox(size: 11))
+                    .foregroundStyle(Color.secondaryText)
+                    .frame(maxWidth: .infinity, minHeight: 55, alignment: .leading)
+            } else {
+                LazyVStack(spacing: 8) {
+                    ForEach(eventsForSelectedDate) { event in
+                        Button {
+                            Task { await model.openCatalogTitle(matching: event.title) }
+                        } label: {
+                            calendarEventRow(event)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Find this title in the Simba catalog")
+                    }
+                }
+            }
+
+            Text("Movie dates: Box Office Mojo (US theatrical releases). Series episodes and usual airing days: TVmaze (CC BY-SA). TV schedules depend on the information supplied by each broadcaster and platform.")
+                .font(.denbox(size: 9))
+                .foregroundStyle(Color.secondaryText.opacity(0.85))
+        }
+        .task(id: persianMonthKey) {
+            await feeds.loadCalendar(cacheKey: persianMonthKey, startDate: monthStart, endDate: monthEnd,
+                                     releaseMonths: apiReleaseMonths)
+        }
+    }
+
+    private func calendarDayButton(_ date: Date) -> some View {
+        let dayEvents = feeds.releaseEvents.filter { persianCalendar.isDate($0.date, inSameDayAs: date) }
+        let isSelected = persianCalendar.isDate(date, inSameDayAs: selectedDate)
+        return Button { selectedDate = date } label: {
+            VStack(spacing: 4) {
+                Text(persianDayNumber(date))
+                    .font(.denbox(size: 12, weight: isSelected ? .bold : .regular))
+                    .foregroundStyle(isSelected ? .white : Color.secondaryText)
+                HStack(spacing: 3) {
+                    if dayEvents.contains(where: { $0.kind == .movieRelease }) {
+                        Circle().fill(Color.orange).frame(width: 4, height: 4)
+                    }
+                    if dayEvents.contains(where: { $0.kind == .episode }) {
+                        Circle().fill(Color.cyan).frame(width: 4, height: 4)
+                    }
+                }
+                .frame(height: 5)
+            }
+            .frame(maxWidth: .infinity, minHeight: 52)
+            .background(isSelected ? Color.white.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 9))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func calendarEventRow(_ event: DiscoveryCalendarEvent) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: event.kind == .episode ? "tv" : "film")
+                .font(.denbox(size: 16))
+                .foregroundStyle(event.kind == .episode ? Color.cyan : Color.orange)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(event.title.title)
+                    .font(.denbox(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                if event.kind == .episode {
+                    HStack(spacing: 6) {
+                        if let season = event.season, let number = event.episode {
+                            Text(String(format: "S%02dE%02d", season, number))
+                                .font(.denbox(size: 10, weight: .medium))
+                                .foregroundStyle(Color.secondaryText)
+                        }
+                        if let episodeTitle = event.episodeTitle, !episodeTitle.isEmpty {
+                            Text(episodeTitle)
+                                .font(.denbox(size: 10))
+                                .foregroundStyle(Color.secondaryText)
+                                .lineLimit(1)
+                        }
+                    }
+                    let details = [
+                        event.airingDays.map { DenboxLanguage.localizedMessage($0) }.joined(separator: " · "),
+                        event.airtime,
+                        event.channel,
+                        event.timeZone
+                    ].compactMap { $0 }.filter { !$0.isEmpty }
+                    if !details.isEmpty {
+                        Text(details.joined(separator: " · "))
+                            .font(.denbox(size: 9))
+                            .foregroundStyle(Color.secondaryText.opacity(0.9))
+                            .lineLimit(1)
+                    }
+                } else {
+                    Text("US theatrical release")
+                        .font(.denbox(size: 10))
+                        .foregroundStyle(Color.secondaryText)
+                }
+            }
+            Spacer(minLength: 4)
+            Image(systemName: "arrow.up.right")
+                .font(.denbox(size: 10, weight: .medium))
+                .foregroundStyle(Color.secondaryText)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 11))
+    }
+
+    private func shiftMonth(_ amount: Int) {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        monthAnchor = calendar.date(byAdding: .month, value: amount, to: monthAnchor) ?? monthAnchor
+        selectedDate = monthAnchor
+    }
+
+    private func persianDayNumber(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = persianCalendar
+        formatter.locale = Locale(identifier: "fa_IR")
+        formatter.timeZone = .current
+        formatter.dateFormat = "d"
+        return formatter.string(from: date)
+    }
+
+    private func setMonth(to date: Date) {
+        monthAnchor = date
+        selectedDate = date
+    }
+
+    private func reloadCalendar() async {
+        await feeds.loadCalendar(cacheKey: persianMonthKey, startDate: monthStart, endDate: monthEnd,
+                                 releaseMonths: apiReleaseMonths, force: true)
+    }
+}
+
 private struct IMDbTitleCard: View {
     @EnvironmentObject private var model: LibraryModel
     let metadata: IMDbTitleMetadata
     var rank: Int? = nil
     var width: CGFloat = 150
     var artworkHeight: CGFloat = 205
+    var fallbackArtworkURL: URL? = nil
     @State private var artworkData: Data?
 
     var body: some View {
@@ -6212,6 +6944,16 @@ private struct IMDbTitleCard: View {
                         .scaledToFill()
                         .frame(width: width, height: artworkHeight)
                         .clipped()
+                } else if let fallbackArtworkURL {
+                    AsyncImage(url: fallbackArtworkURL) { phase in
+                        if let image = phase.image {
+                            image.resizable().scaledToFill()
+                        } else {
+                            Color.clear
+                        }
+                    }
+                    .frame(width: width, height: artworkHeight)
+                    .clipped()
                 } else {
                     Image(systemName: metadata.kind == "Series" ? "tv" : "film")
                         .font(.denbox(size: 35, weight: .ultraLight))
@@ -6257,31 +6999,6 @@ private struct IMDbTitleCard: View {
         guard let votes = metadata.votes else { return nil }
         return DenboxLanguage.localizedMessage("\(votes.formatted(.number.notation(.compactName))) votes")
     }
-}
-
-private struct BoxOfficeMojoBrowser: NSViewRepresentable {
-    static let chartURL = URL(string: "https://www.boxofficemojo.com/chart/ww_top_lifetime_gross/?area=XWW")!
-
-    func makeNSView(context: Context) -> WKWebView {
-        let webView = WKWebView(frame: .zero)
-        webView.load(URLRequest(url: Self.chartURL))
-        return webView
-    }
-
-    func updateNSView(_ webView: WKWebView, context: Context) {}
-}
-
-private struct IMDbTrendingBrowser: NSViewRepresentable {
-    let url: URL
-
-    func makeNSView(context: Context) -> WKWebView {
-        let webView = WKWebView(frame: .zero)
-        webView.allowsBackForwardNavigationGestures = true
-        webView.load(URLRequest(url: url))
-        return webView
-    }
-
-    func updateNSView(_ webView: WKWebView, context: Context) {}
 }
 
 private struct MediaGrid: View {
@@ -6447,6 +7164,16 @@ private struct DownloadRow: View {
                         } else {
                             ProgressView(value: entry.progress).frame(maxWidth: 170)
                         }
+                        if let totalSegments = entry.totalSegments, totalSegments > 1 {
+                            HStack(spacing: 2) {
+                                ForEach(0..<min(totalSegments, 8), id: \.self) { index in
+                                    Capsule()
+                                        .fill(index < entry.completedSegments ? Color.white : Color.white.opacity(0.18))
+                                        .frame(width: 8, height: 6)
+                                }
+                            }
+                            .accessibilityLabel("\(entry.completedSegments) of \(totalSegments) parts complete")
+                        }
                         Text(byteCount(entry.downloadedBytes, total: entry.totalBytes))
                             .font(.denbox(size: 10))
                             .foregroundStyle(Color.secondaryText)
@@ -6467,13 +7194,14 @@ private struct DownloadRow: View {
     private var controls: some View {
         switch entry.status {
         case .queued, .downloading:
-            Button("Cancel", systemImage: "xmark") { manager.cancel(entry) }
+            Button("Stop", systemImage: "stop.fill") { manager.cancel(entry) }
                 .labelStyle(.iconOnly)
-                .help("Cancel download")
+                .help("Stop download")
         case .failed, .cancelled:
             Button("Retry", systemImage: "arrow.clockwise") { manager.retry(entry) }
                 .labelStyle(.iconOnly)
                 .help("Retry download")
+                .disabled(entry.task != nil)
         case .completed:
             HStack(spacing: 4) {
                 if let fileURL = entry.fileURL {
@@ -6561,8 +7289,8 @@ private struct MediaDetailPage: View {
 
                 VStack(alignment: .leading, spacing: 14) {
                     Text([DenboxLanguage.localizedMediaKind(item.kind),
-                          details?.year ?? item.year,
-                          details?.runtime,
+                          displayedYear,
+                          displayedRuntime,
                           displayedRating]
                         .compactMap { $0?.nilIfEmpty }
                         .joined(separator: "  ·  "))
@@ -6575,9 +7303,9 @@ private struct MediaDetailPage: View {
                         .lineSpacing(4)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    if let details, !details.genres.isEmpty {
+                    if !displayedGenres.isEmpty {
                         HStack(spacing: 8) {
-                            ForEach(details.genres, id: \.self) { genre in
+                            ForEach(displayedGenres, id: \.self) { genre in
                                 Button {
                                     model.browseGenre(genre, kind: item.kind)
                                 } label: {
@@ -6593,10 +7321,10 @@ private struct MediaDetailPage: View {
                         }
                     }
 
-                    metadataLine("Director", value: details?.director)
-                    metadataLine("Country", value: details?.country)
+                    metadataLine("Director", value: details?.director ?? publicMetadataSources.compactMap(\.director).first)
+                    metadataLine("Country", value: details?.country ?? publicMetadataSources.compactMap(\.country).first)
                     castSection
-                    if let details, details.hasSupplementalMetadata {
+                    if (details?.hasSupplementalMetadata ?? false) || hasPublicSupplementalMetadata {
                         supplementalMetadata(details)
                     }
                     if let citations = referenceMetadata?.citations, !citations.isEmpty {
@@ -6699,7 +7427,10 @@ private struct MediaDetailPage: View {
             hexDLURLText = hexDLMetadata?.pageURL.absoluteString ?? ""
             guard item.isRemote else { return }
             publicMetadataStatus = "Searching Filimo and HexDL for public Persian details…"
-            async let publicMetadataRefresh = model.refreshPublicTitleMetadata(for: item)
+            async let publicMetadataRefresh = model.refreshPublicTitleMetadata(
+                for: item,
+                includePageDetails: true
+            )
             isLoadingDetails = true
             detailsError = nil
             if let loaded = await model.loadDetails(for: item) {
@@ -6742,9 +7473,49 @@ private struct MediaDetailPage: View {
         ])
     }
 
+    private var publicMetadataSources: [PublicTitleMetadata] {
+        [filimoMetadata, hexDLMetadata].compactMap { $0 }
+    }
+
+    private var displayedYear: String? {
+        nonEmptyPublicText(details?.year) ?? nonEmptyPublicText(item.year)
+            ?? publicMetadataSources.compactMap { nonEmptyPublicText($0.year) }.first
+    }
+
+    private var displayedRuntime: String? {
+        nonEmptyPublicText(details?.runtime)
+            ?? publicMetadataSources.compactMap { nonEmptyPublicText($0.runtime) }.first
+    }
+
+    private var displayedGenres: [String] {
+        if let genres = details?.genres, !genres.isEmpty { return genres }
+        if !item.genres.isEmpty { return item.genres }
+        return uniquePublicStrings(publicMetadataSources.flatMap { $0.genres ?? [] }, limit: 12)
+    }
+
+    private var hasPublicSupplementalMetadata: Bool {
+        publicMetadataSources.contains { source in
+            nonEmptyPublicText(source.originalTitle) != nil || nonEmptyPublicText(source.contentRating) != nil
+                || source.seasonCount != nil || source.episodeCount != nil
+                || nonEmptyPublicText(source.publicRating) != nil || nonEmptyPublicText(source.communityRating) != nil
+                || source.crewNames?.isEmpty == false || source.publicBadges?.isEmpty == false
+        }
+    }
+
+    private func nonEmptyPublicText(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func uniquePublicStrings(_ values: [String], limit: Int) -> [String] {
+        var seen = Set<String>()
+        return Array(values.filter { seen.insert($0).inserted }.prefix(limit))
+    }
+
     private var displayedArtworkURL: URL? {
-        filimoMetadata?.posterURL ?? hexDLMetadata?.posterURL ?? details?.backdropURL
-            ?? referenceMetadata?.posterURL ?? item.artworkURL
+        referenceMetadata?.posterURL ?? filimoMetadata?.posterURL ?? hexDLMetadata?.posterURL
+            ?? item.artworkURL ?? details?.backdropURL
     }
 
     private var personalRatingSection: some View {
@@ -6795,7 +7566,7 @@ private struct MediaDetailPage: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Persian details and artwork")
                     .font(.denbox(size: 21, weight: .bold))
-                Text("Denbox checks public Filimo and HexDL pages automatically for loaded titles and when this page opens. Matching Persian text and artwork are saved on this Mac.")
+                Text("Denbox checks public Filimo and HexDL pages automatically for loaded titles and when this page opens. Persian descriptions, artwork, release facts, genres, and visible episode details are saved on this Mac.")
                     .font(.denbox(size: 11))
                     .foregroundStyle(Color.secondaryText)
             }
@@ -6811,6 +7582,23 @@ private struct MediaDetailPage: View {
 
             publicMetadataImportRow(provider: .filimo, urlText: $filimoURLText, metadata: filimoMetadata)
             publicMetadataImportRow(provider: .hexDL, urlText: $hexDLURLText, metadata: hexDLMetadata)
+
+            let publicEpisodes = uniquePublicStrings(publicMetadataSources.flatMap(\.episodeSnippets), limit: 150)
+            if !publicEpisodes.isEmpty {
+                DisclosureGroup(String(format: DenboxLanguage.localizedMessage("Public episode details (%@)"), String(publicEpisodes.count))) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 7) {
+                            ForEach(Array(publicEpisodes.enumerated()), id: \.offset) { _, summary in
+                                Text(summary)
+                                    .font(.denbox(size: 11))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 180)
+                }
+                .font(.denbox(size: 11, weight: .medium))
+            }
 
             if let publicMetadataStatus {
                 Text(DenboxLanguage.localizedMessage(publicMetadataStatus))
@@ -6831,7 +7619,7 @@ private struct MediaDetailPage: View {
         isSearchingPublicMetadata = true
         publicMetadataStatus = "Searching Filimo and HexDL for public Persian details…"
         Task { @MainActor in
-            let result = await model.refreshPublicTitleMetadata(for: item, force: true)
+            let result = await model.refreshPublicTitleMetadata(for: item, force: true, includePageDetails: true)
             filimoMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .filimo)
             hexDLMetadata = model.publicTitleMetadata(mediaID: item.id, provider: .hexDL)
             filimoURLText = filimoMetadata?.pageURL.absoluteString ?? filimoURLText
@@ -6909,7 +7697,7 @@ private struct MediaDetailPage: View {
                 }
 
                 if !metadata.episodeSnippets.isEmpty {
-                    DisclosureGroup(DenboxLanguage.localizedMessage("Visible episodes (\(metadata.episodeSnippets.count))")) {
+                    DisclosureGroup(DenboxLanguage.localizedMessage("Visible episode details (\(metadata.episodeSnippets.count))")) {
                         VStack(alignment: .leading, spacing: 5) {
                             ForEach(Array(metadata.episodeSnippets.enumerated()), id: \.offset) { _, snippet in
                                 Text(snippet)
@@ -7064,29 +7852,56 @@ private struct MediaDetailPage: View {
             if let source = details?.ratingSource?.nilIfEmpty { return "\(source) ★ \(rating)" }
             return "★ \(rating)"
         }
-        return referenceMetadata?.rating.map { "\(referenceMetadata?.ratingSource ?? "Public source") ★ \($0)" }
+        if let rating = referenceMetadata?.rating {
+            return "\(referenceMetadata?.ratingSource ?? "Public source") ★ \(rating)"
+        }
+        if let source = publicMetadataSources.first(where: { nonEmptyPublicText($0.publicRating) != nil }),
+           let rating = nonEmptyPublicText(source.publicRating) {
+            return "\(source.ratingSource ?? source.provider.rawValue) ★ \(rating)"
+        }
+        return nil
     }
 
     @ViewBuilder
-    private func supplementalMetadata(_ details: MediaDetails) -> some View {
+    private func supplementalMetadata(_ details: MediaDetails?) -> some View {
         DisclosureGroup(DenboxLanguage.localizedMessage("More details")) {
             VStack(alignment: .leading, spacing: 8) {
-                metadataLine("Tagline", value: details.tagline)
-                metadataLine("Original title", value: details.originalTitle)
-                metadataLine("Status", value: details.status)
-                metadataLine("Content rating", value: details.contentRating)
-                metadataLine("Original language", value: details.originalLanguage)
-                metadataLine("Seasons", value: details.seasonCount.map(String.init))
-                metadataLine("Episodes", value: details.episodeCount.map(String.init))
-                metadataLine("Networks", value: details.networks?.joined(separator: ", "))
-                metadataLine("Production companies", value: details.productionCompanies?.joined(separator: ", "))
-                metadataLine("Writers", value: details.writers?.joined(separator: ", "))
-                metadataLine("Keywords", value: details.keywords?.joined(separator: ", "))
+                metadataLine("Tagline", value: details?.tagline)
+                metadataLine("Original title", value: details?.originalTitle
+                            ?? publicMetadataSources.compactMap { nonEmptyPublicText($0.originalTitle) }.first)
+                metadataLine("Status", value: details?.status)
+                metadataLine("Content rating", value: details?.contentRating
+                            ?? publicMetadataSources.compactMap { nonEmptyPublicText($0.contentRating) }.first)
+                metadataLine("Original language", value: details?.originalLanguage)
+                metadataLine("Seasons", value: details?.seasonCount.map(String.init)
+                    ?? publicMetadataSources.compactMap(\.seasonCount).first.map(String.init))
+                metadataLine("Episodes", value: details?.episodeCount.map(String.init)
+                    ?? publicMetadataSources.compactMap(\.episodeCount).first.map(String.init))
+                metadataLine("Networks", value: details?.networks?.joined(separator: ", "))
+                metadataLine("Production companies", value: details?.productionCompanies?.joined(separator: ", "))
+                metadataLine("Writers", value: details?.writers?.joined(separator: ", "))
+                metadataLine("Keywords", value: details?.keywords?.joined(separator: ", "))
+                if let publicRating = publicMetadataSources.first(where: { nonEmptyPublicText($0.publicRating) != nil }),
+                   let score = nonEmptyPublicText(publicRating.publicRating) {
+                    metadataLine("Public source rating", value: "\(publicRating.ratingSource ?? publicRating.provider.rawValue) ★ \(score)")
+                }
+                if let source = publicMetadataSources.first(where: { nonEmptyPublicText($0.communityRating) != nil }),
+                   let score = nonEmptyPublicText(source.communityRating) {
+                    metadataLine("Site rating", value: "\(source.provider.rawValue) ★ \(score)")
+                }
+                if let source = publicMetadataSources.first(where: { nonEmptyPublicText($0.communityVotes) != nil }),
+                   let votes = nonEmptyPublicText(source.communityVotes) {
+                    metadataLine("Site votes", value: "\(source.provider.rawValue) · \(votes)")
+                }
+                metadataLine("Public labels", value: publicMetadataSources.flatMap { $0.publicBadges ?? [] }
+                    .reduce(into: [String]()) { values, value in if !values.contains(value) { values.append(value) } }
+                    .joined(separator: ", "))
+                metadataLine("Additional credits", value: uniquePublicStrings(publicMetadataSources.flatMap { $0.crewNames ?? [] }, limit: 30).joined(separator: ", "))
                 HStack(spacing: 12) {
-                    if let url = details.trailerURL {
+                    if let url = details?.trailerURL {
                         Link(DenboxLanguage.localizedMessage("Watch trailer"), destination: url)
                     }
-                    if let url = details.homepageURL {
+                    if let url = details?.homepageURL {
                         Link(DenboxLanguage.localizedMessage("Official site"), destination: url)
                     }
                 }
@@ -7099,8 +7914,16 @@ private struct MediaDetailPage: View {
     }
 
     private var castNames: [String] {
+        let sourceCast: [String]
+        if let cast = details?.cast, !cast.isEmpty {
+            sourceCast = cast
+        } else if let tvmazeCast = referenceMetadata?.castProfiles?.map(\.name), !tvmazeCast.isEmpty {
+            sourceCast = tvmazeCast
+        } else {
+            sourceCast = publicMetadataSources.flatMap { $0.castNames ?? [] }
+        }
         var seen = Set<String>()
-        return (details?.cast ?? []).filter { name in
+        return sourceCast.filter { name in
             let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             return !key.isEmpty && seen.insert(key).inserted
         }
@@ -7743,7 +8566,6 @@ private struct PlayerWindowHost: View {
                 Color.black
             }
         }
-        .frame(minWidth: 1024, minHeight: 640)
         .onAppear { model.isPlayerWindowOpen = true }
         .onDisappear {
             model.playerURL = nil
@@ -7786,6 +8608,8 @@ private struct LocalPlayerSheet: View {
     @State private var controlsHideTask: Task<Void, Never>?
     @State private var showPlaylist = false
     @State private var showPlaybackInfo = false
+    @State private var showingOnlineSubtitles = false
+    @State private var pictureInPictureUnavailable = false
 
     init(url: URL, title: String, headers: [String: String]) {
         _currentURL = State(initialValue: url)
@@ -7794,6 +8618,105 @@ private struct LocalPlayerSheet: View {
     }
 
     var body: some View {
+        playerScene
+        .onAppear {
+            scrubPosition = model.startPlaybackSession(playerKind: "Denbox Player", localURL: currentURL)
+            playback.onProgress = { position, duration, delta in
+                model.recordPlaybackProgress(position: position, duration: duration, watchedDelta: delta)
+            }
+            playback.onUserActivity = { showPlayerControls() }
+            playback.onToggleFullscreen = { playback.toggleFullscreen() }
+            playback.onScreenshotRequested = { includeSubtitles in saveScreenshot(includeSubtitles: includeSubtitles) }
+            playback.onCloseRequested = { dismiss() }
+            playback.onTogglePlaybackInfo = { showPlaybackInfo.toggle() }
+            playback.onToggleControls = {
+                controlsHideTask?.cancel()
+                controlsHidden.toggle()
+                if !controlsHidden { scheduleControlsHide() }
+            }
+            playback.setSubtitlePosition(subtitlePosition)
+            playback.setSubtitleDelay(subtitleDelaySeconds)
+            playback.setSubtitleScale(subtitleScale)
+            playback.setSubtitleBorderSize(subtitleBorderSize)
+            playback.setSubtitleFontSize(subtitleFontSize)
+            playback.setSubtitleFont(subtitleFont)
+            playback.setSubtitleASSOverride(subtitleASSOverride)
+            _ = playback.setAudioDevice(audioOutputDeviceID)
+            playback.play(currentURL, headers: currentHeaders, startAtSeconds: scrubPosition)
+        }
+        .onChange(of: model.playerRequestID) { _ in
+            guard let nextURL = model.playerURL else { return }
+            playback.flushWatchProgress()
+            currentURL = nextURL
+            currentTitle = model.playerTitle
+            currentHeaders = model.playerHeaders
+            didAutoRefreshSource = false
+            isRefreshingSource = false
+            isScrubbing = false
+            scrubPosition = model.startPlaybackSession(
+                playerKind: "Denbox Player",
+                localURL: nextURL.isFileURL ? nextURL : nil
+            )
+            showPlayerControls()
+            playback.play(nextURL, headers: currentHeaders, startAtSeconds: scrubPosition)
+        }
+        .onChange(of: playback.isPlaying) { isPlaying in
+            if isPlaying { scheduleControlsHide() } else { showPlayerControls() }
+        }
+        .onChange(of: playback.isInMiniPlayerMode) { isMiniPlayer in
+            if isMiniPlayer { showPlayerControls() }
+            else { scheduleControlsHide() }
+        }
+        .onChange(of: currentTitle) { playback.updateMiniPlayerTitle($0) }
+        .onChange(of: playback.currentTimeSeconds) { value in
+            if !isScrubbing { scrubPosition = value }
+        }
+        .onChange(of: subtitleColor) { color in
+            playback.setSubtitleColor(Self.mpvColorString(color))
+        }
+        .onChange(of: subtitleBackgroundOpacity) { opacity in
+            playback.setSubtitleBackgroundColor("0/0/0/\(min(1, max(0, opacity)))")
+        }
+        .onChange(of: subtitleBorderColor) { color in
+            playback.setSubtitleBorderColor(Self.mpvColorString(color))
+        }
+        .onChange(of: subtitlePosition) { playback.setSubtitlePosition($0) }
+        .onChange(of: subtitleBorderSize) { playback.setSubtitleBorderSize($0) }
+        .onChange(of: subtitleFontSize) { playback.setSubtitleFontSize($0) }
+        .onChange(of: subtitleFont) { playback.setSubtitleFont($0) }
+        .onChange(of: subtitleASSOverride) { playback.setSubtitleASSOverride($0) }
+        .onChange(of: playback.errorMessage) { error in
+            guard error != nil, !currentURL.isFileURL, !didAutoRefreshSource,
+                  model.hasActiveRemotePlayback else { return }
+            didAutoRefreshSource = true
+            refreshPlaybackSource()
+        }
+        .onDisappear {
+            controlsHideTask?.cancel()
+            playback.onUserActivity = nil
+            playback.onToggleFullscreen = nil
+            playback.onScreenshotRequested = nil
+            playback.onCloseRequested = nil
+            playback.onTogglePlaybackInfo = nil
+            playback.onToggleControls = nil
+            playback.flushWatchProgress()
+            playback.stop()
+            model.finishPlaybackSession(position: playback.currentTimeSeconds, duration: playback.durationSeconds)
+            playback.shutdown()
+        }
+        .sheet(isPresented: $showingOnlineSubtitles) {
+            OnlineSubtitleSearchView(
+                videoURL: currentURL,
+                initialQuery: currentURL.isFileURL ? currentURL.deletingPathExtension().lastPathComponent : currentTitle,
+                apiKey: SecretVault.read(account: "opensubtitles-api-key") ?? ""
+            ) { subtitleURL in
+                playback.addSubtitleFile(subtitleURL)
+            }
+        }
+        .onExitCommand { dismiss() }
+    }
+
+    private var playerScene: some View {
         ZStack {
             Color.black
             MPVVideoView(controller: playback)
@@ -7900,78 +8823,29 @@ private struct LocalPlayerSheet: View {
             )
             .allowsHitTesting(false)
         }
-        .overlay(alignment: .top) { topBar.opacity(controlsHidden ? 0 : 1).allowsHitTesting(!controlsHidden) }
-        .overlay(alignment: .bottom) { controlsBar.opacity(controlsHidden ? 0 : 1).allowsHitTesting(!controlsHidden) }
+        .overlay(alignment: .top) {
+            if playback.isInMiniPlayerMode {
+                miniPlayerTopBar.opacity(controlsHidden ? 0 : 1).allowsHitTesting(!controlsHidden)
+            } else {
+                topBar.opacity(controlsHidden ? 0 : 1).allowsHitTesting(!controlsHidden)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if playback.isInMiniPlayerMode {
+                miniPlayerControls.opacity(controlsHidden ? 0 : 1).allowsHitTesting(!controlsHidden)
+            } else {
+                controlsBar.opacity(controlsHidden ? 0 : 1).allowsHitTesting(!controlsHidden)
+            }
+        }
         .animation(.easeOut(duration: 0.2), value: controlsHidden)
+        .animation(.easeInOut(duration: 0.22), value: playback.isInMiniPlayerMode)
         .onHover { hovering in if hovering { showPlayerControls() } }
-        .frame(minWidth: 1024, minHeight: 640)
+        .frame(
+            minWidth: playback.isInMiniPlayerMode ? 420 : 1024,
+            minHeight: playback.isInMiniPlayerMode ? 280 : 640
+        )
         .background(.black)
         .preferredColorScheme(.dark)
-        .onAppear {
-            scrubPosition = model.startPlaybackSession(playerKind: "Denbox Player", localURL: currentURL)
-            playback.onProgress = { position, duration, delta in
-                model.recordPlaybackProgress(position: position, duration: duration, watchedDelta: delta)
-            }
-            playback.onUserActivity = { showPlayerControls() }
-            playback.onToggleFullscreen = { playback.toggleFullscreen() }
-            playback.onScreenshotRequested = { includeSubtitles in saveScreenshot(includeSubtitles: includeSubtitles) }
-            playback.onCloseRequested = { dismiss() }
-            playback.onTogglePlaybackInfo = { showPlaybackInfo.toggle() }
-            playback.onToggleControls = {
-                controlsHideTask?.cancel()
-                controlsHidden.toggle()
-                if !controlsHidden { scheduleControlsHide() }
-            }
-            playback.setSubtitlePosition(subtitlePosition)
-            playback.setSubtitleDelay(subtitleDelaySeconds)
-            playback.setSubtitleScale(subtitleScale)
-            playback.setSubtitleBorderSize(subtitleBorderSize)
-            playback.setSubtitleFontSize(subtitleFontSize)
-            playback.setSubtitleFont(subtitleFont)
-            playback.setSubtitleASSOverride(subtitleASSOverride)
-            _ = playback.setAudioDevice(audioOutputDeviceID)
-            playback.play(currentURL, headers: currentHeaders, startAtSeconds: scrubPosition)
-        }
-        .onChange(of: playback.isPlaying) { isPlaying in
-            if isPlaying { scheduleControlsHide() } else { showPlayerControls() }
-        }
-        .onChange(of: playback.currentTimeSeconds) { value in
-            if !isScrubbing { scrubPosition = value }
-        }
-        .onChange(of: subtitleColor) { color in
-            playback.setSubtitleColor(Self.mpvColorString(color))
-        }
-        .onChange(of: subtitleBackgroundOpacity) { opacity in
-            playback.setSubtitleBackgroundColor("0/0/0/\(min(1, max(0, opacity)))")
-        }
-        .onChange(of: subtitleBorderColor) { color in
-            playback.setSubtitleBorderColor(Self.mpvColorString(color))
-        }
-        .onChange(of: subtitlePosition) { playback.setSubtitlePosition($0) }
-        .onChange(of: subtitleBorderSize) { playback.setSubtitleBorderSize($0) }
-        .onChange(of: subtitleFontSize) { playback.setSubtitleFontSize($0) }
-        .onChange(of: subtitleFont) { playback.setSubtitleFont($0) }
-        .onChange(of: subtitleASSOverride) { playback.setSubtitleASSOverride($0) }
-        .onChange(of: playback.errorMessage) { error in
-            guard error != nil, !currentURL.isFileURL, !didAutoRefreshSource,
-                  model.hasActiveRemotePlayback else { return }
-            didAutoRefreshSource = true
-            refreshPlaybackSource()
-        }
-        .onDisappear {
-            controlsHideTask?.cancel()
-            playback.onUserActivity = nil
-            playback.onToggleFullscreen = nil
-            playback.onScreenshotRequested = nil
-            playback.onCloseRequested = nil
-            playback.onTogglePlaybackInfo = nil
-            playback.onToggleControls = nil
-            playback.flushWatchProgress()
-            playback.stop()
-            model.finishPlaybackSession(position: playback.currentTimeSeconds, duration: playback.durationSeconds)
-            playback.shutdown()
-        }
-        .onExitCommand { dismiss() }
     }
 
     private func showPlayerControls() {
@@ -8034,6 +8908,28 @@ private struct LocalPlayerSheet: View {
             }
             .buttonStyle(.plain)
             .help("Rotate video")
+            Menu {
+                Button(playback.isInSystemPictureInPictureMode ? "Close Picture in Picture" : "Picture in Picture") {
+                    if playback.isInSystemPictureInPictureMode {
+                        _ = playback.exitSystemPictureInPicture()
+                    } else if !playback.enterSystemPictureInPicture(title: currentTitle) {
+                        pictureInPictureUnavailable = true
+                    }
+                }
+                Button("Open mini player") {
+                    _ = playback.enterMiniPlayer(title: currentTitle)
+                }
+            } label: {
+                Image(systemName: "pip")
+                    .frame(width: 32, height: 30)
+            }
+            .buttonStyle(.plain)
+            .help(DenboxLanguage.localizedMessage("Picture in Picture"))
+            .alert("Picture in Picture is unavailable", isPresented: $pictureInPictureUnavailable) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text("System Picture in Picture could not be started.")
+            }
             Button { playback.toggleFullscreen() } label: {
                 Image(systemName: "arrow.up.left.and.arrow.down.right")
                     .frame(width: 32, height: 30)
@@ -8045,6 +8941,70 @@ private struct LocalPlayerSheet: View {
         .padding(.top, 16)
         .padding(.bottom, 22)
         .background(LinearGradient(colors: [.black.opacity(0.82), .clear], startPoint: .top, endPoint: .bottom))
+        .onHover { pointerEnteredControls($0) }
+    }
+
+    private var miniPlayerTopBar: some View {
+        HStack(spacing: 8) {
+            Text(currentTitle)
+                .font(.denbox(size: 12, weight: .semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Button { playback.exitMiniPlayer() } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .help(DenboxLanguage.localizedMessage("Return to player window"))
+            Button { dismiss() } label: {
+                Image(systemName: "xmark")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .help(DenboxLanguage.localizedMessage("Close player"))
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 22)
+        .background(LinearGradient(colors: [.black.opacity(0.82), .clear], startPoint: .top, endPoint: .bottom))
+        .onHover { pointerEnteredControls($0) }
+    }
+
+    private var miniPlayerControls: some View {
+        VStack(spacing: 3) {
+            HStack(spacing: 12) {
+                transportButton("gobackward.10", help: "Back 10 seconds") { playback.seek(by: -10) }
+                Button { playback.togglePlayPause() } label: {
+                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.denbox(size: 18, weight: .semibold))
+                        .frame(width: 38, height: 34)
+                }
+                .buttonStyle(.plain)
+                .help(DenboxLanguage.localizedMessage(playback.isPlaying ? "Pause" : "Play"))
+                transportButton("goforward.10", help: "Forward 10 seconds") { playback.seek(by: 10) }
+                Spacer(minLength: 4)
+                Text(Self.timeLabel(playback.currentTimeSeconds))
+                    .font(.denbox(size: 10).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+            HStack(spacing: 8) {
+                Slider(value: $scrubPosition, in: 0...max(playback.durationSeconds ?? 1, 1)) { editing in
+                    isScrubbing = editing
+                    if !editing { playback.seek(to: scrubPosition) }
+                }
+                .disabled(playback.durationSeconds == nil)
+                Text(Self.timeLabel(playback.durationSeconds ?? 0))
+                    .font(.denbox(size: 10).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
+        .background(LinearGradient(colors: [.clear, .black.opacity(0.88)], startPoint: .top, endPoint: .bottom))
         .onHover { pointerEnteredControls($0) }
     }
 
@@ -8274,6 +9234,8 @@ private struct LocalPlayerSheet: View {
 
     private var subtitleMenu: some View {
         Menu {
+            Button("Find subtitles online…") { showingOnlineSubtitles = true }
+            Divider()
             Button("Open subtitles from file…") { chooseSubtitleFile() }
             Button("Open secondary subtitle from file…") { chooseSubtitleFile(asSecondary: true) }
             Button("Disable subtitles") { playback.selectSubtitle(nil) }
@@ -8703,6 +9665,8 @@ private struct SettingsSheet: View {
     @State private var feedKey = SecretVault.read(account: "catalog-feed-key") ?? ""
     @State private var tmdbReadToken = SecretVault.read(account: "tmdb-read-access-token") ?? ""
     @State private var tmdbTokenStatus = ""
+    @State private var openSubtitlesApiKey = SecretVault.read(account: "opensubtitles-api-key") ?? ""
+    @State private var openSubtitlesKeyStatus = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
@@ -8778,7 +9742,7 @@ private struct SettingsSheet: View {
             VStack(alignment: .leading, spacing: 9) {
                 Label("IMDb titles, people, and charts", systemImage: "star.leadinghalf.filled")
                     .font(.denbox(size: 13, weight: .semibold))
-                Text("Download IMDb's official non-commercial datasets to this Mac. They add local search for actors, directors, and writers, with their movie and TV credits, alongside title and episode ratings, season numbering, and top-rated lists. Episode ratings match by title and then SxxExx numbering. The data is refreshed daily by IMDb but must be downloaded again here to update. IMDb's bulk files do not contain photos, biographies, or franchise membership: title posters are cached from your Simba catalog, and IMDb Franchises uses curated collections matched against the local title index. Trending and box office charts also open live IMDb pages.")
+                Text("Download IMDb's official non-commercial datasets to this Mac. They add local search for actors, directors, and writers, with their movie and TV credits, alongside title and episode ratings, season numbering, and top-rated lists. Episode ratings match by title and then SxxExx numbering. The data is refreshed daily by IMDb but must be downloaded again here to update. IMDb's bulk files do not contain photos, biographies, or franchise membership: title posters are cached from your Simba catalog, and IMDb Franchises uses curated collections matched against the local title index. Popular Today uses TMDB’s daily feed; Box Office and Release Calendar show source data as in-app lists.")
                     .font(.denbox(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -8795,7 +9759,7 @@ private struct SettingsSheet: View {
                          destination: URL(string: "https://www.themoviedb.org/settings/api")!)
                         .font(.denbox(size: 10))
                 }
-                Text("Optional. Denbox uses this token only for title and matched IMDb ID lookups to add public details. Catalog titles are sent to TMDB when enabled; viewing history and My List are not. The token stays in macOS Keychain.")
+                Text("Optional. Denbox uses this token for matched public title details and the daily popular movies and TV lists. The token stays in macOS Keychain; viewing history and My List are never sent to TMDB.")
                     .font(.denbox(size: 10))
                     .foregroundStyle(Color.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -8836,6 +9800,40 @@ private struct SettingsSheet: View {
                         .font(.denbox(size: 9))
                         .foregroundStyle(Color.secondaryText.opacity(0.9))
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider().overlay(Color.white.opacity(0.08))
+                HStack(spacing: 8) {
+                    Label("Online subtitles", systemImage: "captions.bubble")
+                        .font(.denbox(size: 12, weight: .semibold))
+                    Spacer()
+                    Link("Get an OpenSubtitles API key",
+                         destination: URL(string: "https://www.opensubtitles.com/en/consumers")!)
+                        .font(.denbox(size: 10))
+                }
+                Text("Optional. Add your own OpenSubtitles application key to search and download subtitles from the player. Denbox stores it in macOS Keychain and sends it only to OpenSubtitles.")
+                    .font(.denbox(size: 10))
+                    .foregroundStyle(Color.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                SecureField("OpenSubtitles API key", text: $openSubtitlesApiKey)
+                    .textFieldStyle(.roundedBorder)
+                    .textContentType(.password)
+                HStack(spacing: 10) {
+                    Button {
+                        let key = openSubtitlesApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                        SecretVault.save(key, account: "opensubtitles-api-key")
+                        openSubtitlesApiKey = key
+                        openSubtitlesKeyStatus = key.isEmpty
+                            ? "OpenSubtitles API key removed from Keychain."
+                            : "OpenSubtitles API key saved in Keychain."
+                    } label: {
+                        Label("Save OpenSubtitles key", systemImage: "key.horizontal")
+                    }
+                    .buttonStyle(.bordered)
+                    Text(DenboxLanguage.localizedMessage(openSubtitlesKeyStatus))
+                        .font(.denbox(size: 10))
+                        .foregroundStyle(Color.secondaryText)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
                 }
                 Button {
                     model.checkPublicReferencesForCatalog()

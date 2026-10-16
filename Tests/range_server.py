@@ -2,7 +2,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 
-SIZE = 12_000_000
+SIZE = 32 * 1024 * 1024
 BODY = bytes((index * 31 + 7) % 256 for index in range(SIZE))
 
 

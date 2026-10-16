@@ -11,19 +11,39 @@ struct StartupResponsivenessTests {
 
         let databaseURL = root.appendingPathComponent("library.sqlite")
         let seed = MediaDatabase(databaseURL: databaseURL)
-        seed.saveRemoteItems(Array(MediaItem.samples.prefix(4)))
+        let savedItems = (0..<2_000).map { index in
+            MediaItem(
+                id: "startup-\(index)",
+                apiID: "startup-\(index)",
+                title: "Startup Fixture \(index)",
+                subtitle: "2026 · Movie",
+                synopsis: "A saved catalog fixture.",
+                year: "2026",
+                kind: index.isMultiple(of: 2) ? "Movie" : "Series",
+                symbol: index.isMultiple(of: 2) ? "film" : "tv",
+                palette: index % 8,
+                isRemote: true
+            )
+        }
+        seed.saveRemoteItems(savedItems)
 
         let started = Date()
-        let model = LibraryModel(loadRemoteCatalog: false, databaseURL: databaseURL)
+        let model = LibraryModel(
+            loadRemoteCatalog: false,
+            databaseURL: databaseURL,
+            startBackgroundCatalogEnrichment: false
+        )
         let startupSeconds = Date().timeIntervalSince(started)
-        try require(startupSeconds < 1, "loading a small saved catalog took more than one second")
-        try require(model.items.count == 4, "the saved catalog was not available immediately at startup")
+        try require(startupSeconds < 0.5,
+                    String(format: "loading 2,000 saved titles took %.3fs", startupSeconds))
+        try require(model.items.count == savedItems.count,
+                    "the full saved catalog was not available immediately at startup")
         try require(model.recommendations.isEmpty, "startup eagerly built recommendations before the page was opened")
 
         try await Task.sleep(nanoseconds: 150_000_000)
-        try require(model.items.count == 4, "background metadata loading changed the visible catalog")
+        try require(model.items.count == savedItems.count, "background metadata loading changed the visible catalog")
         try require(model.recommendations.isEmpty, "background startup work started the full discovery query")
-        print(String(format: "PASS startup responsiveness: %.3fs to show 4 saved titles; discovery remains lazy", startupSeconds))
+        print(String(format: "PASS startup responsiveness: %.3fs to show 2,000 saved titles; discovery remains lazy", startupSeconds))
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

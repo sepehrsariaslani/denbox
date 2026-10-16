@@ -12,7 +12,12 @@ struct SegmentedDownloaderTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let expected = Data((0..<12_000_000).map { UInt8(($0 * 31 + 7) % 256) })
+        // 32 MiB divided into 4 MiB targets exercises the downloader's 8-part ceiling.
+        let expectedSize = 32 * 1024 * 1024
+        var expected = Data(capacity: expectedSize)
+        for index in 0..<expectedSize {
+            expected.append(UInt8((index * 31 + 7) % 256))
+        }
         let expectedDigest = SHA256.hash(data: expected)
         let base = URL(string: "http://127.0.0.1:\(port)")!
 
@@ -21,7 +26,7 @@ struct SegmentedDownloaderTests {
             source: DownloadRequestSource(url: base.appendingPathComponent("range"), headers: [:]),
             to: segmentedURL
         )
-        try require(segmented.segmentCount > 1, "range-enabled source was not downloaded in parallel segments")
+        try require(segmented.segmentCount == 8, "range-enabled source did not use the 8-part maximum")
         try require(segmented.byteCount == Int64(expected.count), "segmented byte count is incorrect")
         let segmentedData = try Data(contentsOf: segmentedURL)
         try require(SHA256.hash(data: segmentedData) == expectedDigest,

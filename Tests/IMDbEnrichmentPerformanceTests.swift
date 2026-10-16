@@ -4,6 +4,11 @@ import Foundation
 struct IMDbEnrichmentPerformanceTests {
     @MainActor
     static func main() async throws {
+        if CommandLine.arguments.dropFirst().contains("--parser-only") {
+            try await verifyDetailParsingResponsiveness()
+            return
+        }
+
         let databaseURL = CommandLine.arguments.dropFirst().first.map { URL(fileURLWithPath: $0) }
         let model = LibraryModel(
             loadRemoteCatalog: false,
@@ -41,6 +46,46 @@ struct IMDbEnrichmentPerformanceTests {
             try require(enrichmentSeconds < 10, "background IMDb enrichment took more than ten seconds")
         }
         log("PASS detail responsiveness: cached series renders before IMDb enrichment completes")
+    }
+
+    @MainActor
+    private static func verifyDetailParsingResponsiveness() async throws {
+        let item = MediaItem(
+            id: "detail-parser-fixture",
+            title: "Large Series Fixture",
+            subtitle: "2026 · Series",
+            synopsis: "",
+            year: "2026",
+            kind: "Series",
+            symbol: "tv",
+            palette: 0,
+            isRemote: true
+        )
+        let episodes: [[String: Any]] = (0..<4_500).map { index in
+            [
+                "episode_number": index + 1,
+                "title": "Episode \(index + 1)",
+                "url": "https://media.example/episode-\(index + 1).mp4"
+            ]
+        }
+        let payload: [String: Any] = [
+            "data": [
+                "seasons": [["season_number": 1, "episodes": episodes]]
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        let heartbeatStarted = Date()
+        let parseTask = Task { await LibraryModel.parseDetailsData(data, for: item) }
+        await Task.yield()
+        let heartbeatSeconds = Date().timeIntervalSince(heartbeatStarted)
+        guard let details = await parseTask.value else {
+            throw PerformanceTestFailure(message: "the synthetic episode details could not be parsed")
+        }
+        let episodeCount = details.seasons.reduce(0) { $0 + $1.episodes.count }
+        try require(episodeCount == 4_500, "the parser lost episodes from the large detail payload")
+        try require(heartbeatSeconds < 0.05,
+                    String(format: "the main-actor heartbeat was blocked for %.3fs during detail parsing", heartbeatSeconds))
+        log(String(format: "PASS detail parsing: 4,500 episodes; main-actor heartbeat %.4fs", heartbeatSeconds))
     }
 
     @MainActor

@@ -15,6 +15,7 @@ struct IMDbGenreIndexPerformanceTests {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let databaseURL = root.appendingPathComponent("imdb-metadata.sqlite")
+        try verifyCatalogMatchIndexes(in: root)
         try createLegacyDatabase(at: databaseURL, seriesCount: 50_000)
         let store = IMDbMetadataStore.testingStore(databaseURL: databaseURL)
 
@@ -86,6 +87,44 @@ struct IMDbGenreIndexPerformanceTests {
         print(String(format: "Indexed discovery query: %.3fs first run · %.3fs cached; 30,000-title ranking: %.3fs", discoverySeconds, repeatedDiscoverySeconds, rankingSeconds))
         print(String(format: "Indexed recommendations and exact title lookups: %.3fs for 60 queries", indexedQuerySeconds))
         print("PASS IMDb indexes: legacy migration, discovery ordering/cache, similar-title lookup, and exact series/movie title lookup")
+    }
+
+    private static func verifyCatalogMatchIndexes(in root: URL) throws {
+        let databaseURL = root.appendingPathComponent("catalog-match.sqlite")
+        try createLegacyDatabase(at: databaseURL, seriesCount: 50_000)
+        let store = IMDbMetadataStore.testingStore(databaseURL: databaseURL)
+        let item = MediaItem(
+            id: "catalog-series",
+            title: "Drama Series 49999",
+            subtitle: "2020 · Series",
+            synopsis: "",
+            year: "2020",
+            kind: "Series",
+            symbol: "tv",
+            palette: 0,
+            isRemote: true
+        )
+        let started = Date()
+        let matches = store.catalogMetadata(for: [item])
+        let elapsed = Date().timeIntervalSince(started)
+        try require(matches[item.id]?.tconst == "tt0049999",
+                    "catalog matching failed after creating its compact title indexes")
+        try require(elapsed < 2,
+                    String(format: "catalog match index creation and lookup took %.3fs", elapsed))
+        for index in ["idx_titles_normalized", "idx_series_normalized_original", "idx_movie_normalized_original"] {
+            try require(indexExists(index, in: databaseURL), "catalog matching did not create \(index)")
+        }
+        for index in ["idx_series_start_year", "idx_movie_start_year", "idx_discovery_rating"] {
+            try require(!indexExists(index, in: databaseURL),
+                        "catalog enrichment built the unrelated \(index) index")
+        }
+
+        try require(store.matchTitle(title: item.title, year: item.year, kind: item.kind)?.tconst == "tt0049999",
+                    "the full title search did not create its year indexes on demand")
+        try require(indexExists("idx_series_start_year", in: databaseURL)
+                    && indexExists("idx_movie_start_year", in: databaseURL),
+                    "full title search did not build the year indexes it needs")
+        print(String(format: "Catalog match indexes: %.3fs for 50,000 IMDb rows; fuzzy year indexes stay lazy", elapsed))
     }
 
     private static func measureInstalledDatabase(at url: URL) throws {

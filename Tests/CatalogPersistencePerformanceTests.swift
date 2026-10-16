@@ -38,6 +38,36 @@ struct CatalogPersistencePerformanceTests {
         let enriched = database?.loadCatalog() ?? []
         try require(enriched.count == items.count && enriched.allSatisfy { $0.imdbID != nil && $0.genres == ["Drama"] },
                     "batched IMDb catalog metadata did not persist every match")
+
+        let cachedReference = ReferenceTitleMetadata.empty()
+        let cachedPublicTitle = PublicTitleMetadata(
+            provider: .filimo,
+            pageURL: URL(string: "https://www.filimo.com/m/fixture")!,
+            title: "Cached catalog fixture",
+            synopsis: "خلاصهٔ فارسی آزمایشی",
+            posterURL: nil,
+            visiblePageText: "",
+            visibleHeadings: [],
+            episodeSnippets: [],
+            imageURLs: [],
+            importedAt: Date()
+        )
+        for item in items {
+            database?.saveReferenceMetadata(cachedReference, mediaID: item.id)
+            _ = database?.savePublicTitleMetadata(cachedPublicTitle, for: item.id)
+            database?.recordPublicTitleMetadataAttempt(mediaID: item.id, provider: .filimo)
+        }
+        let cacheReadStarted = Date()
+        let metadataCache = database?.loadCatalogMetadataPayloads(for: Set(items.map(\.id))) ?? CatalogMetadataPayloads()
+        let metadataCacheReadSeconds = Date().timeIntervalSince(cacheReadStarted)
+        try require(metadataCache.references.count == items.count,
+                    "batched cache loading skipped reference metadata")
+        try require(metadataCache.publicTitles.count == items.count,
+                    "batched cache loading skipped public title metadata")
+        try require(metadataCache.publicAttempts.count == items.count,
+                    "batched cache loading skipped public metadata cooldowns")
+        try require(metadataCacheReadSeconds < 0.25,
+                    String(format: "loading 1,000 metadata cache rows took %.3fs", metadataCacheReadSeconds))
         database = nil
 
         let reopened = MediaDatabase(databaseURL: databaseURL)
@@ -47,7 +77,8 @@ struct CatalogPersistencePerformanceTests {
                     String(format: "writing 1,000 catalog titles took %.3fs", writeSeconds))
         try require(metadataWriteSeconds < 0.5,
                     String(format: "writing 1,000 IMDb metadata rows took %.3fs", metadataWriteSeconds))
-        print(String(format: "PASS catalog persistence: 1,000 titles in %.3fs; 1,000 IMDb rows in %.3fs", writeSeconds, metadataWriteSeconds))
+        print(String(format: "PASS catalog persistence: 1,000 titles in %.3fs; 1,000 IMDb rows in %.3fs; 1,000 cache sets in %.3fs",
+                      writeSeconds, metadataWriteSeconds, metadataCacheReadSeconds))
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

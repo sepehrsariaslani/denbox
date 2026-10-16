@@ -89,6 +89,8 @@ enum DenboxLanguage {
             (#"^The video source could not be opened: (.+)$"#, "The video source could not be opened: %@"),
             (#"^Playback failed: (.+)$"#, "Playback failed: %@"),
             (#"^Error code (\d+)$"#, "Error code %@"),
+            (#"^OpenSubtitles request failed \(HTTP (\d+)\)\.$"#, "OpenSubtitles request failed (HTTP %@)."),
+            (#"^Downloads: (\d+) · Files: (\d+)$"#, "Downloads: %@ · Files: %@"),
             (#"^Updated: (.+) · (\d+) images$"#, "Updated: %@ · %@ images"),
             (#"^Visible episodes \((\d+)\)$"#, "Visible episodes (%@)"),
             (#"^The link must use HTTPS and point to a public title page on (.+)\.$"#, "The link must use HTTPS and point to a public title page on %@."),
@@ -133,6 +135,8 @@ enum DenboxLanguage {
             (#"^IMDb dataset download failed: (.+)$"#, "IMDb dataset download failed: %@"),
             (#"^IMDb dataset import failed: (.+)$"#, "IMDb dataset import failed: %@"),
             (#"^IMDb dataset ready · updated (.+)$"#, "IMDb dataset ready · updated %@"),
+            (#"^Could not load the (.+) feed\. Try again later\.$"#, "Could not load the %@ feed. Try again later."),
+            (#"^(\d+) events$"#, "%@ events"),
             (#"^Checking public metadata for (\d+) titles…$"#, "Checking public metadata for %@ titles…"),
             (#"^Checked public references for (\d+) titles\.$"#, "Checked public references for %@ titles."),
             (#"^(.+) votes$"#, "%@ votes"),
@@ -182,6 +186,7 @@ extension LibrarySection {
         case .movies: "Movies"
         case .shows: "TV Shows"
         case .imdbCharts: "IMDb Charts"
+        case .releaseCalendar: "Release Calendar"
         case .imdbPeople: "IMDb People"
         case .imdbFranchises: "IMDb Franchises"
         case .watchlist: "My List"

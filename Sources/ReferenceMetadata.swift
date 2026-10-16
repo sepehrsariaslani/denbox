@@ -79,10 +79,10 @@ struct ReferenceTitleMetadata: Codable, Sendable {
             year: year ?? fallback.year,
             rating: rating ?? fallback.rating,
             runtime: runtime ?? fallback.runtime,
-            genres: Array((genres + fallback.genres).uniqued().prefix(12)),
+            genres: Array((genres + fallback.genres).referenceUniqued().prefix(12)),
             country: country ?? fallback.country,
             director: director ?? fallback.director,
-            cast: Array((cast + fallback.cast).uniqued().prefix(20)),
+            cast: Array((cast + fallback.cast).referenceUniqued().prefix(20)),
             citations: citationMap.values.sorted { $0.provider < $1.provider },
             attemptedProviders: Array(Set(attemptedProviders + fallback.attemptedProviders)).sorted(),
             fetchedAt: max(fetchedAt, fallback.fetchedAt),
@@ -108,7 +108,7 @@ struct ReferenceTitleMetadata: Codable, Sendable {
     }
 
     private static func mergeLists(_ first: [String]?, _ second: [String]?, limit: Int) -> [String]? {
-        let values = ((first ?? []) + (second ?? [])).uniqued().prefix(limit)
+        let values = ((first ?? []) + (second ?? [])).referenceUniqued().prefix(limit)
         return values.isEmpty ? nil : Array(values)
     }
 
@@ -202,7 +202,7 @@ enum ReferenceMetadataService {
             genres: details.genres.isEmpty ? metadata.genres : details.genres,
             country: details.country?.referenceNonEmpty ?? metadata.country,
             director: details.director?.referenceNonEmpty ?? metadata.director,
-            cast: Array((details.cast + metadata.cast).uniqued().prefix(20)),
+            cast: Array((details.cast + metadata.cast).referenceUniqued().prefix(20)),
             sources: details.sources,
             downloadSources: details.downloadSources,
             seasons: details.seasons,
@@ -230,7 +230,7 @@ enum ReferenceMetadataService {
     }
 
     private static func mergeLists(_ first: [String]?, _ second: [String]?, limit: Int) -> [String]? {
-        let values = ((first ?? []) + (second ?? [])).uniqued().prefix(limit)
+        let values = ((first ?? []) + (second ?? [])).referenceUniqued().prefix(limit)
         return values.isEmpty ? nil : Array(values)
     }
 
@@ -316,7 +316,7 @@ enum ReferenceMetadataService {
 
         let targetYear = item.year.range(of: #"(?:19|20)\d{2}"#, options: .regularExpression)
             .flatMap { Int(item.year[$0]) }
-        for title in ([item.title] + item.matchingTitles).uniqued().prefix(2) {
+        for title in ([item.title] + item.matchingTitles).referenceUniqued().prefix(2) {
             var query = [URLQueryItem(name: "query", value: title), URLQueryItem(name: "include_adult", value: "false")]
             if let targetYear {
                 query.append(URLQueryItem(name: mediaType == "movie" ? "primary_release_year" : "first_air_date_year", value: String(targetYear)))
@@ -363,18 +363,18 @@ enum ReferenceMetadataService {
             return value.range(of: #"^(?:19|20)\d{2}$"#, options: .regularExpression) == nil ? nil : value
         }
         let credits = payload["credits"] as? [String: Any] ?? [:]
-        let cast = Array((credits["cast"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.uniqued().prefix(20))
+        let cast = Array((credits["cast"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.referenceUniqued().prefix(20))
         let crew = credits["crew"] as? [[String: Any]] ?? []
         let directors = crew.filter { string($0["job"])?.localizedCaseInsensitiveCompare("Director") == .orderedSame }
-            .compactMap { string($0["name"]) }.uniqued()
-        let creators = (payload["created_by"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.uniqued()
+            .compactMap { string($0["name"]) }.referenceUniqued()
+        let creators = (payload["created_by"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.referenceUniqued()
         let writers = crew.filter {
             guard let job = string($0["job"])?.lowercased() else { return false }
             return ["writer", "screenplay", "story", "teleplay", "creator"].contains(job)
-        }.compactMap { string($0["name"]) }.uniqued()
-        let genres = Array((payload["genres"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.uniqued().prefix(12))
-        let productionCompanies = Array((payload["production_companies"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.uniqued().prefix(12))
-        let networks = Array((payload["networks"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.uniqued().prefix(12))
+        }.compactMap { string($0["name"]) }.referenceUniqued()
+        let genres = Array((payload["genres"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.referenceUniqued().prefix(12))
+        let productionCompanies = Array((payload["production_companies"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.referenceUniqued().prefix(12))
+        let networks = Array((payload["networks"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }.referenceUniqued().prefix(12))
         let productionCountries = (payload["production_countries"] as? [[String: Any]] ?? []).compactMap { string($0["name"]) }
         let originCountries = (payload["origin_country"] as? [String] ?? [])
         let country = (productionCountries.isEmpty ? originCountries : productionCountries).prefix(5).joined(separator: ", ").referenceNonEmpty
@@ -390,7 +390,7 @@ enum ReferenceMetadataService {
             .first.flatMap { URL(string: "https://www.youtube.com/watch?v=\($0)") }
         let keywordObject = payload["keywords"] as? [String: Any] ?? [:]
         let keywordRows = (keywordObject["keywords"] as? [[String: Any]]) ?? (keywordObject["results"] as? [[String: Any]]) ?? []
-        let keywords = Array(keywordRows.compactMap { string($0["name"]) }.uniqued().prefix(30))
+        let keywords = Array(keywordRows.compactMap { string($0["name"]) }.referenceUniqued().prefix(30))
         let contentRating = tmdbContentRating(payload, mediaType: mediaType)
         let homepageURL = string(payload["homepage"]).flatMap(httpsURL)
         let citationURL = URL(string: "https://www.themoviedb.org/\(mediaType == "movie" ? "movie" : "tv")/\(id)")!
@@ -486,13 +486,13 @@ enum ReferenceMetadataService {
             castProfiles.append(member)
             if castProfiles.count == 20 { break }
         }
-        let cast = Array(castProfiles.map(\.name).uniqued().prefix(15))
+        let cast = Array(castProfiles.map(\.name).referenceUniqued().prefix(15))
         let crewRows = embedded["crew"] as? [[String: Any]] ?? []
         let directors = crewRows.compactMap { row -> String? in
             guard string(row["type"])?.localizedCaseInsensitiveContains("director") == true,
                   let person = row["person"] as? [String: Any] else { return nil }
             return string(person["name"])
-        }.uniqued()
+        }.referenceUniqued()
         let network = show["network"] as? [String: Any]
         let webChannel = show["webChannel"] as? [String: Any]
         let networkCountry = (network?["country"] as? [String: Any]).flatMap { string($0["name"]) }
@@ -511,7 +511,7 @@ enum ReferenceMetadataService {
             year: premiered.flatMap { String($0.prefix(4)).referenceNonEmpty },
             rating: rating,
             runtime: runtime.map { "\(Int($0.rounded())) min" },
-            genres: (show["genres"] as? [String] ?? []).uniqued(),
+            genres: (show["genres"] as? [String] ?? []).referenceUniqued(),
             country: networkCountry ?? channelCountry,
             director: directors.first,
             cast: cast,
@@ -643,7 +643,7 @@ enum ReferenceMetadataService {
 
     private static func fetchTVmaze(item: MediaItem, imdbID: String?) async -> ReferenceTitleMetadata? {
         guard item.kind == "Series" else { return nil }
-        var queries = ([item.title] + item.matchingTitles).uniqued().prefix(2)
+        var queries = ([item.title] + item.matchingTitles).referenceUniqued().prefix(2)
         while let query = queries.first {
             queries = queries.dropFirst()
             guard let url = makeURL("https://api.tvmaze.com/search/shows", query: [URLQueryItem(name: "q", value: query)]) else { continue }
@@ -673,7 +673,7 @@ enum ReferenceMetadataService {
     }
 
     private static func searchWikidataEntity(for item: MediaItem) async -> String? {
-        for title in ([item.title] + item.matchingTitles).uniqued().prefix(2) {
+        for title in ([item.title] + item.matchingTitles).referenceUniqued().prefix(2) {
             guard let url = makeURL("https://www.wikidata.org/w/api.php", query: [
                 URLQueryItem(name: "action", value: "wbsearchentities"),
                 URLQueryItem(name: "search", value: title),
@@ -779,7 +779,7 @@ private extension String {
 }
 
 private extension Array where Element: Hashable {
-    func uniqued() -> [Element] {
+    func referenceUniqued() -> [Element] {
         var seen = Set<Element>()
         return filter { seen.insert($0).inserted }
     }

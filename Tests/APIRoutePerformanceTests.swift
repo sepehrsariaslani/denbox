@@ -18,7 +18,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/slow":
+        if self.path in ("/detail-fast", "/detail-slow", "/detail-fallback", "/detail-empty"):
+            if self.path == "/detail-slow":
+                time.sleep(3)
+            elif self.path == "/detail-fast":
+                time.sleep(0.05)
+            if self.path == "/detail-empty":
+                value = {"status": "empty"}
+            elif self.path == "/detail-fallback":
+                value = {"data": {"description": "cached fallback"}}
+            else:
+                value = {"data": {"description": self.path, "sources": [{"url": "https://media.example/video.mp4"}]}}
+            payload = b"not-json" if self.path == "/detail-empty" else json.dumps(value).encode()
+        elif self.path == "/slow":
             time.sleep(3)
             rows = [{"title": "slow"}]
         elif self.path == "/empty":
@@ -26,7 +38,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             time.sleep(0.05)
             rows = [{"title": "fast"}]
-        payload = json.dumps({"movies": rows}).encode()
+            payload = json.dumps({"movies": rows}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -73,7 +85,51 @@ server.serve_forever()
         )
         try require(DirectMediaAPI.rows(from: skippedEmpty)?.first?["title"] as? String == "fast",
                     "the route race did not skip an empty response")
-        print(String(format: "PASS API route race: usable response in %.3fs; empty route skipped", fastSeconds))
+
+        let item = MediaItem(
+            id: "route-details",
+            title: "Route details fixture",
+            subtitle: "2026 · Movie",
+            synopsis: "",
+            year: "2026",
+            kind: "Movie",
+            symbol: "film",
+            palette: 0,
+            isRemote: true
+        )
+        let detailStarted = Date()
+        let detailResponse = try await DirectMediaAPI.getJSONData(
+            firstAcceptableFrom: [base.appendingPathComponent("detail-slow"), base.appendingPathComponent("detail-fast")],
+            timeout: 5
+        ) { data in
+            let details = await LibraryModel.parseDetailsData(data, for: item)
+            return DirectMediaAPI.JSONDataEvaluation(
+                value: details,
+                isPreferred: details?.hasPlayableResources == true,
+                useAsFallback: details?.hasUsefulContent == true
+            )
+        }
+        let detailSeconds = Date().timeIntervalSince(detailStarted)
+        try require(detailResponse.value.description == "/detail-fast",
+                    "background detail parsing did not select the first playable route")
+        try require(detailSeconds < 1,
+                    "the playable detail route waited for the slow alternative for \(detailSeconds)s")
+
+        let fallback = try await DirectMediaAPI.getJSONData(
+            firstAcceptableFrom: [base.appendingPathComponent("detail-fallback"), base.appendingPathComponent("detail-empty")],
+            timeout: 5
+        ) { data in
+            let details = await LibraryModel.parseDetailsData(data, for: item)
+            return DirectMediaAPI.JSONDataEvaluation(
+                value: details,
+                isPreferred: details?.hasPlayableResources == true,
+                useAsFallback: details?.hasUsefulContent == true
+            )
+        }
+        try require(fallback.value.description == "cached fallback" && !fallback.value.hasPlayableResources,
+                    "the route race did not preserve the first useful non-playable detail fallback")
+        print(String(format: "PASS API route race: usable catalog in %.3fs · playable details in %.3fs · fallback retained",
+                     fastSeconds, detailSeconds))
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
