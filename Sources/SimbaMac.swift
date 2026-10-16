@@ -1715,8 +1715,18 @@ final class LibraryModel: ObservableObject {
         database.watchProgress(mediaID: mediaID, episodeID: episodeID)
     }
 
-    func isWatched(mediaID: String, episodeID: String?) -> Bool {
-        database.watchProgress(mediaID: mediaID, episodeID: episodeID)?.isWatched ?? false
+    func isWatched(
+        mediaID: String,
+        episodeID: String?,
+        episodeLabel: String? = nil,
+        episodeTitle: String? = nil
+    ) -> Bool {
+        database.watchProgress(
+            mediaID: mediaID,
+            episodeID: episodeID,
+            episodeLabel: episodeLabel,
+            episodeTitle: episodeTitle
+        )?.isWatched ?? false
     }
 
     func setWatched(item: MediaItem, episode: MediaEpisode?, details: MediaDetails?, watched: Bool) {
@@ -3648,8 +3658,12 @@ extension MediaDatabase {
     func setWatched(_ progress: WatchProgress, watched: Bool) {
         var updated = progress
         updated.isWatched = watched
-        if watched, let duration = updated.durationSeconds, duration.isFinite, duration > 0 {
-            updated.positionSeconds = duration
+        if watched {
+            if let duration = updated.durationSeconds, duration.isFinite, duration > 0 {
+                updated.positionSeconds = duration
+            }
+        } else {
+            updated.positionSeconds = 0
         }
         updated.updatedAt = Date()
         saveWatchProgress(updated)
@@ -7020,6 +7034,9 @@ private struct MediaDetailPage: View {
                         .buttonStyle(.bordered)
                         .tint(.white)
                     }
+                    if item.kind == "Movie" {
+                        watchStatusControl(for: nil, compact: false)
+                    }
                     Button { model.toggleSaved(item) } label: {
                         Label(model.savedIDs.contains(item.id) ? "In My List" : "Add to My List",
                               systemImage: model.savedIDs.contains(item.id) ? "checkmark" : "plus")
@@ -7326,6 +7343,12 @@ private struct MediaDetailPage: View {
     private func episodeRow(_ episode: MediaEpisode) -> some View {
         let playableSources = uniqueSources(episode.sources + episode.downloadSources)
         let offlineTitle = "\(item.title) · \(episode.title)"
+        let episodeIsWatched = model.isWatched(
+            mediaID: item.id,
+            episodeID: episode.id,
+            episodeLabel: episode.episodeLabel,
+            episodeTitle: episode.title
+        )
         let offlineURL = downloadManager.completedDownload(
             mediaItemID: item.id,
             episodeID: episode.id,
@@ -7360,6 +7383,11 @@ private struct MediaDetailPage: View {
                         if offlineURL != nil {
                             Label("Saved offline", systemImage: "checkmark.circle.fill")
                                 .font(.denbox(size: 10, weight: .medium))
+                                .foregroundStyle(Color.green.opacity(0.9))
+                        }
+                        if episodeIsWatched {
+                            Label("Watched", systemImage: "checkmark.circle.fill")
+                                .font(.denbox(size: 9, weight: .medium))
                                 .foregroundStyle(Color.green.opacity(0.9))
                         }
                     }
@@ -7412,6 +7440,7 @@ private struct MediaDetailPage: View {
                     }
                     .menuStyle(.borderlessButton)
                 }
+                watchStatusControl(for: episode, compact: true)
                 downloadControl(
                     sources: episode.downloadSources + episode.sources,
                     title: offlineTitle,
@@ -7420,6 +7449,31 @@ private struct MediaDetailPage: View {
                 )
             }
         }
+    }
+
+    @ViewBuilder
+    private func watchStatusControl(for episode: MediaEpisode?, compact: Bool) -> some View {
+        let watched = model.isWatched(
+            mediaID: item.id,
+            episodeID: episode?.id,
+            episodeLabel: episode?.episodeLabel,
+            episodeTitle: episode?.title
+        )
+        let title = watched ? "Mark as unwatched" : "Mark as watched"
+        let localizedTitle = DenboxLanguage.localizedMessage(title)
+        Button {
+            model.setWatched(item: item, episode: episode, details: details, watched: !watched)
+        } label: {
+            if compact {
+                Image(systemName: watched ? "checkmark.circle.fill" : "checkmark.circle")
+                    .frame(width: 22, height: 22)
+            } else {
+                Label(localizedTitle, systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
+            }
+        }
+        .buttonStyle(.bordered)
+        .help(localizedTitle)
+        .accessibilityLabel(Text(localizedTitle))
     }
 
     private var selectedSeason: MediaSeason? {

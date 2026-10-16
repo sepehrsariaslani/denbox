@@ -208,6 +208,8 @@
 "Movies and episodes you start will stay here so you can continue watching later." = "فیلم‌ها و قسمت‌هایی که پخششان را شروع می‌کنی اینجا می‌مانند تا بعداً ادامه‌شان بدهی.";
 "Resume" = "ادامه";
 "Mark as watched" = "دیده شد";
+"Mark as unwatched" = "علامت‌گذاری به‌عنوان دیده‌نشده";
+"Watched" = "دیده‌شده";
 "Playback sessions for movies and episodes on this Mac will appear here." = "پخش فیلم یا قسمت روی همین Mac در سابقه ثبت می‌شود.";
 "Watched %@ of %@" = "%@ از %@";
 "Resume at %@" = "ادامه از %@";
