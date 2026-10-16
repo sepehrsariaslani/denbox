@@ -19,11 +19,11 @@ struct WatchProgress: Identifiable, Sendable {
     let artworkURL: URL?
     let imdbID: String?
     let genres: [String]
-    let positionSeconds: Double
-    let durationSeconds: Double?
-    let watchedSeconds: Double
-    let isWatched: Bool
-    let updatedAt: Date
+    var positionSeconds: Double
+    var durationSeconds: Double?
+    var watchedSeconds: Double
+    var isWatched: Bool
+    var updatedAt: Date
 
     var id: String { Self.key(mediaID: mediaID, episodeID: episodeID) }
     var displayTitle: String { episodeTitle ?? mediaTitle }

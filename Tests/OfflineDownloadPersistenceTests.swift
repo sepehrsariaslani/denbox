@@ -35,6 +35,15 @@ struct OfflineDownloadPersistenceTests {
         }
         try require(offlineURL.standardizedFileURL == mediaURL.standardizedFileURL,
                     "the offline episode points to a different file")
+        guard let refreshedOfflineURL = reopenedManager.completedDownload(
+            mediaItemID: "series-1",
+            episodeID: "episode-id-refreshed-by-api",
+            title: "Series · Episode 1"
+        ) else {
+            throw TestFailure(message: "the offline episode stopped matching when the API refreshed its episode ID")
+        }
+        try require(refreshedOfflineURL.standardizedFileURL == mediaURL.standardizedFileURL,
+                    "the refreshed episode ID matched a different offline file")
 
         try FileManager.default.removeItem(at: mediaURL)
         try require(reopenedManager.completedDownload(
@@ -43,7 +52,7 @@ struct OfflineDownloadPersistenceTests {
             title: "Series · Episode 1"
         ) == nil, "a missing download was still advertised as available offline")
 
-        print("PASS offline episode: linked download survives database reopen and missing files are ignored")
+        print("PASS offline episode: database reopen, refreshed episode IDs, and missing-file detection")
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

@@ -9,7 +9,11 @@ struct DenboxLiveAPITests {
             return
         }
 
-        let model = LibraryModel()
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DenboxLiveCatalogTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testDirectory) }
+        let model = LibraryModel(databaseURL: testDirectory.appendingPathComponent("library.sqlite"))
         try await Task.sleep(nanoseconds: 250_000_000)
         await model.refreshCatalog()
         for _ in 0..<300 where model.isConnecting
@@ -41,6 +45,11 @@ struct DenboxLiveAPITests {
 
         let movieLinkCount = max(movieDetails.sources.count, movieDetails.downloadSources.count)
         let episodeLinkCount = max(episode.sources.count, episode.downloadSources.count)
+        if CommandLine.arguments.contains("--catalog-only") {
+            print("PASS live catalog: \(initialMovieCount) movies, \(initialSeriesCount) series")
+            print("PASS live details: movie links=\(movieLinkCount), episode links=\(episodeLinkCount)")
+            return
+        }
         let directSource = movieDetails.downloadSources.first ?? movieDetails.sources[0]
         let firstRange = try await probeRange(directSource, range: "bytes=0-0")
         let secondRange = try await probeRange(directSource, range: "bytes=1-1")
@@ -136,7 +145,14 @@ struct DenboxLiveAPITests {
         var request = URLRequest(url: source.url)
         request.setValue(range, forHTTPHeaderField: "Range")
         for (name, value) in source.headers { request.setValue(value, forHTTPHeaderField: name) }
-        let (bytes, response) = try await session.bytes(for: request)
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: request)
+        } catch {
+            let failure = error as NSError
+            throw TestFailure(message: "range request failed (\(failure.domain)/\(failure.code))")
+        }
         guard let http = response as? HTTPURLResponse else {
             throw TestFailure(message: "range probe returned a non-HTTP response")
         }

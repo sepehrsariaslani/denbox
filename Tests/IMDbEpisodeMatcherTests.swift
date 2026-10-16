@@ -6,6 +6,7 @@ struct IMDbEpisodeMatcherTests {
         try exactTitleAndDuplicateNumbering()
         try fuzzyTitleAndNumberedFallback()
         try ambiguousFuzzyMatchIsRejected()
+        try imdbTitleNormalization()
         try largeEpisodeListDoesNotRegress()
         print("PASS IMDb episode matcher: exact, fuzzy, fallback, ambiguity, and large lists")
     }
@@ -51,6 +52,22 @@ struct IMDbEpisodeMatcherTests {
         )
         try require(result.first?.episodes.first?.episodeLabel == "S08E99", "ambiguous fuzzy title was assigned to an IMDb episode")
         try require(result.first?.episodes.first?.imdbVotes == nil, "ambiguous fuzzy title received an arbitrary rating")
+    }
+
+    private static func imdbTitleNormalization() throws {
+        try require(IMDbTitleNormalizer.normalize("The Matrix: Reloaded (2003)") == "thematrixreloaded2003",
+                    "ASCII normalization changed the title key")
+        try require(IMDbTitleNormalizer.normalize("Léon: The Professional") == "leontheprofessional",
+                    "Unicode normalization did not fold accents")
+        try require(IMDbTitleNormalizer.normalize("  São-Paulo 2049  ") == "saopaulo2049",
+                    "Unicode normalization did not keep letters and digits")
+
+        let started = Date()
+        for _ in 0..<100_000 {
+            _ = IMDbTitleNormalizer.normalize("The Matrix: Reloaded (2003)")
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        print(String(format: "IMDb title normalization benchmark: %.3fs for 100,000 ASCII titles", elapsed))
     }
 
     private static func largeEpisodeListDoesNotRegress() throws {

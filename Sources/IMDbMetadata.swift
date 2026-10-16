@@ -91,6 +91,8 @@ final class IMDbMetadataStore: @unchecked Sendable {
     private let fileManager = FileManager.default
     private let searchIndexLock = NSLock()
     private var hasSearchIndexes = false
+    private let seriesGenreIndexLock = NSLock()
+    private var hasSeriesGenreIndex = false
     private let endpoints: [(String, URL)] = [
         ("titles", URL(string: "https://datasets.imdbws.com/title.basics.tsv.gz")!),
         ("episodes", URL(string: "https://datasets.imdbws.com/title.episode.tsv.gz")!),
@@ -100,12 +102,22 @@ final class IMDbMetadataStore: @unchecked Sendable {
         ("crew", URL(string: "https://datasets.imdbws.com/title.crew.tsv.gz")!)
     ]
 
-    private init() {
+    private init(databaseURLOverride: URL? = nil) {
+        if let databaseURLOverride {
+            databaseURL = databaseURLOverride
+            return
+        }
         let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let directory = support.appendingPathComponent("Denbox", isDirectory: true)
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         databaseURL = directory.appendingPathComponent("imdb-metadata.sqlite")
     }
+
+#if DENBOX_TESTING
+    static func testingStore(databaseURL: URL) -> IMDbMetadataStore {
+        IMDbMetadataStore(databaseURLOverride: databaseURL)
+    }
+#endif
 
     var isAvailable: Bool { fileManager.fileExists(atPath: databaseURL.path) }
 
@@ -267,6 +279,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
 
     func similarSeries(for seriesID: String) -> [IMDbTitleMetadata] {
         _ = ensureSearchIndexes()
+        guard ensureSeriesGenreIndex() else { return [] }
         guard let db = openReadOnly() else { return [] }
         defer { sqlite3_close(db) }
         var statement: OpaquePointer?
@@ -285,6 +298,131 @@ final class IMDbMetadataStore: @unchecked Sendable {
             votes: integer(statement, 5)
         )
         return similarRows(db: db, to: series)
+    }
+
+    func genreFacets() -> [IMDbGenreFacet] {
+        guard let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        let sql = "SELECT genres FROM titles WHERE title_type IN ('movie','tvSeries','tvMiniSeries') AND genres IS NOT NULL AND genres<>''"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var counts: [String: Int] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let genres = Set((text(statement, 0) ?? "").split(separator: ",").map(String.init))
+            for genre in genres where !genre.isEmpty { counts[genre, default: 0] += 1 }
+        }
+        return counts.map { IMDbGenreFacet(name: $0.key, titleCount: $0.value) }
+            .sorted { lhs, rhs in
+                if lhs.titleCount != rhs.titleCount { return lhs.titleCount > rhs.titleCount }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
+    func discoveryCandidates(limit: Int = 30_000) -> [IMDbTitleMetadata] {
+        guard let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        let bounded = max(1, min(limit, 50_000))
+        let sql = """
+        SELECT tconst,primary_title,start_year,genres,rating,votes,title_type
+        FROM titles
+        WHERE title_type IN ('movie','tvSeries','tvMiniSeries')
+          AND rating IS NOT NULL AND votes >= 50
+        ORDER BY rating DESC,votes DESC
+        LIMIT \(bounded)
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var result: [IMDbTitleMetadata] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = text(statement, 0), let title = text(statement, 1), let type = text(statement, 6) else { continue }
+            result.append(IMDbTitleMetadata(
+                tconst: id,
+                title: title,
+                year: integer(statement, 2),
+                genres: (text(statement, 3) ?? "").split(separator: ",").map(String.init),
+                rating: double(statement, 4),
+                votes: integer(statement, 5),
+                kind: type == "movie" ? "Movie" : "Series"
+            ))
+        }
+        return result
+    }
+
+    func matchTitle(title: String, year: String?, kind: String) -> IMDbTitleMetadata? {
+        let normalized = imdbNormalize(title)
+        guard !normalized.isEmpty, let db = openReadOnly() else { return nil }
+        defer { sqlite3_close(db) }
+        let predicate = kind == "Movie" ? "title_type='movie'" : "title_type IN ('tvSeries','tvMiniSeries')"
+        let columns = "tconst,primary_title,start_year,genres,rating,votes,normalized_primary,normalized_original,title_type"
+        let exactSQL = "SELECT \(columns) FROM titles WHERE \(predicate) AND (normalized_primary=? OR normalized_original=?)"
+        var exact = queryTitleRows(db: db, sql: exactSQL, normalized: normalized, year: year.flatMap(Int.init))
+        if exact.isEmpty, let yearValue = Int(year ?? "") {
+            let fuzzySQL = "SELECT \(columns) FROM titles WHERE \(predicate) AND start_year BETWEEN ? AND ? AND rating IS NOT NULL ORDER BY votes DESC LIMIT 4000"
+            exact = queryTitleRows(db: db, sql: fuzzySQL, normalized: normalized, year: yearValue)
+        }
+        guard !exact.isEmpty else { return nil }
+        let ranked = exact.sorted { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            if let yearValue = Int(year ?? "") {
+                let leftDistance = lhs.title.year.map { abs($0 - yearValue) } ?? Int.max
+                let rightDistance = rhs.title.year.map { abs($0 - yearValue) } ?? Int.max
+                if leftDistance != rightDistance { return leftDistance < rightDistance }
+            }
+            return (lhs.title.votes ?? 0) > (rhs.title.votes ?? 0)
+        }
+        let exactMatches = ranked.filter { $0.primary == normalized || $0.original == normalized }
+        if !exactMatches.isEmpty { return exactMatches.first?.title }
+        guard ranked[0].score >= 0.92 else { return nil }
+        if ranked.count > 1, ranked[0].score - ranked[1].score < 0.035 { return nil }
+        if let yearValue = Int(year ?? ""), let matchedYear = ranked[0].title.year, abs(yearValue - matchedYear) > 2 { return nil }
+        return ranked[0].title
+    }
+
+    func catalogMetadata(for items: [MediaItem]) -> [String: IMDbTitleMetadata] {
+        guard let db = openReadOnly() else { return [:] }
+        defer { sqlite3_close(db) }
+        var result: [String: IMDbTitleMetadata] = [:]
+        for item in items where item.imdbID == nil || item.genres.isEmpty {
+            let normalized = imdbNormalize(item.title)
+            guard !normalized.isEmpty else { continue }
+            let predicate = item.kind == "Movie" ? "title_type='movie'" : "title_type IN ('tvSeries','tvMiniSeries')"
+            let sql = "SELECT tconst,primary_title,start_year,genres,rating,votes,normalized_primary,normalized_original,title_type FROM titles WHERE \(predicate) AND (normalized_primary=? OR normalized_original=?)"
+            let candidates = queryTitleRows(db: db, sql: sql, normalized: normalized, year: Int(item.year))
+                .filter { $0.primary == normalized || $0.original == normalized }
+            let sorted = candidates.sorted { lhs, rhs in
+                let year = Int(item.year)
+                let leftDistance = year.flatMap { value in lhs.title.year.map { abs($0 - value) } } ?? Int.max
+                let rightDistance = year.flatMap { value in rhs.title.year.map { abs($0 - value) } } ?? Int.max
+                if leftDistance != rightDistance { return leftDistance < rightDistance }
+                return (lhs.title.votes ?? 0) > (rhs.title.votes ?? 0)
+            }
+            if let match = sorted.first?.title { result[item.id] = match }
+        }
+        return result
+    }
+
+    func principalCast(for tconst: String, limit: Int = 20) -> [String] {
+        guard hasPeopleData(), let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        let sql = """
+        SELECT p.primary_name
+        FROM title_principals c JOIN people p ON p.nconst=c.nconst
+        WHERE c.tconst=? AND c.category IN ('actor','actress')
+        ORDER BY c.ordering LIMIT ?
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        bind(tconst, to: statement, at: 1)
+        sqlite3_bind_int(statement, 2, Int32(max(1, min(limit, 50))))
+        var names: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let name = text(statement, 0), !name.isEmpty else { continue }
+            names.append(name)
+        }
+        return names
     }
 
     func chartLists() -> IMDbChartLists? {
@@ -359,6 +497,40 @@ final class IMDbMetadataStore: @unchecked Sendable {
         return result
     }
 
+    private func queryTitleRows(db: OpaquePointer, sql: String, normalized: String, year: Int?) -> [(title: IMDbTitleMetadata, primary: String, original: String, score: Double)] {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        if sql.contains("BETWEEN") {
+            guard let year else { return [] }
+            sqlite3_bind_int(statement, 1, Int32(year - 1))
+            sqlite3_bind_int(statement, 2, Int32(year + 1))
+        } else {
+            bind(normalized, to: statement, at: 1)
+            bind(normalized, to: statement, at: 2)
+        }
+        var result: [(IMDbTitleMetadata, String, String, Double)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = text(statement, 0), let name = text(statement, 1), let type = text(statement, 8) else { continue }
+            let primary = text(statement, 6) ?? ""
+            let original = text(statement, 7) ?? ""
+            let recordYear = integer(statement, 2)
+            let score = max(titleSimilarity(normalized, primary), titleSimilarity(normalized, original))
+            let yearPenalty = year.flatMap { target in recordYear.map { abs(target - $0) } } ?? 0
+            let metadata = IMDbTitleMetadata(
+                tconst: id,
+                title: name,
+                year: recordYear,
+                genres: (text(statement, 3) ?? "").split(separator: ",").map(String.init),
+                rating: double(statement, 4),
+                votes: integer(statement, 5),
+                kind: type == "movie" ? "Movie" : "Series"
+            )
+            result.append((metadata, primary, original, score - Double(yearPenalty) * 0.025))
+        }
+        return result
+    }
+
     private func openReadOnly() -> OpaquePointer? {
         guard isAvailable else { return nil }
         var db: OpaquePointer?
@@ -394,6 +566,75 @@ final class IMDbMetadataStore: @unchecked Sendable {
         sqlite3_close(db)
         hasSearchIndexes = result == SQLITE_OK
         return hasSearchIndexes
+    }
+
+    private func ensureSeriesGenreIndex() -> Bool {
+        seriesGenreIndexLock.lock()
+        defer { seriesGenreIndexLock.unlock() }
+        if hasSeriesGenreIndex { return true }
+        guard isAvailable else { return false }
+
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db else {
+            if let db { sqlite3_close(db) }
+            return false
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 20_000)
+
+        guard sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS series_genres(genre TEXT NOT NULL,tconst TEXT NOT NULL,PRIMARY KEY(genre,tconst)) WITHOUT ROWID;", nil, nil, nil) == SQLITE_OK else {
+            return false
+        }
+        if metadataValue("series_genres_ready", db: db) == "1" {
+            hasSeriesGenreIndex = true
+            return true
+        }
+
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE; DELETE FROM series_genres;", nil, nil, nil) == SQLITE_OK else { return false }
+        var committed = false
+        defer { if !committed { _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) } }
+
+        var select: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT tconst,genres FROM titles WHERE title_type IN ('tvSeries','tvMiniSeries') AND genres IS NOT NULL AND genres<>''", -1, &select, nil) == SQLITE_OK,
+              let select else { return false }
+        defer { sqlite3_finalize(select) }
+        var insert: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO series_genres(genre,tconst) VALUES(?,?)", -1, &insert, nil) == SQLITE_OK,
+              let insert else { return false }
+        defer { sqlite3_finalize(insert) }
+
+        while true {
+            let step = sqlite3_step(select)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else { return false }
+            guard let id = text(select, 0), let rawGenres = text(select, 1) else { continue }
+            for rawGenre in rawGenres.split(separator: ",") {
+                let genre = String(rawGenre).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !genre.isEmpty else { continue }
+                sqlite3_reset(insert)
+                sqlite3_clear_bindings(insert)
+                bind(genre, to: insert, at: 1)
+                bind(id, to: insert, at: 2)
+                guard sqlite3_step(insert) == SQLITE_DONE else { return false }
+            }
+        }
+        guard sqlite3_exec(db, "INSERT OR REPLACE INTO metadata(key,value) VALUES('series_genres_ready','1'); COMMIT;", nil, nil, nil) == SQLITE_OK else {
+            return false
+        }
+        committed = true
+        hasSeriesGenreIndex = true
+        return true
+    }
+
+    private func metadataValue(_ key: String, db: OpaquePointer) -> String? {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM metadata WHERE key=?", -1, &statement, nil) == SQLITE_OK,
+              let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        bind(key, to: statement, at: 1)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return text(statement, 0)
     }
 
     private func matchSeries(db: OpaquePointer, title: String, year: Int?, indexesReady: Bool) -> IMDbTitleMetadata? {
@@ -459,17 +700,19 @@ final class IMDbMetadataStore: @unchecked Sendable {
     private func similarRows(db: OpaquePointer, to series: IMDbTitleMetadata) -> [IMDbTitleMetadata] {
         let genres = Array(series.genres.prefix(4))
         guard !genres.isEmpty else { return [] }
-        let clauses = Array(repeating: "(',' || genres || ',') LIKE ?", count: genres.count).joined(separator: " OR ")
+        let placeholders = Array(repeating: "?", count: genres.count).joined(separator: ",")
         let sql = """
-        SELECT tconst,primary_title,start_year,genres,rating,votes
-        FROM titles WHERE title_type IN ('tvSeries','tvMiniSeries') AND rating IS NOT NULL
-          AND tconst<>? AND (\(clauses))
+        SELECT t.tconst,t.primary_title,t.start_year,t.genres,t.rating,t.votes
+        FROM series_genres g JOIN titles t ON t.tconst=g.tconst
+        WHERE t.title_type IN ('tvSeries','tvMiniSeries') AND t.rating IS NOT NULL
+          AND t.tconst<>? AND g.genre IN (\(placeholders))
+        GROUP BY t.tconst
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
         defer { sqlite3_finalize(statement) }
         bind(series.tconst, to: statement, at: 1)
-        for (index, genre) in genres.enumerated() { bind("%,\(genre),%", to: statement, at: Int32(index + 2)) }
+        for (index, genre) in genres.enumerated() { bind(genre, to: statement, at: Int32(index + 2)) }
         var candidates: [(IMDbTitleMetadata, Double)] = []
         let sourceGenres = Set(series.genres)
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -503,6 +746,9 @@ final class IMDbMetadataStore: @unchecked Sendable {
           rating REAL,votes INTEGER,parent_tconst TEXT,season_number INTEGER,episode_number INTEGER
         );
         CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE series_genres(
+          genre TEXT NOT NULL,tconst TEXT NOT NULL,PRIMARY KEY(genre,tconst)
+        ) WITHOUT ROWID;
         CREATE TABLE people(
           nconst TEXT PRIMARY KEY,primary_name TEXT NOT NULL,birth_year INTEGER,death_year INTEGER,
           primary_profession TEXT NOT NULL,known_for_titles TEXT NOT NULL
@@ -525,6 +771,10 @@ final class IMDbMetadataStore: @unchecked Sendable {
             throw IMDbMetadataError.invalidDatabase
         }
         defer { sqlite3_finalize(insert) }
+        var insertSeriesGenre: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO series_genres(genre,tconst) VALUES(?,?)", -1, &insertSeriesGenre, nil) == SQLITE_OK,
+              let insertSeriesGenre else { throw IMDbMetadataError.invalidDatabase }
+        defer { sqlite3_finalize(insertSeriesGenre) }
         progress("Indexing IMDb series and episode titles…")
         try readGzipTSV(titles) { columns in
             guard columns.count > 8, let type = columns[1],
@@ -543,6 +793,17 @@ final class IMDbMetadataStore: @unchecked Sendable {
             if let year { sqlite3_bind_int(insert, 7, year) } else { sqlite3_bind_null(insert, 7) }
             bind(columns[8] ?? "", to: insert, at: 8)
             guard sqlite3_step(insert) == SQLITE_DONE else { throw IMDbMetadataError.invalidDatabase }
+            if type == "tvSeries" || type == "tvMiniSeries" {
+                for rawGenre in (columns[8] ?? "").split(separator: ",") {
+                    let genre = String(rawGenre).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !genre.isEmpty else { continue }
+                    sqlite3_reset(insertSeriesGenre)
+                    sqlite3_clear_bindings(insertSeriesGenre)
+                    bind(genre, to: insertSeriesGenre, at: 1)
+                    bind(id, to: insertSeriesGenre, at: 2)
+                    guard sqlite3_step(insertSeriesGenre) == SQLITE_DONE else { throw IMDbMetadataError.invalidDatabase }
+                }
+            }
         }
 
         progress("Linking IMDb seasons and episode numbers…")
@@ -658,6 +919,7 @@ final class IMDbMetadataStore: @unchecked Sendable {
         CREATE INDEX idx_principals_person ON title_principals(nconst,tconst);
         CREATE INDEX idx_crew_person ON title_crew(nconst,tconst);
         INSERT INTO metadata(key,value) VALUES('updated_at','\(Date().timeIntervalSince1970)');
+        INSERT INTO metadata(key,value) VALUES('series_genres_ready','1');
         \(names != nil && principals != nil ? "INSERT INTO metadata(key,value) VALUES('people_ready','1');" : "")
         COMMIT;
         """, db: db)
@@ -671,6 +933,12 @@ final class IMDbMetadataStore: @unchecked Sendable {
         do {
             try fileManager.moveItem(at: source, to: databaseURL)
             try? fileManager.removeItem(at: backup)
+            searchIndexLock.lock()
+            hasSearchIndexes = false
+            searchIndexLock.unlock()
+            seriesGenreIndexLock.lock()
+            hasSeriesGenreIndex = false
+            seriesGenreIndexLock.unlock()
         } catch {
             if hadPrevious { try? fileManager.moveItem(at: backup, to: databaseURL) }
             throw error
@@ -779,10 +1047,36 @@ final class IMDbMetadataStore: @unchecked Sendable {
 
 private let imdbSQLiteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+enum IMDbTitleNormalizer {
+    private static let locale = Locale(identifier: "en_US_POSIX")
+    private static let alphanumeric = CharacterSet.alphanumerics
+
+    static func normalize(_ value: String) -> String {
+        if value.unicodeScalars.allSatisfy(\.isASCII) {
+            var bytes: [UInt8] = []
+            bytes.reserveCapacity(value.utf8.count)
+            for byte in value.utf8 {
+                switch byte {
+                case 48...57, 97...122: bytes.append(byte)
+                case 65...90: bytes.append(byte + 32)
+                default: break
+                }
+            }
+            return String(decoding: bytes, as: UTF8.self)
+        }
+
+        let folded = value.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: locale)
+        var normalized = String.UnicodeScalarView()
+        normalized.reserveCapacity(folded.unicodeScalars.count)
+        for scalar in folded.unicodeScalars where alphanumeric.contains(scalar) {
+            normalized.append(scalar)
+        }
+        return String(normalized)
+    }
+}
+
 private func imdbNormalize(_ value: String) -> String {
-    value.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
-        .unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
-        .map(String.init).joined()
+    IMDbTitleNormalizer.normalize(value)
 }
 
 private func titleSimilarity(_ lhs: String, _ rhs: String) -> Double {

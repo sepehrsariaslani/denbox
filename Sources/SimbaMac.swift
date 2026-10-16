@@ -27,6 +27,11 @@ struct DenboxApp: App {
 
 enum LibrarySection: String, CaseIterable, Identifiable {
     case home = "Home"
+    case forYou = "For You"
+    case genres = "Genres"
+    case continueWatching = "Continue Watching"
+    case watchHistory = "Watch History"
+    case viewingStats = "Viewing Stats"
     case movies = "Movies"
     case shows = "TV Shows"
     case imdbCharts = "IMDb Charts"
@@ -40,6 +45,11 @@ enum LibrarySection: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .home: "house"
+        case .forYou: "sparkles.tv"
+        case .genres: "square.grid.2x2"
+        case .continueWatching: "play.rectangle"
+        case .watchHistory: "clock.arrow.circlepath"
+        case .viewingStats: "chart.bar.fill"
         case .movies: "film"
         case .shows: "tv"
         case .imdbCharts: "chart.bar.xaxis"
@@ -64,6 +74,10 @@ struct MediaItem: Identifiable, Hashable, Sendable {
     let artworkURL: URL?
     let isRemote: Bool
     let matchingTitles: [String]
+    let imdbID: String?
+    let genres: [String]
+    let imdbRating: String?
+    let imdbVotes: Int?
 
     init(
         id: String,
@@ -77,7 +91,11 @@ struct MediaItem: Identifiable, Hashable, Sendable {
         palette: Int,
         artworkURL: URL? = nil,
         isRemote: Bool = false,
-        matchingTitles: [String] = []
+        matchingTitles: [String] = [],
+        imdbID: String? = nil,
+        genres: [String] = [],
+        imdbRating: String? = nil,
+        imdbVotes: Int? = nil
     ) {
         self.id = id
         self.apiID = apiID
@@ -91,6 +109,10 @@ struct MediaItem: Identifiable, Hashable, Sendable {
         self.artworkURL = artworkURL
         self.isRemote = isRemote
         self.matchingTitles = matchingTitles
+        self.imdbID = imdbID
+        self.genres = genres
+        self.imdbRating = imdbRating
+        self.imdbVotes = imdbVotes
     }
 }
 
@@ -113,6 +135,35 @@ struct MediaEpisode: Identifiable, Sendable {
     let imdbRating: String?
     let imdbVotes: Int?
     let matchingTitles: [String]
+    let imdbID: String?
+
+    init(
+        id: String,
+        title: String,
+        episodeLabel: String,
+        synopsis: String,
+        duration: String?,
+        artworkURL: URL?,
+        sources: [MediaStreamSource],
+        downloadSources: [MediaStreamSource],
+        imdbRating: String?,
+        imdbVotes: Int?,
+        matchingTitles: [String],
+        imdbID: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.episodeLabel = episodeLabel
+        self.synopsis = synopsis
+        self.duration = duration
+        self.artworkURL = artworkURL
+        self.sources = sources
+        self.downloadSources = downloadSources
+        self.imdbRating = imdbRating
+        self.imdbVotes = imdbVotes
+        self.matchingTitles = matchingTitles
+        self.imdbID = imdbID
+    }
 }
 
 struct MediaSeason: Identifiable, Sendable {
@@ -142,6 +193,29 @@ struct MediaDetails: Sendable {
         !sources.isEmpty || !downloadSources.isEmpty || !seasons.isEmpty
             || description?.isEmpty == false || year?.isEmpty == false
             || rating?.isEmpty == false || !genres.isEmpty || !cast.isEmpty
+    }
+}
+
+extension MediaItem {
+    func applyingIMDb(_ metadata: IMDbTitleMetadata) -> MediaItem {
+        MediaItem(
+            id: id,
+            apiID: apiID,
+            title: title,
+            subtitle: subtitle,
+            synopsis: synopsis,
+            year: year,
+            kind: kind,
+            symbol: symbol,
+            palette: palette,
+            artworkURL: artworkURL,
+            isRemote: isRemote,
+            matchingTitles: matchingTitles,
+            imdbID: metadata.tconst,
+            genres: metadata.genres,
+            imdbRating: metadata.rating.map { String(format: "%.1f", $0) },
+            imdbVotes: metadata.votes
+        )
     }
 }
 
@@ -317,7 +391,8 @@ enum IMDbEpisodeMatcher {
                     downloadSources: episode.downloadSources,
                     imdbRating: matching?.rating.map { String(format: "%.1f", $0) },
                     imdbVotes: matching?.votes,
-                    matchingTitles: episode.matchingTitles
+                    matchingTitles: episode.matchingTitles,
+                    imdbID: matching?.tconst
                 )
                 grouped[actualSeason, default: []].append((actualNumber, updated))
             }
@@ -416,30 +491,30 @@ enum IMDbEpisodeMatcher {
 
 enum IMDbMediaEnricher {
     static func enrich(_ details: MediaDetails, for item: MediaItem) -> MediaDetails {
-        guard item.kind == "Series",
-              let matched = IMDbMetadataStore.shared.enrichment(
-                title: item.title,
-                year: details.year ?? item.year,
-                includeSimilar: false
-              ) else {
+        let store = IMDbMetadataStore.shared
+        guard let matched = store.matchTitle(title: item.title, year: details.year ?? item.year, kind: item.kind) else {
             return details
         }
-        let seasons = IMDbEpisodeMatcher.remap(details.seasons, using: matched.episodes)
+        let cast = store.principalCast(for: matched.tconst)
+        let seriesEnrichment = item.kind == "Series"
+            ? store.enrichment(title: item.title, year: details.year ?? item.year, includeSimilar: false)
+            : nil
+        let seasons = seriesEnrichment.map { IMDbEpisodeMatcher.remap(details.seasons, using: $0.episodes) } ?? details.seasons
         return MediaDetails(
             description: details.description,
-            year: matched.series.year.map(String.init) ?? details.year,
+            year: matched.year.map(String.init) ?? details.year,
             rating: details.rating,
             runtime: details.runtime,
-            genres: matched.series.genres.isEmpty ? details.genres : matched.series.genres,
+            genres: matched.genres.isEmpty ? details.genres : matched.genres,
             country: details.country,
             director: details.director,
-            cast: details.cast,
+            cast: cast.isEmpty ? details.cast : cast,
             sources: details.sources,
             downloadSources: details.downloadSources,
             seasons: seasons,
-            imdbID: matched.series.tconst,
-            imdbRating: matched.series.rating.map { String(format: "%.1f", $0) },
-            imdbVotes: matched.series.votes,
+            imdbID: matched.tconst,
+            imdbRating: matched.rating.map { String(format: "%.1f", $0) } ?? details.imdbRating,
+            imdbVotes: matched.votes ?? details.imdbVotes,
             similarSeries: []
         )
     }
@@ -456,6 +531,7 @@ final class LibraryModel: ObservableObject {
     @Published var playerHeaders: [String: String] = [:]
     @Published var showingSettings = false
     @Published var catalogName = "Local library"
+    @Published var selectedGenreFilters: Set<String> = []
     @Published private(set) var connectionStatus = "Loading local database…"
     @Published private(set) var isConnecting = false
     @Published private(set) var isLoadingMore = false
@@ -469,6 +545,14 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var imdbChartLists: IMDbChartLists?
     @Published private(set) var isLoadingIMDbCharts = false
     @Published private(set) var imdbPeopleAvailable = false
+    @Published private(set) var genreFacets: [IMDbGenreFacet] = []
+    @Published private(set) var preferredGenres: Set<String> = []
+    @Published private(set) var recommendations: [IMDbTitleMetadata] = []
+    @Published private(set) var isLoadingRecommendations = false
+    @Published private(set) var continueWatchingItems: [WatchProgress] = []
+    @Published private(set) var watchHistory: [WatchHistoryEntry] = []
+    @Published private(set) var viewingStats = ViewingStats()
+    @Published private(set) var viewingUpdateMessage: String?
     @Published private(set) var resolvingSimilarTitleID: String?
     @Published private(set) var similarTitleSearchMessage: String?
     @Published private(set) var detailsRefreshRevision = 0
@@ -488,20 +572,26 @@ final class LibraryModel: ObservableObject {
         episodeID: String?,
         episodeLabel: String?,
         episodeTitle: String?,
-        sourceTitle: String?
+        sourceTitle: String?,
+        details: MediaDetails?
     )?
+    private var activeWatchSessionID: String?
+    private var activeWatchProgress: WatchProgress?
+    private var activeWatchPlayerKind = "AVPlayer"
     private var nextMoviePage = 0
     private var nextSeriesPage = 0
 
-    init(loadRemoteCatalog: Bool = true, refreshStaleDetailsInBackground: Bool = true) {
+    init(loadRemoteCatalog: Bool = true, refreshStaleDetailsInBackground: Bool = true, databaseURL: URL? = nil) {
         self.refreshStaleDetailsInBackground = refreshStaleDetailsInBackground
-        let database = MediaDatabase()
+        let database = MediaDatabase(databaseURL: databaseURL)
         self.database = database
         self.downloadManager = DownloadManager(database: database)
         if let updated = IMDbMetadataStore.shared.lastUpdated {
             imdbDatasetStatus = "IMDb dataset ready · updated \(updated.formatted(date: .abbreviated, time: .shortened))"
         }
         imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
+        selectedGenreFilters = database.loadGenrePreferences(category: "filter")
+        preferredGenres = database.loadGenrePreferences(category: "preferred")
         let cached = database.loadCatalog()
         if !cached.isEmpty {
             items = cached
@@ -511,6 +601,13 @@ final class LibraryModel: ObservableObject {
             connectionStatus = "Local database · \(movies) movies · \(series) series"
         }
         savedIDs = database.loadSavedIDs()
+        refreshViewingData()
+        if IMDbMetadataStore.shared.isAvailable {
+            Task {
+                await enrichCatalogWithIMDb()
+                await refreshDiscoveryData()
+            }
+        }
         if loadRemoteCatalog {
             if SecretVault.read(account: "media-api-key") != nil,
                SecretVault.read(account: "catalog-feed-key") != nil {
@@ -530,16 +627,19 @@ final class LibraryModel: ObservableObject {
             base = items.filter { $0.kind == "Movie" }
         case .shows:
             base = items.filter { $0.kind == "Series" }
-        case .imdbCharts, .imdbPeople, .imdbFranchises:
+        case .imdbCharts, .imdbPeople, .imdbFranchises, .forYou, .genres, .continueWatching, .watchHistory, .viewingStats:
             base = []
         case .watchlist:
             base = items.filter { savedIDs.contains($0.id) }
         case .downloads:
             base = []
         }
+        let genreFiltered = selectedGenreFilters.isEmpty
+            ? base
+            : base.filter { !Set($0.genres).isDisjoint(with: selectedGenreFilters) }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return base }
-        let localMatches = base.filter { $0.title.localizedCaseInsensitiveContains(query) }
+        guard !query.isEmpty else { return genreFiltered }
+        let localMatches = genreFiltered.filter { $0.title.localizedCaseInsensitiveContains(query) }
         guard didFinishRemoteSearch else { return localMatches }
         var seen = Set(localMatches.map(\.id))
         return localMatches + remoteSearchResults.filter { seen.insert($0.id).inserted }
@@ -553,6 +653,70 @@ final class LibraryModel: ObservableObject {
             savedIDs.insert(item.id)
             database.setSaved(item.id, saved: true)
         }
+    }
+
+    func refreshViewingData() {
+        continueWatchingItems = database.loadWatchProgress(limit: 500)
+            .filter { !$0.isWatched && $0.positionSeconds >= 15 }
+        watchHistory = database.loadWatchHistory(limit: 500)
+        viewingStats = database.viewingStats()
+    }
+
+    func refreshDiscoveryData() async {
+        guard !isLoadingRecommendations else { return }
+        isLoadingRecommendations = true
+        defer { isLoadingRecommendations = false }
+        let store = IMDbMetadataStore.shared
+        let (facets, candidates) = await Task.detached(priority: .userInitiated) {
+            (store.genreFacets(), store.discoveryCandidates())
+        }.value
+        genreFacets = facets
+        refreshViewingData()
+        let watched = Set(database.loadWatchProgress(limit: 2_000, includeWatched: true)
+            .filter { $0.isWatched || $0.progress >= 0.9 }
+            .compactMap(\.imdbID))
+        recommendations = PersonalizedRecommendationRanker.rank(
+            candidates,
+            history: watchHistory,
+            preferredGenres: preferredGenres,
+            excluding: watched,
+            limit: 80
+        )
+    }
+
+    func enrichCatalogWithIMDb() async {
+        guard IMDbMetadataStore.shared.isAvailable, !items.isEmpty else { return }
+        let catalog = items
+        let metadata = await Task.detached(priority: .utility) {
+            IMDbMetadataStore.shared.catalogMetadata(for: catalog)
+        }.value
+        guard !metadata.isEmpty else { return }
+        var enriched: [MediaItem] = []
+        enriched.reserveCapacity(catalog.count)
+        for item in catalog {
+            guard let title = metadata[item.id] else { enriched.append(item); continue }
+            database.saveIMDbMetadata(title, for: item.id)
+            enriched.append(item.applyingIMDb(title))
+        }
+        items = enriched
+    }
+
+    func toggleGenreFilter(_ genre: String) {
+        if selectedGenreFilters.contains(genre) { selectedGenreFilters.remove(genre) }
+        else { selectedGenreFilters.insert(genre) }
+        database.saveGenrePreferences(selectedGenreFilters, category: "filter")
+    }
+
+    func clearGenreFilters() {
+        selectedGenreFilters.removeAll()
+        database.saveGenrePreferences([], category: "filter")
+    }
+
+    func togglePreferredGenre(_ genre: String) {
+        if preferredGenres.contains(genre) { preferredGenres.remove(genre) }
+        else { preferredGenres.insert(genre) }
+        database.saveGenrePreferences(preferredGenres, category: "preferred")
+        Task { await refreshDiscoveryData() }
     }
 
     func saveAPIKeys(mediaAPIKey: String, feedKey: String) {
@@ -630,7 +794,7 @@ final class LibraryModel: ObservableObject {
     }
 
     private func scheduleIMDbEnrichment(for item: MediaItem, details: MediaDetails) {
-        guard item.kind == "Series", IMDbMetadataStore.shared.isAvailable,
+        guard IMDbMetadataStore.shared.isAvailable,
               imdbEnrichmentsInFlight.insert(item.id).inserted else { return }
         Task { [weak self] in
             let enriched = await Task.detached(priority: .utility) {
@@ -641,7 +805,9 @@ final class LibraryModel: ObservableObject {
             guard enriched.imdbID != nil else { return }
             self.recentlyRefreshedDetails[item.id] = enriched
             self.detailsRefreshRevision += 1
-            self.scheduleIMDbRecommendations(for: item, seriesID: enriched.imdbID!)
+            if item.kind == "Series", let seriesID = enriched.imdbID {
+                self.scheduleIMDbRecommendations(for: item, seriesID: seriesID)
+            }
         }
     }
 
@@ -675,22 +841,264 @@ final class LibraryModel: ObservableObject {
         }
     }
 
-    func playRemoteSource(_ source: MediaStreamSource, title: String, item: MediaItem, episode: MediaEpisode?) {
+    func playRemoteSource(
+        _ source: MediaStreamSource,
+        title: String,
+        item: MediaItem,
+        episode: MediaEpisode?,
+        details: MediaDetails? = nil
+    ) {
+        if activeWatchSessionID != nil {
+            finishPlaybackSession(position: activeWatchProgress?.positionSeconds ?? 0,
+                                  duration: activeWatchProgress?.durationSeconds)
+        }
         activeRemotePlayback = (
             item: item,
             episodeID: episode?.id,
             episodeLabel: episode?.episodeLabel,
             episodeTitle: episode?.title,
-            sourceTitle: source.title
+            sourceTitle: source.title,
+            details: details
         )
         playerTitle = title
         playerHeaders = source.headers
         playerURL = source.url
     }
 
+    func startPlaybackSession(playerKind: String, localURL: URL? = nil) -> Double {
+        if activeWatchSessionID != nil {
+            finishPlaybackSession(position: activeWatchProgress?.positionSeconds ?? 0,
+                                  duration: activeWatchProgress?.durationSeconds)
+        }
+        activeWatchPlayerKind = playerKind
+        let progress: WatchProgress
+        if let active = activeRemotePlayback {
+            let stored = database.watchProgress(mediaID: active.item.id, episodeID: active.episodeID)
+            let episode = active.details?.seasons.flatMap(\.episodes).first(where: { $0.id == active.episodeID })
+                ?? active.details?.seasons.flatMap(\.episodes).first(where: { $0.episodeLabel == active.episodeLabel })
+            let duration = episode.flatMap { Self.durationSeconds($0.duration) }
+                ?? Self.durationSeconds(active.details?.runtime)
+                ?? stored?.durationSeconds
+            let resume = stored?.isWatched == true ? 0 : (stored?.positionSeconds ?? 0)
+            progress = WatchProgress(
+                mediaID: active.item.id,
+                episodeID: active.episodeID,
+                mediaTitle: active.item.title,
+                kind: active.item.kind,
+                episodeTitle: active.episodeTitle,
+                episodeLabel: active.episodeLabel,
+                year: active.details?.year ?? active.item.year,
+                artworkURL: episode?.artworkURL ?? active.item.artworkURL,
+                imdbID: episode?.imdbID ?? active.details?.imdbID ?? active.item.imdbID,
+                genres: active.details?.genres.isEmpty == false ? active.details!.genres : active.item.genres,
+                positionSeconds: resume,
+                durationSeconds: duration,
+                watchedSeconds: stored?.watchedSeconds ?? 0,
+                isWatched: false,
+                updatedAt: Date()
+            )
+        } else {
+            let url = localURL?.standardizedFileURL
+            let mediaID = url.map { "local:\($0.path)" } ?? "local:\(playerTitle)"
+            let stored = database.watchProgress(mediaID: mediaID, episodeID: nil)
+            progress = WatchProgress(
+                mediaID: mediaID,
+                episodeID: nil,
+                mediaTitle: playerTitle,
+                kind: "Movie",
+                episodeTitle: nil,
+                episodeLabel: nil,
+                year: "",
+                artworkURL: nil,
+                imdbID: nil,
+                genres: [],
+                positionSeconds: stored?.isWatched == true ? 0 : (stored?.positionSeconds ?? 0),
+                durationSeconds: stored?.durationSeconds,
+                watchedSeconds: stored?.watchedSeconds ?? 0,
+                isWatched: false,
+                updatedAt: Date()
+            )
+        }
+        activeWatchProgress = progress
+        activeWatchSessionID = database.beginWatchSession(progress: progress, playerKind: playerKind)
+        refreshViewingData()
+        return progress.positionSeconds
+    }
+
+    func recordPlaybackProgress(position: Double, duration: Double?, watchedDelta: Double) {
+        guard let sessionID = activeWatchSessionID, var progress = activeWatchProgress else { return }
+        guard position.isFinite else { return }
+        progress.positionSeconds = max(0, position)
+        if let duration, duration.isFinite, duration > 0 { progress.durationSeconds = duration }
+        progress.watchedSeconds += max(0, min(60, watchedDelta))
+        if let total = progress.durationSeconds, total > 0 {
+            if progress.positionSeconds / total >= 0.92 { progress.isWatched = true }
+            else if progress.positionSeconds / total < 0.9 { progress.isWatched = false }
+        }
+        progress.updatedAt = Date()
+        database.updateWatchSession(id: sessionID, progress: progress, watchedDelta: watchedDelta)
+        activeWatchProgress = progress
+        refreshViewingData()
+    }
+
+    func finishPlaybackSession(position: Double, duration: Double?) {
+        guard let sessionID = activeWatchSessionID, var progress = activeWatchProgress else { return }
+        if position.isFinite { progress.positionSeconds = max(0, position) }
+        if let duration, duration.isFinite, duration > 0 { progress.durationSeconds = duration }
+        if let total = progress.durationSeconds, total > 0, progress.positionSeconds / total >= 0.92 {
+            progress.isWatched = true
+        }
+        progress.updatedAt = Date()
+        database.updateWatchSession(id: sessionID, progress: progress, watchedDelta: 0, endedAt: Date())
+        activeWatchSessionID = nil
+        activeWatchProgress = nil
+        refreshViewingData()
+        Task { await refreshDiscoveryData() }
+    }
+
+    func setWatched(_ progress: WatchProgress, watched: Bool) {
+        database.setWatched(progress, watched: watched)
+        refreshViewingData()
+        Task { await refreshDiscoveryData() }
+    }
+
+    func watchProgress(mediaID: String, episodeID: String?) -> WatchProgress? {
+        database.watchProgress(mediaID: mediaID, episodeID: episodeID)
+    }
+
+    func isWatched(mediaID: String, episodeID: String?) -> Bool {
+        database.watchProgress(mediaID: mediaID, episodeID: episodeID)?.isWatched ?? false
+    }
+
+    func setWatched(item: MediaItem, episode: MediaEpisode?, details: MediaDetails?, watched: Bool) {
+        let old = database.watchProgress(mediaID: item.id, episodeID: episode?.id)
+        let progress = WatchProgress(
+            mediaID: item.id,
+            episodeID: episode?.id,
+            mediaTitle: item.title,
+            kind: item.kind,
+            episodeTitle: episode?.title,
+            episodeLabel: episode?.episodeLabel,
+            year: details?.year ?? item.year,
+            artworkURL: episode?.artworkURL ?? item.artworkURL,
+            imdbID: episode?.imdbID ?? details?.imdbID ?? item.imdbID,
+            genres: details?.genres.isEmpty == false ? details!.genres : item.genres,
+            positionSeconds: old?.positionSeconds ?? 0,
+            durationSeconds: old?.durationSeconds ?? Self.durationSeconds(episode?.duration ?? details?.runtime),
+            watchedSeconds: old?.watchedSeconds ?? 0,
+            isWatched: watched,
+            updatedAt: Date()
+        )
+        database.setWatched(progress, watched: watched)
+        refreshViewingData()
+        Task { await refreshDiscoveryData() }
+    }
+
+    func resume(_ progress: WatchProgress) async {
+        if progress.mediaID.hasPrefix("local:") {
+            let path = String(progress.mediaID.dropFirst("local:".count))
+            let url = URL(fileURLWithPath: path)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                viewingUpdateMessage = "فایل این تماشا دیگر روی این Mac پیدا نشد."
+                return
+            }
+            playLocalVideo(url, title: progress.displayTitle)
+            return
+        }
+        let item = items.first(where: { $0.id == progress.mediaID })
+            ?? database.loadCatalog().first(where: { $0.id == progress.mediaID })
+        guard let item else {
+            viewingUpdateMessage = "این عنوان در کاتالوگ ذخیره‌شده پیدا نشد."
+            return
+        }
+        let details = await loadDetails(for: item)
+        let episodes: [MediaEpisode] = details?.seasons.flatMap { $0.episodes } ?? []
+        var episode = progress.episodeID.flatMap { episodeID in episodes.first { $0.id == episodeID } }
+        if episode == nil, let episodeLabel = progress.episodeLabel {
+            episode = episodes.first { $0.episodeLabel == episodeLabel }
+        }
+        if episode == nil, let episodeTitle = progress.episodeTitle {
+            episode = episodes.first {
+                $0.title.localizedCaseInsensitiveCompare(episodeTitle) == .orderedSame
+            }
+        }
+        let title = episode.map { "\(item.title) · \($0.title)" } ?? item.title
+        if let offline = downloadManager.completedDownload(
+            mediaItemID: item.id,
+            episodeID: episode?.id ?? progress.episodeID,
+            title: title
+        ) {
+            playLocalVideo(offline, title: title, item: item, episode: episode, details: details)
+            return
+        }
+        let sources: [MediaStreamSource]
+        if let episode {
+            sources = episode.sources + episode.downloadSources
+        } else {
+            sources = (details?.sources ?? []) + (details?.downloadSources ?? [])
+        }
+        guard let source = sources.first else {
+            viewingUpdateMessage = "برای ادامهٔ تماشا لینک پخش فعالی پیدا نشد."
+            return
+        }
+        viewingUpdateMessage = nil
+        playRemoteSource(source, title: title, item: item, episode: episode, details: details)
+    }
+
+    func resume(_ entry: WatchHistoryEntry) async {
+        let saved = database.watchProgress(mediaID: entry.mediaID, episodeID: entry.episodeID)
+        let progress = saved ?? WatchProgress(
+            mediaID: entry.mediaID,
+            episodeID: entry.episodeID,
+            mediaTitle: entry.mediaTitle,
+            kind: entry.kind,
+            episodeTitle: entry.episodeTitle,
+            episodeLabel: entry.episodeLabel,
+            year: entry.year,
+            artworkURL: entry.artworkURL,
+            imdbID: entry.imdbID,
+            genres: entry.genres,
+            positionSeconds: entry.positionSeconds,
+            durationSeconds: entry.durationSeconds,
+            watchedSeconds: entry.watchedSeconds,
+            isWatched: false,
+            updatedAt: entry.startedAt
+        )
+        await resume(progress)
+    }
+
+    private static func durationSeconds(_ value: String?) -> Double? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.contains(":") {
+            let parts = trimmed.split(separator: ":").compactMap { Double($0) }
+            if parts.count == 2 { return parts[0] * 60 + parts[1] }
+            if parts.count == 3 { return parts[0] * 3600 + parts[1] * 60 + parts[2] }
+        }
+        let pattern = #"([0-9]+(?:\.[0-9]+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let ns = trimmed as NSString
+        let matches = expression.matches(in: trimmed, range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else {
+            return Double(trimmed).map { $0 < 1000 ? $0 * 60 : $0 }
+        }
+        var total = 0.0
+        for match in matches {
+            guard let numberRange = Range(match.range(at: 1), in: trimmed),
+                  let unitRange = Range(match.range(at: 2), in: trimmed),
+                  let number = Double(trimmed[numberRange]) else { continue }
+            let unit = String(trimmed[unitRange])
+            if unit.hasPrefix("h") { total += number * 3600 }
+            else if unit.hasPrefix("m") { total += number * 60 }
+            else { total += number }
+        }
+        return total > 0 ? total : nil
+    }
+
     func refreshActivePlaybackSource() async -> MediaStreamSource? {
         guard let active = activeRemotePlayback,
               let details = await loadDetails(for: active.item, forceRefresh: true) else { return nil }
+        activeRemotePlayback?.details = details
         recentlyRefreshedDetails[active.item.id] = details
         detailsRefreshRevision += 1
 
@@ -729,6 +1137,8 @@ final class LibraryModel: ObservableObject {
             imdbDatasetStatus = "IMDb dataset ready · updated \(timestamp)"
             imdbChartLists = nil
             imdbPeopleAvailable = IMDbMetadataStore.shared.hasPeopleData()
+            await enrichCatalogWithIMDb()
+            await refreshDiscoveryData()
             if section == .imdbCharts { await loadIMDbCharts() }
         } catch {
             imdbDatasetStatus = error.localizedDescription
@@ -801,6 +1211,7 @@ final class LibraryModel: ObservableObject {
         }
         database.saveRemoteItems([resolved])
         items = database.loadCatalog()
+        await enrichCatalogWithIMDb()
         selectedItem = items.first(where: { $0.id == resolved.id }) ?? resolved
         similarTitleSearchMessage = nil
     }
@@ -935,35 +1346,47 @@ final class LibraryModel: ObservableObject {
             return
         }
 
-        do {
-            async let moviePayload = DirectMediaAPI.getJSON(url: movieURL)
-            async let seriesPayload = DirectMediaAPI.getJSON(url: seriesURL)
-            let (movieResponse, seriesResponse) = try await (moviePayload, seriesPayload)
-            let movieRows = DirectMediaAPI.rows(from: movieResponse) ?? []
-            let seriesRows = DirectMediaAPI.rows(from: seriesResponse) ?? []
-            let movies = Self.mediaItems(from: movieRows, fallbackKind: "Movie", offset: 0)
-            let series = Self.mediaItems(from: seriesRows, fallbackKind: "Series", offset: movies.count)
-            let remoteItems = movies + series
-            guard !remoteItems.isEmpty else {
-                connectionStatus = "The API returned an empty catalog."
-                return
-            }
-            database.saveRemoteItems(Self.uniqueItems(remoteItems))
-            items = database.loadCatalog()
-            catalogName = "Denbox API"
-            nextMoviePage = 1
-            nextSeriesPage = 1
-            hasMoreMovies = movieRows.count >= DirectMediaAPI.pageSize
-            hasMoreSeries = seriesRows.count >= DirectMediaAPI.pageSize
-            let movieCount = items.filter { $0.kind == "Movie" }.count
-            let seriesCount = items.filter { $0.kind == "Series" }.count
-            connectionStatus = "Loaded first page · \(movieCount) movies · \(seriesCount) series"
-            section = .home
-        } catch {
-            connectionStatus = "API unavailable. Showing the local database."
+        // Fetch each catalog independently. A temporary failure in one feed must not
+        // discard a successful response from the other feed or hide cached titles.
+        async let movieResult = fetchCatalogRows(from: movieURL)
+        async let seriesResult = fetchCatalogRows(from: seriesURL)
+        let (movieResponse, seriesResponse) = await (movieResult, seriesResult)
+        let movieRows = movieResponse.rows ?? []
+        let seriesRows = seriesResponse.rows ?? []
+        let movies = Self.mediaItems(from: movieRows, fallbackKind: "Movie", offset: 0)
+        let series = Self.mediaItems(from: seriesRows, fallbackKind: "Series", offset: 0)
+        let remoteItems = Self.uniqueItems(movies + series)
+        guard !remoteItems.isEmpty else {
             let cached = database.loadCatalog()
-            if !cached.isEmpty { items = cached }
+            if !cached.isEmpty {
+                items = cached
+                connectionStatus = "Live catalog unavailable. Showing \(cached.filter { $0.kind == "Movie" }.count) saved movies and \(cached.filter { $0.kind == "Series" }.count) saved series."
+            } else {
+                let failures = [movieResponse.error, seriesResponse.error].compactMap { $0 }
+                connectionStatus = failures.isEmpty
+                    ? "The live API returned no movie or series titles."
+                    : "Could not load the live catalog. Check the API settings and try Refresh."
+            }
+            return
         }
+
+        database.saveRemoteItems(remoteItems)
+        items = database.loadCatalog()
+        catalogName = "Denbox API"
+        nextMoviePage = 1
+        nextSeriesPage = 1
+        hasMoreMovies = movieRows.count >= DirectMediaAPI.pageSize
+        hasMoreSeries = seriesRows.count >= DirectMediaAPI.pageSize
+        let movieCount = items.filter { $0.kind == "Movie" }.count
+        let seriesCount = items.filter { $0.kind == "Series" }.count
+        if movieResponse.rows == nil || seriesResponse.rows == nil {
+            let failedKind = movieResponse.rows == nil ? "movies" : "series"
+            connectionStatus = "Live catalog loaded · \(movieCount) movies · \(seriesCount) series · \(failedKind) feed unavailable"
+        } else {
+            connectionStatus = "Live catalog · \(movieCount) movies · \(seriesCount) series"
+        }
+        section = .home
+        await enrichCatalogWithIMDb()
     }
 
     var canLoadMoreCatalog: Bool {
@@ -973,7 +1396,8 @@ final class LibraryModel: ObservableObject {
         case .home: hasMoreMovies || hasMoreSeries
         case .movies: hasMoreMovies
         case .shows: hasMoreSeries
-        case .watchlist, .downloads, .imdbCharts, .imdbPeople, .imdbFranchises: false
+        case .watchlist, .downloads, .imdbCharts, .imdbPeople, .imdbFranchises,
+             .forYou, .genres, .continueWatching, .watchHistory, .viewingStats: false
         }
     }
 
@@ -1027,6 +1451,7 @@ final class LibraryModel: ObservableObject {
         } else {
             connectionStatus = "Loaded \(added) more titles · \(items.filter { $0.kind == "Movie" }.count) movies · \(items.filter { $0.kind == "Series" }.count) series"
         }
+        if added > 0 { await enrichCatalogWithIMDb() }
     }
 
     private func appendCatalogPage(_ pageItems: [MediaItem], rawCount: Int, kind: String) -> Int {
@@ -1042,6 +1467,18 @@ final class LibraryModel: ObservableObject {
         return newItems.count
     }
 
+    private func fetchCatalogRows(from url: URL) async -> (rows: [[String: Any]]?, error: Error?) {
+        do {
+            let payload = try await DirectMediaAPI.getJSON(url: url, timeout: 35)
+            guard let rows = DirectMediaAPI.rows(from: payload) else {
+                return (nil, DirectMediaAPIError.invalidResponse)
+            }
+            return (rows, nil)
+        } catch {
+            return (nil, error)
+        }
+    }
+
     private static func uniqueItems(_ items: [MediaItem]) -> [MediaItem] {
         var seen = Set<String>()
         return items.filter { seen.insert($0.id).inserted }
@@ -1054,6 +1491,7 @@ final class LibraryModel: ObservableObject {
         guard !uniqueItems.isEmpty else { return false }
         database.saveRemoteItems(uniqueItems)
         items = database.loadCatalog()
+        if IMDbMetadataStore.shared.isAvailable { Task { await enrichCatalogWithIMDb() } }
         catalogName = "Denbox API"
         let movieCount = uniqueItems.filter { $0.kind == "Movie" }.count
         let seriesCount = uniqueItems.filter { $0.kind == "Series" }.count
@@ -1279,8 +1717,8 @@ final class LibraryModel: ObservableObject {
             for (episodeIndex, episodeValue) in episodeRows.enumerated() {
                 let episode = episodeValue as? [String: Any] ?? ["url": episodeValue]
                 let sources = streamSources(from: ["sources": episode])
-                guard !sources.isEmpty else { continue }
                 let downloadSources = streamSources(from: ["sources": episode], includeDownloadFields: true)
+                guard !sources.isEmpty || !downloadSources.isEmpty else { continue }
                 let number = integer(episode["episode_number"] ?? episode["number"] ?? episode["episode"])
                     ?? episodeIndex + 1
                 var matchingTitles: [String] = []
@@ -1406,8 +1844,23 @@ final class LibraryModel: ObservableObject {
         playLocalVideo(url, title: url.deletingPathExtension().lastPathComponent)
     }
 
-    func playLocalVideo(_ url: URL, title: String) {
-        activeRemotePlayback = nil
+    func playLocalVideo(_ url: URL, title: String, item: MediaItem? = nil, episode: MediaEpisode? = nil, details: MediaDetails? = nil) {
+        if activeWatchSessionID != nil {
+            finishPlaybackSession(position: activeWatchProgress?.positionSeconds ?? 0,
+                                  duration: activeWatchProgress?.durationSeconds)
+        }
+        if let item {
+            activeRemotePlayback = (
+                item: item,
+                episodeID: episode?.id,
+                episodeLabel: episode?.episodeLabel,
+                episodeTitle: episode?.title,
+                sourceTitle: nil,
+                details: details
+            )
+        } else {
+            activeRemotePlayback = nil
+        }
         playerTitle = title
         playerHeaders = [:]
         playerURL = url
@@ -1661,6 +2114,13 @@ final class MediaDatabase {
             source_url TEXT,
             cached_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS imdb_media_metadata (
+            media_id TEXT PRIMARY KEY,
+            imdb_id TEXT,
+            genres TEXT NOT NULL DEFAULT '[]',
+            rating TEXT,
+            votes INTEGER
+        );
         CREATE TABLE IF NOT EXISTS downloaded_media (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -1670,6 +2130,48 @@ final class MediaDatabase {
             created_at REAL NOT NULL,
             catalog_media_id TEXT,
             episode_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS watch_progress (
+            media_id TEXT NOT NULL,
+            episode_id TEXT NOT NULL DEFAULT '',
+            media_title TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            episode_title TEXT,
+            episode_label TEXT,
+            year TEXT NOT NULL DEFAULT '',
+            artwork_url TEXT,
+            imdb_id TEXT,
+            genres TEXT NOT NULL DEFAULT '[]',
+            position_seconds REAL NOT NULL DEFAULT 0,
+            duration_seconds REAL,
+            watched_seconds REAL NOT NULL DEFAULT 0,
+            is_watched INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(media_id, episode_id)
+        );
+        CREATE TABLE IF NOT EXISTS watch_sessions (
+            id TEXT PRIMARY KEY,
+            media_id TEXT NOT NULL,
+            episode_id TEXT NOT NULL DEFAULT '',
+            media_title TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            episode_title TEXT,
+            episode_label TEXT,
+            year TEXT NOT NULL DEFAULT '',
+            artwork_url TEXT,
+            imdb_id TEXT,
+            genres TEXT NOT NULL DEFAULT '[]',
+            started_at REAL NOT NULL,
+            position_seconds REAL NOT NULL DEFAULT 0,
+            duration_seconds REAL,
+            watched_seconds REAL NOT NULL DEFAULT 0,
+            player_kind TEXT NOT NULL,
+            ended_at REAL
+        );
+        CREATE TABLE IF NOT EXISTS genre_preferences (
+            category TEXT NOT NULL,
+            genre TEXT NOT NULL,
+            PRIMARY KEY(category, genre)
         );
         """)
         if !columnExists("segment_count", in: "downloaded_media") {
@@ -1690,12 +2192,18 @@ final class MediaDatabase {
     func loadCatalog() -> [MediaItem] {
         guard let handle else { return [] }
         var statement: OpaquePointer?
-        let sql = "SELECT id,api_id,title,subtitle,synopsis,year,kind,symbol,palette,artwork_url,source FROM media ORDER BY updated_at DESC,title COLLATE NOCASE"
+        let sql = """
+        SELECT m.id,m.api_id,m.title,m.subtitle,m.synopsis,m.year,m.kind,m.symbol,m.palette,m.artwork_url,m.source,
+               i.imdb_id,i.genres,i.rating,i.votes
+        FROM media m LEFT JOIN imdb_media_metadata i ON i.media_id=m.id
+        ORDER BY m.updated_at DESC,m.title COLLATE NOCASE
+        """
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
         defer { sqlite3_finalize(statement) }
         var result: [MediaItem] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             let source = columnText(statement, 10) ?? "api"
+            let storedVotes = sqlite3_column_type(statement, 14) == SQLITE_NULL ? nil : Int(sqlite3_column_int(statement, 14))
             result.append(MediaItem(
                 id: columnText(statement, 0) ?? UUID().uuidString,
                 apiID: columnText(statement, 1),
@@ -1707,7 +2215,11 @@ final class MediaDatabase {
                 symbol: columnText(statement, 7) ?? "film",
                 palette: Int(sqlite3_column_int(statement, 8)),
                 artworkURL: columnText(statement, 9).flatMap { URL(string: $0) },
-                isRemote: source == "api"
+                isRemote: source == "api",
+                imdbID: columnText(statement, 11),
+                genres: Self.decodeGenres(columnText(statement, 12)),
+                imdbRating: columnText(statement, 13),
+                imdbVotes: storedVotes
             ))
         }
         return result
@@ -1734,6 +2246,22 @@ final class MediaDatabase {
         bind(id, at: 1, in: statement)
         bind(json, at: 2, in: statement)
         sqlite3_bind_double(statement, 3, fetchedAt.timeIntervalSince1970)
+        sqlite3_step(statement)
+    }
+
+    func saveIMDbMetadata(_ metadata: IMDbTitleMetadata, for mediaID: String) {
+        guard let handle else { return }
+        let sql = "INSERT OR REPLACE INTO imdb_media_metadata(media_id,imdb_id,genres,rating,votes) VALUES(?,?,?,?,?)"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return }
+        defer { sqlite3_finalize(statement) }
+        bind(mediaID, at: 1, in: statement)
+        bind(metadata.tconst, at: 2, in: statement)
+        bind(Self.encodeGenres(metadata.genres), at: 3, in: statement)
+        if let rating = metadata.rating { bind(String(format: "%.1f", rating), at: 4, in: statement) }
+        else { sqlite3_bind_null(statement, 4) }
+        if let votes = metadata.votes { sqlite3_bind_int(statement, 5, Int32(votes)) }
+        else { sqlite3_bind_null(statement, 5) }
         sqlite3_step(statement)
     }
 
@@ -1923,6 +2451,272 @@ final class MediaDatabase {
     }
 }
 
+extension MediaDatabase {
+    func watchProgress(mediaID: String, episodeID: String?) -> WatchProgress? {
+        guard let handle else { return nil }
+        let sql = """
+        SELECT media_id,episode_id,media_title,kind,episode_title,episode_label,year,artwork_url,imdb_id,genres,
+               position_seconds,duration_seconds,watched_seconds,is_watched,updated_at
+        FROM watch_progress WHERE media_id=? AND episode_id=? LIMIT 1
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        bind(mediaID, at: 1, in: statement)
+        bind(episodeID ?? "", at: 2, in: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return Self.readWatchProgress(statement)
+    }
+
+    func loadWatchProgress(limit: Int = 500, includeWatched: Bool = false) -> [WatchProgress] {
+        guard let handle else { return [] }
+        var statement: OpaquePointer?
+        let predicate = includeWatched ? "" : "WHERE is_watched=0"
+        let sql = """
+        SELECT media_id,episode_id,media_title,kind,episode_title,episode_label,year,artwork_url,imdb_id,genres,
+               position_seconds,duration_seconds,watched_seconds,is_watched,updated_at
+        FROM watch_progress \(predicate)
+        ORDER BY updated_at DESC LIMIT ?
+        """
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(max(1, min(limit, 2_000))))
+        var result: [WatchProgress] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let row = Self.readWatchProgress(statement) { result.append(row) }
+        }
+        return result
+    }
+
+    @discardableResult
+    func beginWatchSession(progress: WatchProgress, playerKind: String) -> String? {
+        guard let handle else { return nil }
+        let id = UUID().uuidString
+        let sql = """
+        INSERT INTO watch_sessions(id,media_id,episode_id,media_title,kind,episode_title,episode_label,year,artwork_url,imdb_id,genres,
+                                   started_at,position_seconds,duration_seconds,watched_seconds,player_kind,ended_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,NULL)
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        bind(id, at: 1, in: statement)
+        Self.bind(progress, to: statement, startingAt: 2, using: self)
+        sqlite3_bind_double(statement, 12, Date().timeIntervalSince1970)
+        sqlite3_bind_double(statement, 13, progress.positionSeconds)
+        if let duration = progress.durationSeconds { sqlite3_bind_double(statement, 14, duration) }
+        else { sqlite3_bind_null(statement, 14) }
+        bind(playerKind, at: 15, in: statement)
+        guard sqlite3_step(statement) == SQLITE_DONE else { return nil }
+        saveWatchProgress(progress)
+        return id
+    }
+
+    func updateWatchSession(id: String, progress: WatchProgress, watchedDelta: Double, endedAt: Date? = nil) {
+        guard let handle else { return }
+        saveWatchProgress(progress)
+        let sql = endedAt == nil
+            ? "UPDATE watch_sessions SET position_seconds=?,duration_seconds=?,watched_seconds=watched_seconds+? WHERE id=?"
+            : "UPDATE watch_sessions SET position_seconds=?,duration_seconds=?,watched_seconds=watched_seconds+?,ended_at=? WHERE id=?"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, max(0, progress.positionSeconds))
+        if let duration = progress.durationSeconds, duration.isFinite { sqlite3_bind_double(statement, 2, max(0, duration)) }
+        else { sqlite3_bind_null(statement, 2) }
+        sqlite3_bind_double(statement, 3, max(0, min(60, watchedDelta)))
+        if let endedAt {
+            sqlite3_bind_double(statement, 4, endedAt.timeIntervalSince1970)
+            bind(id, at: 5, in: statement)
+        } else {
+            bind(id, at: 4, in: statement)
+        }
+        sqlite3_step(statement)
+    }
+
+    func setWatched(_ progress: WatchProgress, watched: Bool) {
+        var updated = progress
+        updated.isWatched = watched
+        if watched, let duration = updated.durationSeconds, duration.isFinite, duration > 0 {
+            updated.positionSeconds = duration
+        }
+        updated.updatedAt = Date()
+        saveWatchProgress(updated)
+    }
+
+    func loadWatchHistory(limit: Int = 500) -> [WatchHistoryEntry] {
+        guard let handle else { return [] }
+        var statement: OpaquePointer?
+        let sql = """
+        SELECT id,media_id,episode_id,media_title,kind,episode_title,episode_label,year,artwork_url,imdb_id,genres,
+               started_at,position_seconds,duration_seconds,watched_seconds,player_kind
+        FROM watch_sessions ORDER BY started_at DESC LIMIT ?
+        """
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(max(1, min(limit, 2_000))))
+        var result: [WatchHistoryEntry] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = columnText(statement, 0), let mediaID = columnText(statement, 1) else { continue }
+            result.append(WatchHistoryEntry(
+                id: id,
+                mediaID: mediaID,
+                episodeID: (columnText(statement, 2) ?? "").nilIfEmpty,
+                mediaTitle: columnText(statement, 3) ?? "Untitled",
+                kind: columnText(statement, 4) ?? "Movie",
+                episodeTitle: columnText(statement, 5),
+                episodeLabel: columnText(statement, 6),
+                year: columnText(statement, 7) ?? "",
+                artworkURL: columnText(statement, 8).flatMap(URL.init(string:)),
+                imdbID: columnText(statement, 9),
+                genres: Self.decodeGenres(columnText(statement, 10)),
+                startedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 11)),
+                positionSeconds: sqlite3_column_double(statement, 12),
+                durationSeconds: Self.optionalDouble(statement, 13),
+                watchedSeconds: sqlite3_column_double(statement, 14),
+                playerKind: columnText(statement, 15) ?? "AVPlayer"
+            ))
+        }
+        return result
+    }
+
+    func viewingStats() -> ViewingStats {
+        guard let handle else { return ViewingStats() }
+        var stats = ViewingStats()
+        var sessionStatement: OpaquePointer?
+        if sqlite3_prepare_v2(handle, "SELECT COALESCE(SUM(watched_seconds),0),COUNT(*),genres,watched_seconds FROM watch_sessions GROUP BY id", -1, &sessionStatement, nil) == SQLITE_OK,
+           let sessionStatement {
+            while sqlite3_step(sessionStatement) == SQLITE_ROW {
+                stats.totalWatchedSeconds += sqlite3_column_double(sessionStatement, 3)
+                stats.sessionCount += 1
+                for genre in Self.decodeGenres(columnText(sessionStatement, 2)) {
+                    stats.genreSeconds[genre, default: 0] += sqlite3_column_double(sessionStatement, 3)
+                }
+            }
+            sqlite3_finalize(sessionStatement)
+        }
+        stats.completedMovies = scalarCount("SELECT COUNT(*) FROM watch_progress WHERE is_watched=1 AND kind='Movie'", handle: handle)
+        stats.completedEpisodes = scalarCount("SELECT COUNT(*) FROM watch_progress WHERE is_watched=1 AND kind='Series' AND episode_id<>''", handle: handle)
+        return stats
+    }
+
+    func loadGenrePreferences(category: String) -> Set<String> {
+        guard let handle else { return [] }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT genre FROM genre_preferences WHERE category=?", -1, &statement, nil) == SQLITE_OK,
+              let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        bind(category, at: 1, in: statement)
+        var result = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let genre = columnText(statement, 0) { result.insert(genre) }
+        }
+        return result
+    }
+
+    func saveGenrePreferences(_ genres: Set<String>, category: String) {
+        guard let handle else { return }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "DELETE FROM genre_preferences WHERE category=?", -1, &statement, nil) == SQLITE_OK,
+              let statement else { return }
+        bind(category, at: 1, in: statement)
+        sqlite3_step(statement)
+        sqlite3_finalize(statement)
+        for genre in genres {
+            var insert: OpaquePointer?
+            guard sqlite3_prepare_v2(handle, "INSERT OR IGNORE INTO genre_preferences(category,genre) VALUES(?,?)", -1, &insert, nil) == SQLITE_OK,
+                  let insert else { continue }
+            bind(category, at: 1, in: insert)
+            bind(genre, at: 2, in: insert)
+            sqlite3_step(insert)
+            sqlite3_finalize(insert)
+        }
+    }
+
+    private func saveWatchProgress(_ progress: WatchProgress) {
+        guard let handle else { return }
+        let sql = """
+        INSERT INTO watch_progress(media_id,episode_id,media_title,kind,episode_title,episode_label,year,artwork_url,imdb_id,genres,
+                                   position_seconds,duration_seconds,watched_seconds,is_watched,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(media_id,episode_id) DO UPDATE SET media_title=excluded.media_title,kind=excluded.kind,
+          episode_title=excluded.episode_title,episode_label=excluded.episode_label,year=excluded.year,
+          artwork_url=excluded.artwork_url,imdb_id=excluded.imdb_id,genres=excluded.genres,
+          position_seconds=excluded.position_seconds,duration_seconds=COALESCE(excluded.duration_seconds,watch_progress.duration_seconds),
+          watched_seconds=excluded.watched_seconds,is_watched=excluded.is_watched,updated_at=excluded.updated_at
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return }
+        defer { sqlite3_finalize(statement) }
+        Self.bind(progress, to: statement, startingAt: 1, using: self)
+        sqlite3_bind_double(statement, 11, max(0, progress.positionSeconds))
+        if let duration = progress.durationSeconds, duration.isFinite { sqlite3_bind_double(statement, 12, max(0, duration)) }
+        else { sqlite3_bind_null(statement, 12) }
+        sqlite3_bind_double(statement, 13, max(0, progress.watchedSeconds))
+        sqlite3_bind_int(statement, 14, progress.isWatched ? 1 : 0)
+        sqlite3_bind_double(statement, 15, progress.updatedAt.timeIntervalSince1970)
+        sqlite3_step(statement)
+    }
+
+    private static func readWatchProgress(_ statement: OpaquePointer) -> WatchProgress? {
+        guard let mediaID = sqlite3_column_text(statement, 0).map({ String(cString: $0) }) else { return nil }
+        return WatchProgress(
+            mediaID: mediaID,
+            episodeID: (sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? "").nilIfEmpty,
+            mediaTitle: sqlite3_column_text(statement, 2).map { String(cString: $0) } ?? "Untitled",
+            kind: sqlite3_column_text(statement, 3).map { String(cString: $0) } ?? "Movie",
+            episodeTitle: sqlite3_column_text(statement, 4).map { String(cString: $0) },
+            episodeLabel: sqlite3_column_text(statement, 5).map { String(cString: $0) },
+            year: sqlite3_column_text(statement, 6).map { String(cString: $0) } ?? "",
+            artworkURL: sqlite3_column_text(statement, 7).map { URL(string: String(cString: $0)) }.flatMap { $0 },
+            imdbID: sqlite3_column_text(statement, 8).map { String(cString: $0) },
+            genres: decodeGenres(sqlite3_column_text(statement, 9).map { String(cString: $0) }),
+            positionSeconds: sqlite3_column_double(statement, 10),
+            durationSeconds: optionalDouble(statement, 11),
+            watchedSeconds: sqlite3_column_double(statement, 12),
+            isWatched: sqlite3_column_int(statement, 13) != 0,
+            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 14))
+        )
+    }
+
+    private static func bind(_ progress: WatchProgress, to statement: OpaquePointer, startingAt index: Int32, using database: MediaDatabase) {
+        database.bind(progress.mediaID, at: index, in: statement)
+        database.bind(progress.episodeID ?? "", at: index + 1, in: statement)
+        database.bind(progress.mediaTitle, at: index + 2, in: statement)
+        database.bind(progress.kind, at: index + 3, in: statement)
+        database.bind(progress.episodeTitle, at: index + 4, in: statement)
+        database.bind(progress.episodeLabel, at: index + 5, in: statement)
+        database.bind(progress.year, at: index + 6, in: statement)
+        database.bind(progress.artworkURL?.absoluteString, at: index + 7, in: statement)
+        database.bind(progress.imdbID, at: index + 8, in: statement)
+        database.bind(encodeGenres(progress.genres), at: index + 9, in: statement)
+    }
+
+    private static func encodeGenres(_ genres: [String]) -> String {
+        guard let data = try? JSONEncoder().encode(genres), let value = String(data: data, encoding: .utf8) else { return "[]" }
+        return value
+    }
+
+    private static func decodeGenres(_ value: String?) -> [String] {
+        guard let value, let data = value.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+    }
+
+    private static func optionalDouble(_ statement: OpaquePointer, _ index: Int32) -> Double? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        let value = sqlite3_column_double(statement, index)
+        return value.isFinite ? value : nil
+    }
+
+    private func scalarCount(_ sql: String, handle: OpaquePointer) -> Int {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return 0 }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+}
+
 enum DownloadStatus: String {
     case queued = "Queued"
     case downloading = "Downloading"
@@ -1999,13 +2793,23 @@ final class DownloadManager: ObservableObject {
 
     func completedDownload(mediaItemID: String, episodeID: String?, title: String) -> URL? {
         let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return entries.first { entry in
+        let completed = entries.filter { entry in
             guard entry.status == .completed,
                   let fileURL = entry.fileURL,
                   FileManager.default.fileExists(atPath: fileURL.path) else { return false }
-            if entry.catalogMediaID == mediaItemID, entry.episodeID == episodeID { return true }
-            return entry.catalogMediaID == nil
-                && entry.title.compare(normalizedTitle, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+            return true
+        }
+        if let exact = completed.first(where: { $0.catalogMediaID == mediaItemID && $0.episodeID == episodeID }) {
+            return exact.fileURL
+        }
+        // Some catalog backends regenerate episode IDs. Preserve the offline match
+        // when the same catalog item and episode title still identify the download.
+        return completed.first { entry in
+            guard entry.title.compare(normalizedTitle, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame else {
+                return false
+            }
+            if entry.catalogMediaID == mediaItemID { return true }
+            return entry.catalogMediaID == nil && entry.episodeID == nil
         }?.fileURL
     }
 
@@ -2207,7 +3011,20 @@ struct MainWindow: View {
                         HeroFeature(item: featured)
                     }
                     pageHeading
-                    if model.section == .imdbPeople {
+                    if [.home, .movies, .shows, .watchlist].contains(model.section), !model.genreFacets.isEmpty {
+                        GenreFilterBar()
+                    }
+                    if model.section == .forYou {
+                        PersonalizedRecommendationsPage()
+                    } else if model.section == .genres {
+                        GenresPage()
+                    } else if model.section == .continueWatching {
+                        ContinueWatchingPage()
+                    } else if model.section == .watchHistory {
+                        WatchHistoryPage()
+                    } else if model.section == .viewingStats {
+                        ViewingStatsPage()
+                    } else if model.section == .imdbPeople {
                         IMDbPeoplePage()
                     } else if model.section == .imdbFranchises {
                         IMDbFranchisesPage()
@@ -2302,6 +3119,11 @@ struct MainWindow: View {
     private var headingSubtitle: String {
         if !model.searchText.isEmpty { return "\(model.visibleItems.count) results · From \(model.catalogName)" }
         return switch model.section {
+        case .forYou: "Recommendations from IMDb, tuned to your viewing and the genres you choose"
+        case .genres: "Choose your favorite genres and filter the local catalog"
+        case .continueWatching: "\(model.continueWatchingItems.count) titles ready to resume"
+        case .watchHistory: "\(model.watchHistory.count) recent sessions stored on this Mac"
+        case .viewingStats: "Your viewing time, completed titles, and favorite genres"
         case .imdbCharts: "Top rated titles, most-voted lists, and live box office"
         case .imdbPeople: "Search IMDb actors, directors, writers, and their filmographies"
         case .imdbFranchises: "Browse official IMDb franchise interests and their titles"
@@ -3130,6 +3952,393 @@ private struct IMDbFranchiseBrowser: NSViewRepresentable {
     }
 }
 
+private struct GenreFilterBar: View {
+    @EnvironmentObject private var model: LibraryModel
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                genreChip(title: "همه", selected: model.selectedGenreFilters.isEmpty) {
+                    model.clearGenreFilters()
+                }
+                ForEach(model.genreFacets) { facet in
+                    genreChip(title: facet.persianName, selected: model.selectedGenreFilters.contains(facet.name)) {
+                        model.toggleGenreFilter(facet.name)
+                    }
+                    .help("فیلتر ژانر \(facet.name)")
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    private func genreChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? .black : Color.white.opacity(0.8))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(selected ? Color.white : Color.white.opacity(0.08), in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct GenresPage: View {
+    @EnvironmentObject private var model: LibraryModel
+    private let columns = [GridItem(.adaptive(minimum: 175), spacing: 12)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("ژانرهای مورد علاقه")
+                    .font(.system(size: 21, weight: .bold, design: .rounded))
+                Text("ژانرها به‌صورت پویا از داده‌های IMDb روی همین Mac ساخته می‌شوند. برای پیشنهاد شخصی، ژانرها را انتخاب کن.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.secondaryText)
+            }
+            if model.genreFacets.isEmpty {
+                VStack(spacing: 11) {
+                    Text("برای ساختن فهرست ژانرها، داده‌های IMDb را دریافت کن.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondaryText)
+                    Button("دریافت داده‌های IMDb", systemImage: "arrow.down.circle") {
+                        Task { await model.refreshIMDbDataset() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.white)
+                    .foregroundStyle(.black)
+                    .disabled(model.isUpdatingIMDbDataset)
+                }
+                .frame(maxWidth: .infinity, minHeight: 180)
+                .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+            } else {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                    ForEach(model.genreFacets) { facet in
+                        let selected = model.preferredGenres.contains(facet.name)
+                        Button { model.togglePreferredGenre(facet.name) } label: {
+                            HStack(spacing: 11) {
+                                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 18))
+                                    .foregroundStyle(selected ? Color.green : Color.secondaryText)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(facet.persianName)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(.white)
+                                    Text("\(facet.titleCount.formatted()) عنوان در IMDb · \(facet.name)")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(Color.secondaryText)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(13)
+                            .background(selected ? Color.white.opacity(0.1) : Color.white.opacity(0.045),
+                                        in: RoundedRectangle(cornerRadius: 11))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            if !model.selectedGenreFilters.isEmpty {
+                Button("پاک کردن فیلتر ژانرها", systemImage: "xmark.circle") {
+                    model.clearGenreFilters()
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+}
+
+private struct PersonalizedRecommendationsPage: View {
+    @EnvironmentObject private var model: LibraryModel
+    private let columns = [GridItem(.adaptive(minimum: 155), spacing: 16, alignment: .top)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("پیشنهاد برای تو")
+                    .font(.system(size: 21, weight: .bold, design: .rounded))
+                Text("امتیاز و تعداد رأی IMDb با سابقهٔ تماشا و ژانرهایی که انتخاب کرده‌ای ترکیب می‌شود. این رتبه‌بندی محلی است.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.secondaryText)
+            }
+            if !model.preferredGenres.isEmpty {
+                HStack(spacing: 7) {
+                    Text("سلیقهٔ تو:")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Color.secondaryText)
+                    ForEach(model.genreFacets.filter { model.preferredGenres.contains($0.name) }) { facet in
+                        Text(facet.persianName)
+                            .font(.system(size: 10, weight: .medium))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color.white.opacity(0.09), in: Capsule())
+                    }
+                }
+            }
+            if model.isLoadingRecommendations {
+                HStack(spacing: 9) {
+                    ProgressView().controlSize(.small)
+                    Text("در حال ساخت پیشنهادها از IMDb…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.secondaryText)
+                }
+                .frame(maxWidth: .infinity, minHeight: 150)
+            } else if model.recommendations.isEmpty {
+                VStack(spacing: 11) {
+                    Text("برای پیشنهاد فیلم و سریال، داده‌های IMDb را دریافت کن.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondaryText)
+                    Button("دریافت یا به‌روزرسانی IMDb", systemImage: "arrow.down.circle") {
+                        Task { await model.refreshIMDbDataset() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.white)
+                    .foregroundStyle(.black)
+                    .disabled(model.isUpdatingIMDbDataset)
+                }
+                .frame(maxWidth: .infinity, minHeight: 180)
+                .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+            } else {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 22) {
+                    ForEach(Array(model.recommendations.enumerated()), id: \.element.id) { index, title in
+                        Button {
+                            Task { await model.openCatalogTitle(matching: title) }
+                        } label: {
+                            IMDbTitleCard(metadata: title, rank: index + 1, width: 155, artworkHeight: 210)
+                        }
+                        .buttonStyle(.plain)
+                        .help("در Simba جست‌وجو و باز کن")
+                    }
+                }
+            }
+        }
+        .task {
+            if model.genreFacets.isEmpty || model.recommendations.isEmpty {
+                await model.refreshDiscoveryData()
+            }
+        }
+    }
+}
+
+private struct ContinueWatchingPage: View {
+    @EnvironmentObject private var model: LibraryModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            if let message = model.viewingUpdateMessage {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.orange)
+            }
+            if model.continueWatchingItems.isEmpty {
+                Text("فیلم‌ها و قسمت‌هایی که شروع کرده‌ای اینجا می‌مانند تا بعداً ادامه‌شان بدهی.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.secondaryText)
+                    .frame(maxWidth: .infinity, minHeight: 140)
+                    .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+            } else {
+                ForEach(model.continueWatchingItems) { progress in
+                    WatchProgressCard(progress: progress)
+                }
+            }
+        }
+        .onAppear { model.refreshViewingData() }
+    }
+}
+
+private struct WatchProgressCard: View {
+    @EnvironmentObject private var model: LibraryModel
+    let progress: WatchProgress
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Button {
+                Task { await model.resume(progress) }
+            } label: {
+                ZStack(alignment: .bottom) {
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(LinearGradient(colors: Palette.colors(abs(progress.mediaID.hashValue) % 8),
+                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+                    if let url = progress.artworkURL {
+                        AsyncImage(url: url) { image in image.resizable().scaledToFill() } placeholder: { Color.clear }
+                            .frame(width: 92, height: 64)
+                            .clipped()
+                    } else {
+                        Image(systemName: progress.kind == "Series" ? "tv" : "film")
+                            .font(.system(size: 24, weight: .ultraLight))
+                            .foregroundStyle(.white.opacity(0.75))
+                    }
+                    if let duration = progress.durationSeconds, duration > 0 {
+                        ProgressView(value: progress.progress)
+                            .tint(.red)
+                            .padding(.horizontal, 2)
+                    }
+                }
+                .frame(width: 92, height: 64)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+            }
+            .buttonStyle(.plain)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(progress.mediaTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.secondaryText)
+                    .lineLimit(1)
+                Text(progress.displayTitle)
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                if let duration = progress.durationSeconds, duration > 0 {
+                    ProgressView(value: progress.progress)
+                        .tint(.red)
+                    Text("\(watchTimeLabel(progress.positionSeconds)) از \(watchTimeLabel(duration))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Color.secondaryText)
+                } else {
+                    Text("ادامه از \(watchTimeLabel(progress.positionSeconds))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Color.secondaryText)
+                }
+            }
+            Spacer(minLength: 5)
+            Button {
+                Task { await model.resume(progress) }
+            } label: {
+                Label("ادامه", systemImage: "play.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.white)
+            .foregroundStyle(.black)
+            Button("دیده شد", systemImage: "checkmark") {
+                model.setWatched(progress, watched: true)
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(11)
+        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private struct WatchHistoryPage: View {
+    @EnvironmentObject private var model: LibraryModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let message = model.viewingUpdateMessage {
+                Text(message).font(.system(size: 11)).foregroundStyle(Color.orange)
+            }
+            if model.watchHistory.isEmpty {
+                Text("سابقهٔ پخش به‌محض شروع فیلم یا قسمت در همین Mac ثبت می‌شود.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.secondaryText)
+                    .frame(maxWidth: .infinity, minHeight: 140)
+                    .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+            } else {
+                ForEach(model.watchHistory) { entry in
+                    HStack(spacing: 12) {
+                        Image(systemName: entry.kind == "Series" ? "tv" : "film")
+                            .font(.system(size: 17, weight: .light))
+                            .foregroundStyle(Color.white.opacity(0.7))
+                            .frame(width: 42, height: 42)
+                            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(entry.displayTitle)
+                                .font(.system(size: 13, weight: .semibold))
+                            Text([entry.mediaTitle == entry.displayTitle ? nil : entry.mediaTitle,
+                                  entry.episodeLabel,
+                                  entry.startedAt.formatted(date: .abbreviated, time: .shortened),
+                                  entry.playerKind]
+                                .compactMap { $0 }.joined(separator: " · "))
+                                .font(.system(size: 9))
+                                .foregroundStyle(Color.secondaryText)
+                            Text("زمان تماشا: \(watchTimeLabel(entry.watchedSeconds))")
+                                .font(.system(size: 9))
+                                .foregroundStyle(Color.secondaryText.opacity(0.85))
+                        }
+                        Spacer(minLength: 4)
+                        Button("ادامه") { Task { await model.resume(entry) } }
+                            .buttonStyle(.bordered)
+                    }
+                    .padding(11)
+                    .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 11))
+                }
+            }
+        }
+        .onAppear { model.refreshViewingData() }
+    }
+}
+
+private struct ViewingStatsPage: View {
+    @EnvironmentObject private var model: LibraryModel
+    private let columns = [GridItem(.adaptive(minimum: 155), spacing: 12)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                statCard(title: "کل زمان تماشا", value: String(format: "%.1f ساعت", model.viewingStats.watchedHours), symbol: "clock")
+                statCard(title: "فیلم کامل‌شده", value: "\(model.viewingStats.completedMovies)", symbol: "film")
+                statCard(title: "قسمت کامل‌شده", value: "\(model.viewingStats.completedEpisodes)", symbol: "tv")
+                statCard(title: "جلسهٔ پخش", value: "\(model.viewingStats.sessionCount)", symbol: "play.rectangle")
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("بیشتر تماشا کردی")
+                    .font(.system(size: 17, weight: .bold, design: .rounded))
+                if model.viewingStats.favoriteGenres.isEmpty {
+                    Text("پس از تماشا، آمار ژانرها اینجا دیده می‌شود.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.secondaryText)
+                } else {
+                    ForEach(Array(model.viewingStats.favoriteGenres.prefix(10).enumerated()), id: \.offset) { index, entry in
+                        HStack(spacing: 9) {
+                            Text("\(index + 1).")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(Color.secondaryText)
+                                .frame(width: 22, alignment: .leading)
+                            Text(IMDbGenreLocalization.persianName(for: entry.name))
+                                .font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Text(String(format: "%.1f ساعت", entry.seconds / 3600))
+                                .font(.system(size: 10))
+                                .foregroundStyle(Color.secondaryText)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            .padding(17)
+            .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 13))
+        }
+        .onAppear { model.refreshViewingData() }
+    }
+
+    private func statCard(title: String, value: String, symbol: String) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.72))
+            Text(value)
+                .font(.system(size: 24, weight: .bold, design: .rounded))
+            Text(title)
+                .font(.system(size: 10))
+                .foregroundStyle(Color.secondaryText)
+        }
+        .frame(maxWidth: .infinity, minHeight: 95, alignment: .leading)
+        .padding(14)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private func watchTimeLabel(_ seconds: Double) -> String {
+    let value = max(0, Int(seconds))
+    let hours = value / 3600
+    let minutes = (value % 3600) / 60
+    let remaining = value % 60
+    if hours > 0 { return String(format: "%d:%02d:%02d", hours, minutes, remaining) }
+    return String(format: "%d:%02d", minutes, remaining)
+}
+
 private enum IMDbChartTab: String, CaseIterable, Identifiable {
     case topMovies = "Top 250 Movies"
     case topSeries = "Top 250 Series"
@@ -3786,7 +4995,10 @@ private struct MediaDetailPage: View {
                         Label("موجود آفلاین", systemImage: "checkmark.circle.fill")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(Color.green.opacity(0.9))
-                        Button { model.playLocalVideo(offlineURL, title: playbackTitle) } label: {
+                        Button {
+                            model.playLocalVideo(offlineURL, title: playbackTitle, item: item,
+                                                 episode: item.kind == "Series" ? selectedEpisode : nil, details: details)
+                        } label: {
                             Label("پخش آفلاین", systemImage: "play.fill")
                         }
                         .buttonStyle(.bordered)
@@ -4037,7 +5249,9 @@ private struct MediaDetailPage: View {
                 .disabled(playableSources.isEmpty)
 
                 if let offlineURL {
-                    Button { model.playLocalVideo(offlineURL, title: offlineTitle) } label: {
+                    Button {
+                        model.playLocalVideo(offlineURL, title: offlineTitle, item: item, episode: episode, details: details)
+                    } label: {
                         Label("پخش آفلاین", systemImage: "play.fill")
                     }
                     .buttonStyle(.bordered)
@@ -4121,7 +5335,7 @@ private struct MediaDetailPage: View {
 
     private func beginPlayback(_ source: MediaStreamSource, title: String, episode: MediaEpisode? = nil) {
         let playbackEpisode = item.kind == "Series" ? (episode ?? selectedEpisode) : nil
-        model.playRemoteSource(source, title: title, item: item, episode: playbackEpisode)
+        model.playRemoteSource(source, title: title, item: item, episode: playbackEpisode, details: details)
     }
 
     @ViewBuilder
@@ -4168,6 +5382,7 @@ private final class PlaybackController: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var currentTimeSeconds: Double = 0
+    @Published private(set) var durationSeconds: Double?
     @Published private(set) var audioOptions: [AVMediaSelectionOption] = []
     @Published private(set) var subtitleOptions: [AVMediaSelectionOption] = []
     @Published private(set) var subtitlesCanBeDisabled = false
@@ -4178,8 +5393,12 @@ private final class PlaybackController: ObservableObject {
     private var loadedURL: URL?
     private var loadedHeaders: [String: String] = [:]
     private var timeObserver: Any?
+    private var pendingResumeSeconds = 0.0
+    private var lastWatchTick: Date?
+    private var pendingWatchedSeconds = 0.0
+    var onProgress: ((Double, Double?, Double) -> Void)?
 
-    func play(_ url: URL, headers: [String: String]) {
+    func play(_ url: URL, headers: [String: String], startAtSeconds: Double = 0) {
         guard loadedURL != url || loadedHeaders != headers else { player.play(); return }
         loadedURL = url
         loadedHeaders = headers
@@ -4190,6 +5409,10 @@ private final class PlaybackController: ObservableObject {
         errorMessage = nil
         isLoading = true
         currentTimeSeconds = 0
+        durationSeconds = nil
+        pendingResumeSeconds = max(0, startAtSeconds)
+        lastWatchTick = nil
+        pendingWatchedSeconds = 0
 
         if timeObserver == nil {
             timeObserver = player.addPeriodicTimeObserver(
@@ -4198,7 +5421,25 @@ private final class PlaybackController: ObservableObject {
             ) { [weak self] time in
                 guard time.seconds.isFinite else { return }
                 Task { @MainActor [weak self] in
-                    self?.currentTimeSeconds = time.seconds
+                    guard let self else { return }
+                    self.currentTimeSeconds = max(0, time.seconds)
+                    if let duration = self.player.currentItem?.duration.seconds, duration.isFinite, duration > 0 {
+                        self.durationSeconds = duration
+                    }
+                    let item = self.player.currentItem
+                    guard item?.status == .readyToPlay, self.player.rate > 0 else {
+                        self.flushPendingWatchTime()
+                        self.lastWatchTick = nil
+                        return
+                    }
+                    let now = Date()
+                    if let last = self.lastWatchTick {
+                        self.pendingWatchedSeconds += min(0.5, max(0, now.timeIntervalSince(last)))
+                    }
+                    self.lastWatchTick = now
+                    if self.pendingWatchedSeconds >= 10 {
+                        self.flushPendingWatchTime()
+                    }
                 }
             }
         }
@@ -4214,6 +5455,19 @@ private final class PlaybackController: ObservableObject {
                 switch status {
                 case .readyToPlay:
                     self.isLoading = false
+                    let duration = item.duration.seconds
+                    self.durationSeconds = duration.isFinite && duration > 0 ? duration : nil
+                    let upperBound = self.durationSeconds.map { max(0, $0 - 1) } ?? self.pendingResumeSeconds
+                    let resume = min(self.pendingResumeSeconds, upperBound)
+                    self.pendingResumeSeconds = 0
+                    if resume > 1 {
+                        self.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600),
+                                         toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                            DispatchQueue.main.async { self?.player.play() }
+                        }
+                    } else {
+                        self.player.play()
+                    }
                 case .failed:
                     self.isLoading = false
                     self.errorMessage = Self.playbackDiagnostics(item: item, fallback: message)
@@ -4223,10 +5477,10 @@ private final class PlaybackController: ObservableObject {
             }
         }
         Task { await loadTracks(for: item) }
-        player.play()
     }
 
     func stop() {
+        flushPendingWatchTime()
         player.pause()
         player.replaceCurrentItem(with: nil)
         if let timeObserver {
@@ -4236,11 +5490,22 @@ private final class PlaybackController: ObservableObject {
         statusObservation = nil
         loadedURL = nil
         loadedHeaders = [:]
+        lastWatchTick = nil
     }
 
     func retry(_ url: URL, headers: [String: String]) {
         loadedURL = nil
         play(url, headers: headers)
+    }
+
+    func flushWatchProgress() {
+        flushPendingWatchTime()
+    }
+
+    private func flushPendingWatchTime() {
+        let delta = pendingWatchedSeconds
+        pendingWatchedSeconds = 0
+        onProgress?(currentTimeSeconds, durationSeconds, delta)
     }
 
     func selectAudio(_ option: AVMediaSelectionOption?) {
@@ -4355,6 +5620,8 @@ private struct LocalPlayerSheet: View {
     @State private var didAutoRefreshSource = false
     @State private var didAutoOpenIINA = false
     @State private var isRefreshingSource = false
+    @State private var isExternalPlayback = false
+    @State private var resumePositionSeconds = 0.0
 
     private var currentSubtitleCue: PlayerSubtitleCue? {
         subtitleCues.first { cue in
@@ -4451,11 +5718,21 @@ private struct LocalPlayerSheet: View {
         .frame(minWidth: 1024, minHeight: 640)
         .background(.black)
         .onAppear {
-            if PlaybackRouting.usesIINA(for: url), openInIINA() {
-                dismiss()
-            } else {
-                playback.play(url, headers: headers)
+            if PlaybackRouting.usesIINA(for: url) {
+                resumePositionSeconds = model.startPlaybackSession(playerKind: "IINA", localURL: url)
+                if openInIINA(startAtSeconds: resumePositionSeconds) {
+                    model.finishPlaybackSession(position: resumePositionSeconds, duration: nil)
+                    isExternalPlayback = true
+                    dismiss()
+                    return
+                }
+                model.finishPlaybackSession(position: resumePositionSeconds, duration: nil)
             }
+            resumePositionSeconds = model.startPlaybackSession(playerKind: "AVPlayer", localURL: url)
+            playback.onProgress = { position, duration, delta in
+                model.recordPlaybackProgress(position: position, duration: duration, watchedDelta: delta)
+            }
+            playback.play(url, headers: headers, startAtSeconds: resumePositionSeconds)
         }
         .onChange(of: playback.errorMessage) { error in
             guard error != nil, !didAutoOpenIINA else { return }
@@ -4467,13 +5744,27 @@ private struct LocalPlayerSheet: View {
             guard model.hasActiveRemotePlayback else { return }
             if didAutoRefreshSource {
                 didAutoOpenIINA = true
-                if openInIINA() { dismiss() }
+                let position = playback.currentTimeSeconds
+                let duration = playback.durationSeconds
+                playback.flushWatchProgress()
+                playback.stop()
+                model.finishPlaybackSession(position: position, duration: duration)
+                if openInIINA(startAtSeconds: position) {
+                    isExternalPlayback = true
+                    dismiss()
+                }
                 return
             }
             didAutoRefreshSource = true
             refreshPlaybackSource()
         }
-        .onDisappear { playback.stop() }
+        .onDisappear {
+            playback.flushWatchProgress()
+            playback.stop()
+            if !isExternalPlayback {
+                model.finishPlaybackSession(position: playback.currentTimeSeconds, duration: playback.durationSeconds)
+            }
+        }
         .onExitCommand { dismiss() }
     }
 
@@ -4575,13 +5866,24 @@ private struct LocalPlayerSheet: View {
     }
 
     @discardableResult
-    private func openInIINA() -> Bool {
+    private func openInIINA(startAtSeconds: Double = 0) -> Bool {
         let appURL = URL(fileURLWithPath: "/Applications/IINA.app")
-        guard FileManager.default.fileExists(atPath: appURL.path) else { return false }
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: configuration)
-        return true
+        let cliURL = appURL.appendingPathComponent("Contents/MacOS/iina-cli")
+        guard FileManager.default.fileExists(atPath: cliURL.path) else { return false }
+        let process = Process()
+        process.executableURL = cliURL
+        var arguments = ["--no-stdin"]
+        if startAtSeconds > 0 {
+            arguments.append("--mpv-start=\(startAtSeconds)")
+        }
+        arguments.append(url.absoluteString)
+        process.arguments = arguments
+        do {
+            try process.run()
+            return true
+        } catch {
+            return false
+        }
     }
 
     private var trackMenu: some View {

@@ -38,16 +38,23 @@ struct DenboxSourceParserTests {
                 "downloadas": "1",
                 "sources": [["quality": "1080p", "url": "http://media.example/episode.mkv"]],
                 "download_url": "http://media.example/episode-extra.mp4"
+            ], [
+                "id": "ep2",
+                "title": "Episode 2",
+                "download_url": "http://media.example/episode-2.mp4"
             ]]
         ]]
         let seriesDetails = LibraryModel.parseDetails(seriesPayload, for: series)
         try require(seriesDetails.seasons.count == 1, "series seasons were not parsed")
-        try require(seriesDetails.seasons[0].episodes.count == 1, "series episode was not parsed")
+        try require(seriesDetails.seasons[0].episodes.count == 2, "series episodes were not parsed")
         let episode = seriesDetails.seasons[0].episodes[0]
         try require(episode.sources.count == 1, "episode playback link was not parsed")
         try require(episode.downloadSources.count == 2, "episode download links were not parsed")
         try require(!episode.downloadSources.contains(where: { $0.url.lastPathComponent == "1" }),
                     "the episode downloadas flag was incorrectly treated as a media URL")
+        try require(seriesDetails.seasons[0].episodes[1].sources.isEmpty
+                    && seriesDetails.seasons[0].episodes[1].downloadSources.count == 1,
+                    "an episode with only a download link was omitted from the season")
 
         print("PASS source parser: movie + series episode URLs and downloadas flag")
     }
