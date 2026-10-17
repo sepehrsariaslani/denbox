@@ -51,9 +51,9 @@ struct PublicTitlePageImportView: View {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(DenboxLanguage.localizedMessage("Public details from \(provider.rawValue)"))
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.denbox(size: 17, weight: .semibold))
                     Text(url.absoluteString)
-                        .font(.system(size: 10))
+                        .font(.denbox(size: 10))
                         .foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
                         .lineLimit(1)
                 }
@@ -94,15 +94,15 @@ struct PublicTitlePageImportView: View {
                         }
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Title to match in the catalog")
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.denbox(size: 10, weight: .medium))
                                 .foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
                             TextField("Persian or English title", text: $title)
                                 .textFieldStyle(.roundedBorder)
                             Text("Persian synopsis")
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.denbox(size: 10, weight: .medium))
                                 .foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
                             TextEditor(text: $synopsis)
-                                .font(.system(size: 12))
+                                .font(.denbox(size: 12))
                                 .frame(minHeight: 74, maxHeight: 110)
                                 .scrollContentBackground(.hidden)
                                 .padding(4)
@@ -111,48 +111,48 @@ struct PublicTitlePageImportView: View {
                     }
 
                     if !capture.episodeSnippets.isEmpty {
-                        DisclosureGroup(DenboxLanguage.localizedMessage("Visible episodes on this page (\(capture.episodeSnippets.count))")) {
+                        DisclosureGroup(DenboxLanguage.localizedMessage("Visible episode details on this page (\(capture.episodeSnippets.count))")) {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 6) {
                                     ForEach(Array(capture.episodeSnippets.enumerated()), id: \.offset) { _, snippet in
                                         Text(snippet)
-                                            .font(.system(size: 11))
+                                            .font(.denbox(size: 11))
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                 }
                             }
                             .frame(maxHeight: 115)
                         }
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.denbox(size: 11, weight: .medium))
                     }
 
                     if !capture.visiblePageText.isEmpty {
                         DisclosureGroup("Full public text on this page") {
                             ScrollView {
                                 Text(capture.visiblePageText)
-                                    .font(.system(size: 11))
+                                    .font(.denbox(size: 11))
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .textSelection(.enabled)
                             }
                             .frame(maxHeight: 130)
                         }
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.denbox(size: 11, weight: .medium))
                     }
                 } else {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text(DenboxLanguage.localizedMessage(status)).font(.system(size: 11)).foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
+                        Text(DenboxLanguage.localizedMessage(status)).font(.denbox(size: 11)).foregroundStyle(Color(red: 0.62, green: 0.65, blue: 0.69))
                     }
                 }
 
                 if let errorMessage {
-                    Text(DenboxLanguage.localizedMessage(errorMessage)).font(.system(size: 11)).foregroundStyle(.orange)
+                    Text(DenboxLanguage.localizedMessage(errorMessage)).font(.denbox(size: 11)).foregroundStyle(.orange)
                 }
 
                 HStack {
                     if let capture, let imageURL = capture.posterURL {
                         Link("Open original image", destination: imageURL)
-                            .font(.system(size: 10))
+                            .font(.denbox(size: 10))
                     }
                     Spacer()
                     Button("Save to local catalog") {

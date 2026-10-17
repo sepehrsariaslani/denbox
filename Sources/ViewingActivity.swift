@@ -1,5 +1,11 @@
 import Foundation
 
+struct PersonalRating: Codable, Sendable {
+    let rating: Int
+    let item: MediaItem
+    let updatedAt: Date
+}
+
 struct IMDbGenreFacet: Identifiable, Sendable {
     let name: String
     let titleCount: Int
@@ -63,6 +69,115 @@ struct ViewingDataExport: Codable, Sendable {
     let exportedAt: Date
     let progress: [WatchProgress]
     let history: [WatchHistoryEntry]
+    let personalRatings: [PersonalRating]
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, exportedAt, progress, history, personalRatings
+    }
+
+    init(
+        schemaVersion: Int,
+        exportedAt: Date,
+        progress: [WatchProgress],
+        history: [WatchHistoryEntry],
+        personalRatings: [PersonalRating]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.exportedAt = exportedAt
+        self.progress = progress
+        self.history = history
+        self.personalRatings = personalRatings
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        exportedAt = try values.decode(Date.self, forKey: .exportedAt)
+        progress = try values.decode([WatchProgress].self, forKey: .progress)
+        history = try values.decode([WatchHistoryEntry].self, forKey: .history)
+        personalRatings = try values.decodeIfPresent([PersonalRating].self, forKey: .personalRatings) ?? []
+    }
+
+    func validated() throws -> ViewingDataExport {
+        guard schemaVersion == 1 || schemaVersion == 2 else { throw ViewingDataImportError.unsupportedVersion }
+        guard progress.count + history.count + personalRatings.count <= 100_000 else {
+            throw ViewingDataImportError.tooManyRecords
+        }
+        guard exportedAt.timeIntervalSince1970.isFinite else { throw ViewingDataImportError.invalidRecords }
+
+        var progressIDs = Set<String>()
+        for entry in progress {
+            let key = WatchProgress.key(mediaID: entry.mediaID, episodeID: entry.episodeID)
+            guard !entry.mediaID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  progressIDs.insert(key).inserted,
+                  entry.positionSeconds.isFinite, entry.positionSeconds >= 0,
+                  entry.watchedSeconds.isFinite, entry.watchedSeconds >= 0,
+                  entry.durationSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
+                  entry.updatedAt.timeIntervalSince1970.isFinite,
+                  ["Movie", "Series"].contains(entry.kind) else {
+                throw ViewingDataImportError.invalidRecords
+            }
+            try Self.validateArtworkURL(entry.artworkURL)
+        }
+
+        var historyIDs = Set<String>()
+        for entry in history {
+            guard !entry.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !entry.mediaID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  historyIDs.insert(entry.id).inserted,
+                  entry.positionSeconds.isFinite, entry.positionSeconds >= 0,
+                  entry.watchedSeconds.isFinite, entry.watchedSeconds > 0,
+                  entry.durationSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
+                  entry.startedAt.timeIntervalSince1970.isFinite,
+                  (entry.startedAt.timeIntervalSince1970 + entry.watchedSeconds).isFinite,
+                  ["Movie", "Series"].contains(entry.kind) else {
+                throw ViewingDataImportError.invalidRecords
+            }
+            try Self.validateArtworkURL(entry.artworkURL)
+        }
+
+        var ratingIDs = Set<String>()
+        for rating in personalRatings {
+            guard (1...5).contains(rating.rating),
+                  !rating.item.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  ["Movie", "Series"].contains(rating.item.kind),
+                  ratingIDs.insert(rating.item.id).inserted,
+                  rating.updatedAt.timeIntervalSince1970.isFinite else {
+                throw ViewingDataImportError.invalidRecords
+            }
+            try Self.validateArtworkURL(rating.item.artworkURL)
+        }
+        return self
+    }
+
+    private static func validateArtworkURL(_ url: URL?) throws {
+        guard let url else { return }
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            throw ViewingDataImportError.unsafeArtworkURL
+        }
+    }
+}
+
+enum ViewingDataImportError: LocalizedError {
+    case unsupportedVersion
+    case tooManyRecords
+    case invalidRecords
+    case unsafeArtworkURL
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedVersion: "The selected JSON version is not supported."
+        case .tooManyRecords: "The selected JSON contains too many records."
+        case .invalidRecords: "The selected JSON contains invalid viewing records."
+        case .unsafeArtworkURL: "The selected JSON contains an artwork URL that is not HTTP or HTTPS."
+        }
+    }
+}
+
+struct ViewingDataImportPreview: Identifiable, Sendable {
+    let id = UUID()
+    let fileName: String
+    let export: ViewingDataExport
 }
 
 struct ViewingStats: Sendable {
@@ -81,6 +196,7 @@ struct ViewingStats: Sendable {
 enum IMDbGenreLocalization {
     private static let names: [String: String] = [
         "Action": "اکشن",
+        "Adult": "بزرگسالان",
         "Adventure": "ماجراجویی",
         "Animation": "انیمیشن",
         "Biography": "زندگی‌نامه",
@@ -101,6 +217,7 @@ enum IMDbGenreLocalization {
         "Reality-TV": "واقع‌نما",
         "Romance": "عاشقانه",
         "Sci-Fi": "علمی‌تخیلی",
+        "Short": "کوتاه",
         "Sport": "ورزشی",
         "Talk-Show": "گفت‌وگو",
         "Thriller": "هیجان‌انگیز",
@@ -124,6 +241,7 @@ enum PersonalizedRecommendationRanker {
         history: [WatchHistoryEntry],
         preferredGenres: Set<String>,
         excluding watchedIMDbIDs: Set<String>,
+        personalRatings: [PersonalRating] = [],
         limit: Int = 60
     ) -> [IMDbTitleMetadata] {
         var weights: [String: Double] = [:]
@@ -139,19 +257,43 @@ enum PersonalizedRecommendationRanker {
             }
         }
 
+        var ratedIMDbIDs = Set<String>()
+        var explicitGenreTotals: [String: (weightedScore: Double, weight: Double)] = [:]
+        for entry in personalRatings {
+            if let imdbID = entry.item.imdbID { ratedIMDbIDs.insert(imdbID) }
+            let preference = Double(entry.rating - 3) / 2
+            let confidence = abs(preference)
+            guard confidence > 0 else { continue }
+            for genre in entry.item.genres {
+                var total = explicitGenreTotals[genre, default: (0, 0)]
+                total.weightedScore += preference * confidence
+                total.weight += confidence
+                explicitGenreTotals[genre] = total
+            }
+        }
+        let explicitGenrePreferences = explicitGenreTotals.mapValues {
+            min(1, max(-1, $0.weightedScore / $0.weight))
+        }
+
         let maximumVotes = max(1, candidates.compactMap(\.votes).max() ?? 1)
         let maximumPopularity = log(Double(maximumVotes) + 1)
-        let hasTaste = !weights.isEmpty
+        let hasTaste = !weights.isEmpty || !explicitGenrePreferences.isEmpty
         let ranked = candidates.compactMap { title -> (IMDbTitleMetadata, Double)? in
-            guard !watchedIMDbIDs.contains(title.tconst),
+            guard !watchedIMDbIDs.contains(title.tconst), !ratedIMDbIDs.contains(title.tconst),
                   let rating = title.rating, let votes = title.votes, votes >= 50 else { return nil }
             let genreWeight = title.genres.reduce(0.0) { $0 + (weights[$1] ?? 0) }
             let maxWeight = max(1.0, weights.values.max() ?? 1)
             let genreFit = title.genres.isEmpty ? 0 : min(1, genreWeight / (maxWeight * Double(min(title.genres.count, 3))))
+            let matchingExplicitPreferences = title.genres.compactMap { explicitGenrePreferences[$0] }
+            let explicitGenreFit = explicitGenrePreferences.isEmpty ? nil :
+                (matchingExplicitPreferences.isEmpty
+                    ? 0.5
+                    : matchingExplicitPreferences.map { ($0 + 1) / 2 }.reduce(0, +) / Double(matchingExplicitPreferences.count))
+            let tasteFit = explicitGenreFit.map { genreFit * 0.45 + $0 * 0.55 } ?? genreFit
             let quality = min(1, max(0, rating / 10))
             let popularity = maximumPopularity > 0 ? log(Double(votes) + 1) / maximumPopularity : 0
             let score = hasTaste
-                ? genreFit * 0.68 + quality * 0.22 + popularity * 0.10
+                ? tasteFit * 0.68 + quality * 0.22 + popularity * 0.10
                 : quality * 0.70 + popularity * 0.30
             return (title, score)
         }

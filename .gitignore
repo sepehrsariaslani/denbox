@@ -15,3 +15,4 @@ dist/
 *.pem
 *.p12
 *.key
+DenboxPrivateAPIKeys.plist

@@ -1,5 +1,31 @@
 import SwiftUI
 
+extension Font {
+    static func denbox(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        let postScriptName: String
+        if weight == .black {
+            postScriptName = "Peyda-Black"
+        } else if weight == .heavy {
+            postScriptName = "Peyda-ExtraBold"
+        } else if weight == .bold {
+            postScriptName = "Peyda-Bold"
+        } else if weight == .semibold {
+            postScriptName = "Peyda-SemiBold"
+        } else if weight == .medium {
+            postScriptName = "Peyda-Medium"
+        } else if weight == .light {
+            postScriptName = "Peyda-Light"
+        } else if weight == .thin {
+            postScriptName = "Peyda-Thin"
+        } else if weight == .ultraLight {
+            postScriptName = "Peyda-ExtraLight"
+        } else {
+            postScriptName = "Peyda-Regular"
+        }
+        return .custom(postScriptName, size: size)
+    }
+}
+
 enum DenboxLanguage {
     static let preferenceKey = "denbox.interfaceLanguage"
     static let defaultCode = persianCode
@@ -58,11 +84,22 @@ enum DenboxLanguage {
               let bundle = Bundle(path: path) else { return message }
 
         let dynamicKeys: [(pattern: String, key: String)] = [
+            (#"^Playback speed: (.+)$"#, "Playback speed: %@"),
+            (#"^Volume: (\d+)%$"#, "Volume: %@%"),
+            (#"^Audio track: (.+)$"#, "Audio track: %@"),
+            (#"^Video track: (.+)$"#, "Video track: %@"),
+            (#"^Subtitle track: (.+)$"#, "Subtitle track: %@"),
+            (#"^Subtitle delay: (.+)$"#, "Subtitle delay: %@"),
+            (#"^Audio delay: (.+)$"#, "Audio delay: %@"),
             (#"^The embedded playback engine could not start: (.+)$"#, "The embedded playback engine could not start: %@"),
             (#"^The embedded video renderer could not initialize: (.+)$"#, "The embedded video renderer could not initialize: %@"),
             (#"^The video source could not be opened: (.+)$"#, "The video source could not be opened: %@"),
             (#"^Playback failed: (.+)$"#, "Playback failed: %@"),
             (#"^Error code (\d+)$"#, "Error code %@"),
+            (#"^OpenSubtitles request failed \(HTTP (\d+)\)\.$"#, "OpenSubtitles request failed (HTTP %@)."),
+            (#"^ASSRT request failed \(HTTP (\d+)\)\.$"#, "ASSRT request failed (HTTP %@)."),
+            (#"^ASSRT request failed \(code (\d+)\)\.$"#, "ASSRT request failed (code %@)."),
+            (#"^Downloads: (\d+) · Files: (\d+)$"#, "Downloads: %@ · Files: %@"),
             (#"^Updated: (.+) · (\d+) images$"#, "Updated: %@ · %@ images"),
             (#"^Visible episodes \((\d+)\)$"#, "Visible episodes (%@)"),
             (#"^The link must use HTTPS and point to a public title page on (.+)\.$"#, "The link must use HTTPS and point to a public title page on %@."),
@@ -72,15 +109,27 @@ enum DenboxLanguage {
             (#"^Could not connect to the public page: (.+)$"#, "Could not connect to the public page: %@"),
             (#"^Could not read the visible page text: (.+)$"#, "Could not read the visible page text: %@"),
             (#"^Filter genre: (.+)$"#, "Filter genre: %@"),
+            (#"^Browse titles in (.+)$"#, "Browse titles in %@"),
+            (#"^Open (.+) filmography$"#, "Open %@ filmography"),
             (#"^(\d+) titles in IMDb · (.+)$"#, "%@ titles in IMDb · %@"),
             (#"^Watched (.+) of (.+)$"#, "Watched %@ of %@"),
             (#"^Resume at (.+)$"#, "Resume at %@"),
+            (#"^Season downloads: (\d+) added · (\d+) unavailable · (\d+) already queued or downloaded$"#, "Season downloads: %@ added · %@ unavailable · %@ already queued or downloaded"),
             (#"^Watch time: (.+)$"#, "Watch time: %@"),
             (#"^(\d+(?:\.\d+)?) hours$"#, "%@ hours"),
-            (#"^Could not save the viewing history export: (.+)$"#, "Could not save the viewing history export: %@"),
+            (#"^Could not save the viewing data export: (.+)$"#, "Could not save the viewing data export: %@"),
+            (#"^Could not move current file to Trash: (.+)$"#, "Could not move current file to Trash: %@"),
+            (#"^Could not delete current file: (.+)$"#, "Could not delete current file: %@"),
+            (#"^Could not read viewing data: (.+)$"#, "Could not read viewing data: %@"),
+            (#"^Progress records: (\d+)$"#, "Progress records: %@"),
+            (#"^History sessions: (\d+)$"#, "History sessions: %@"),
+            (#"^Personal ratings: (\d+)$"#, "Personal ratings: %@"),
             (#"^(.+)× Speed$"#, "%@× Speed"),
             (#"^Audio (\d+)$"#, "Audio %@"),
+            (#"^Video (\d+)$"#, "Video %@"),
             (#"^Subtitle (\d+)$"#, "Subtitle %@"),
+            (#"^Chapter (\d+)$"#, "Chapter %@"),
+            (#"^Chapters: (\d+)$"#, "Chapters: %@"),
             (#"^Local database · (\d+) movies · (\d+) series$"#, "Local database · %@ movies · %@ series"),
             (#"^Live catalog unavailable\. Showing (\d+) saved movies and (\d+) saved series\.$"#, "Live catalog unavailable. Showing %@ saved movies and %@ saved series."),
             (#"^Live catalog loaded · (\d+) movies · (\d+) series · (movies|series) feed unavailable$"#, "Live catalog loaded · %@ movies · %@ series · %@ feed unavailable"),
@@ -91,11 +140,16 @@ enum DenboxLanguage {
             (#"^(\d+) results · From (.+)$"#, "%@ results · From %@"),
             (#"^(\d+) titles ready to resume$"#, "%@ titles ready to resume"),
             (#"^(\d+) recent sessions stored on this Mac$"#, "%@ recent sessions stored on this Mac"),
+            (#"^Rate (\d+) out of 5 stars$"#, "Rate %@ out of 5 stars"),
             (#"^(\d+) titles · From (.+)$"#, "%@ titles · From %@"),
             (#"^Simba did not return a matching title for (.+)\.$"#, "Simba did not return a matching title for %@."),
             (#"^IMDb dataset download failed: (.+)$"#, "IMDb dataset download failed: %@"),
             (#"^IMDb dataset import failed: (.+)$"#, "IMDb dataset import failed: %@"),
             (#"^IMDb dataset ready · updated (.+)$"#, "IMDb dataset ready · updated %@"),
+            (#"^Could not load the (.+) feed\. Try again later\.$"#, "Could not load the %@ feed. Try again later."),
+            (#"^(\d+) events$"#, "%@ events"),
+            (#"^Checking public metadata for (\d+) titles…$"#, "Checking public metadata for %@ titles…"),
+            (#"^Checked public references for (\d+) titles\.$"#, "Checked public references for %@ titles."),
             (#"^(.+) votes$"#, "%@ votes"),
             (#"^Downloading IMDb (.+)…$"#, "Downloading IMDb %@…")
         ]
@@ -143,9 +197,11 @@ extension LibrarySection {
         case .movies: "Movies"
         case .shows: "TV Shows"
         case .imdbCharts: "IMDb Charts"
+        case .releaseCalendar: "Release Calendar"
         case .imdbPeople: "IMDb People"
         case .imdbFranchises: "IMDb Franchises"
         case .watchlist: "My List"
+        case .myRatings: "My Ratings"
         case .downloads: "Downloads"
         }
     }
